@@ -51,6 +51,11 @@ class Config:
     scan_interval_day: int = field(default_factory=lambda: int(os.getenv("SCAN_INTERVAL_DAY", "1800")))
     desk_summary_interval: int = field(default_factory=lambda: int(os.getenv("DESK_SUMMARY_INTERVAL", "60")))
 
+    # Leverage Override
+    max_leverage_cap: Optional[int] = field(
+        default_factory=lambda: int(os.getenv("MAX_LEVERAGE_CAP")) if os.getenv("MAX_LEVERAGE_CAP") else None
+    )
+
     # Logging
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
 
@@ -128,12 +133,18 @@ def get_leverage(ticker: str, scalp: bool = True) -> int:
     """Return suggested leverage for a ticker."""
     tier = LEVERAGE_MAP.get(ticker, _TIER_C)
     key = "scalp_suggest" if scalp else "day_suggest"
-    return tier[key]
+    lev = tier[key]
+    if cfg.max_leverage_cap is not None:
+        lev = min(lev, cfg.max_leverage_cap)
+    return lev
 
 
 def get_hard_cap(ticker: str) -> int:
     """Return absolute max leverage for a ticker."""
-    return LEVERAGE_MAP.get(ticker, _TIER_C)["hard_cap"]
+    cap = LEVERAGE_MAP.get(ticker, _TIER_C)["hard_cap"]
+    if cfg.max_leverage_cap is not None:
+        cap = min(cap, cfg.max_leverage_cap)
+    return cap
 
 
 # ── Tickers that must NEVER be market-ordered ────────────────────────────────
