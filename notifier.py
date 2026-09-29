@@ -20,6 +20,8 @@ from config import cfg, get_leverage, tv_url, NO_MARKET_TICKERS, CORE_TICKERS
 
 log = logging.getLogger(__name__)
 
+import html
+
 _TG_BASE = f"https://api.telegram.org/bot{cfg.telegram_token}"
 
 
@@ -35,7 +37,10 @@ def _post(endpoint: str, data: dict, files=None, retries: int = 3) -> bool:
             r.raise_for_status()
             return True
         except Exception as exc:
-            log.warning("Telegram attempt %d failed (%s): %s", attempt + 1, endpoint, exc)
+            err_body = ""
+            if 'r' in locals() and hasattr(r, 'text'):
+                err_body = f" — response: {r.text}"
+            log.warning("Telegram attempt %d failed (%s): %s%s", attempt + 1, endpoint, exc, err_body)
     return False
 
 
@@ -103,8 +108,8 @@ def format_buy_sell_card(sig: dict, chart_url: Optional[str] = None) -> str:
     sl = _price(sig["sl"])
     entry_range = f"{el}–{eh}"
     tv = sig.get("tv_url") or tv_url(t)
-    structure = sig.get("structure", "")
-    reason = sig.get("reason", "")
+    structure = html.escape(sig.get("structure", ""))
+    reason = html.escape(sig.get("reason", ""))
     lev_scalp = get_leverage(t, scalp=True)
     lev_day = get_leverage(t, scalp=False)
     lev_str = f"{lev_scalp}x" if trade_type.lower() == "scalp" else f"{lev_day}x"
@@ -149,8 +154,8 @@ def format_wait_card(sig: dict) -> str:
     t = sig["ticker"]
     tv = sig.get("tv_url") or tv_url(t)
     tf = sig["tf"]
-    structure = sig.get("structure", "")
-    reason = sig.get("reason", "")
+    structure = html.escape(sig.get("structure", ""))
+    reason = html.escape(sig.get("reason", ""))
     return (
         f"<b>{t} — WAIT</b>\n"
         f"Chart: <a href='{tv}'>{tv}</a> ({tf})\n"
