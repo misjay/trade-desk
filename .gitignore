@@ -1,0 +1,10 @@
+.venv/
+.env
+state.json
+trade_desk.log
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.png
+charts/

@@ -1,0 +1,15 @@
+[Unit]
+Description=Trade Desk Bot Service (Bybit 24/7)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/trade-desk
+ExecStart=/opt/trade-desk/.venv/bin/python main.py --demo
+Restart=always
+RestartSec=10
+EnvironmentFile=/opt/trade-desk/.env
+
+[Install]
+WantedBy=multi-user.target

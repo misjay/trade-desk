@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  trade-desk:
+    build: .
+    container_name: trade-desk-bot
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./state.json:/app/state.json
+      - ./trade_desk.log:/app/trade_desk.log
