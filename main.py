@@ -1,17 +1,21 @@
 """
-main.py — Trade Desk Bot entry point.
+main.py — Entry point for Two-sided Crypto Trade Desk on Bybit.
 
-Schedules:
-  - Scalp scan: every 5 minutes (15m candles)
-  - Day scan:   every 30 minutes (4h candles)
-  - Desk summary push: every 60 minutes (configurable)
-  - Mini HTTP server on :8765 serving state.json for dashboard
+Modes:
+  - Demo (default): Simulated paper broker against live Bybit orderbooks / marks,
+                    or Bybit Testnet / Demo UTA API if keys provided.
+  - Live: Real Bybit V5 Linear & Spot execution.
+  - Desk mode: Generate single live desk publication with EXECUTOR CONTRACT.
+  - Execution mode: Direct ingestion and execution of BOT machine contract lines.
 
 Usage:
-    python main.py              # runs in current mode (from .env)
-    python main.py --demo       # force demo mode
-    python main.py --live       # force live mode (requires live API keys)
-    python main.py --reset      # reset state.json and start fresh
+  python main.py                     # run in default demo mode
+  python main.py --demo              # force demo mode
+  python main.py --live              # force live mode
+  python main.py --desk              # print full Desk publication (Core 24 + Extras)
+  python main.py --execute "BOT|..." # execute single contract line
+  python main.py --reset             # reset paper equity & positions
+  python main.py --no-telegram       # run without telegram
 """
 from __future__ import annotations
 
@@ -22,6 +26,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -30,32 +35,43 @@ from typing import List
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-# ── Patch mode before importing config singleton ──────────────────────────────
-def _parse_args():
-    p = argparse.ArgumentParser(description="Trade Desk Bot")
+# Ensure UTF-8 output on Windows
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
+# ── Parse Arguments ─────────────────────────────────────────────────────────
+def parse_args():
+    p = argparse.ArgumentParser(description="Trade Desk Bot for Bybit")
     group = p.add_mutually_exclusive_group()
-    group.add_argument("--demo", action="store_true", help="Force demo mode")
-    group.add_argument("--live", action="store_true", help="Force live mode")
+    group.add_argument("--demo", action="store_true", help="Force demo mode (default)")
+    group.add_argument("--live", action="store_true", help="Force live mode on Bybit")
+    p.add_argument("--desk", action="store_true", help="Generate single live Desk publication and exit")
+    p.add_argument("--execute", type=str, default="", help="Execute a single BOT contract line and exit")
+    p.add_argument("--execute-file", type=str, default="", help="Execute contract lines from file and exit")
+    p.add_argument("--test-connection", action="store_true", help="Test Bybit API connection, credentials, and wallet balance")
     p.add_argument("--reset", action="store_true", help="Reset state.json")
-    p.add_argument("--no-telegram", action="store_true", help="Disable Telegram (local test)")
+    p.add_argument("--no-telegram", action="store_true", help="Disable Telegram notifications")
     return p.parse_args()
 
 
-args = _parse_args()
+args = parse_args()
 if args.demo:
     os.environ["TRADE_MODE"] = "demo"
 if args.live:
     os.environ["TRADE_MODE"] = "live"
 
-# Now safe to import config and modules
-from config import cfg, ALL_TICKERS, CORE_TICKERS, EXTRA_TICKERS
+# Safe imports
+from config import cfg, CORE_TICKERS, EXTRA_TICKERS
 import state
 import scanner
-import chart as chart_mod
 import notifier
 import engine
+import telegram_bot
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+# ── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=getattr(logging, cfg.log_level.upper(), logging.INFO),
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
@@ -67,155 +83,53 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
-# ── Patch notifier if --no-telegram ──────────────────────────────────────────
-if args.no_telegram:
-    def _noop(*a, **kw): pass
-    notifier.send_text = _noop
-    notifier.send_photo = _noop
-    log.info("Telegram disabled (--no-telegram)")
+if args.no_telegram or cfg.telegram_token in ("", "your_telegram_bot_token"):
+    notifier.send_text = lambda *a, **k: False
+    log.info("Telegram notifications inactive (set valid token in .env to enable)")
 
-
-# ── State init ────────────────────────────────────────────────────────────────
 if args.reset:
     state.reset_state()
-    log.info("State reset.")
+    log.info("State reset to initial equity $%.2f.", cfg.paper_equity)
+    print("State reset successfully.")
+    sys.exit(0)
 
 
-# ── Shared last-signals store ─────────────────────────────────────────────────
+# ── Mini HTTP Server for Dashboard ──────────────────────────────────────────
+_STATE_FILE = Path(__file__).parent / "state.json"
+_DASHBOARD_FILE = Path(__file__).parent / "dashboard.html"
 _last_signals: List[dict] = []
 _signals_lock = threading.Lock()
 
 
-def _update_last_signals(signals: list) -> None:
-    with _signals_lock:
-        _last_signals.clear()
-        _last_signals.extend(signals)
-
-
-def _get_last_signals() -> list:
-    with _signals_lock:
-        return list(_last_signals)
-
-
-# ── Dedup: only act on a signal if it differs from last one for that ticker ───
-def _should_execute(sig: dict) -> bool:
-    """
-    Avoid re-emitting the same signal back-to-back.
-    A signal is 'new' if side changed, or entry range shifted > 0.1%.
-    """
-    if sig["side"] == "WAIT":
-        return False
-    prev = state.get_last_signal(sig["ticker"])
-    if prev is None:
-        return True
-    if prev["side"] != sig["side"]:
-        return True
-    # Check if entry range shifted significantly
-    prev_mid = ((prev.get("entry_low") or 0) + (prev.get("entry_high") or 0)) / 2
-    curr_mid = ((sig.get("entry_low") or 0) + (sig.get("entry_high") or 0)) / 2
-    if prev_mid == 0:
-        return True
-    shift = abs(curr_mid - prev_mid) / prev_mid
-    return shift > 0.001  # 0.1% change = new signal
-
-
-# ── Scan job ──────────────────────────────────────────────────────────────────
-def _run_scan(trade_type: str) -> None:
-    log.info("=== %s scan started ===", trade_type.upper())
-    try:
-        signals = scanner.run_scan(trade_type)
-        _update_last_signals(signals)
-    except Exception as exc:
-        log.error("Scan error: %s", exc, exc_info=True)
-        return
-
-    for sig in signals:
-        try:
-            state.save_signal(sig)
-
-            if sig["side"] == "WAIT":
-                # Only push WAIT cards on the desk summary, not every scan
-                continue
-
-            if not _should_execute(sig):
-                log.info("Dedup: %s %s already active, skipping", sig["ticker"], sig["side"])
-                continue
-
-            # Generate chart
-            chart_bytes = None
-            try:
-                df = scanner.fetch_ohlcv(
-                    sig["ticker"],
-                    15 if trade_type == "scalp" else 240,
-                    limit=100,
-                )
-                if df is not None:
-                    chart_bytes = chart_mod.generate_chart(
-                        df=df,
-                        ticker=sig["ticker"],
-                        side=sig["side"],
-                        tf=sig["tf"],
-                        entry_low=sig["entry_low"],
-                        entry_high=sig["entry_high"],
-                        tp1=sig["tp1"],
-                        tp2=sig["tp2"],
-                        sl=sig["sl"],
-                        live_price=sig["live_price"],
-                    )
-            except Exception as chart_exc:
-                log.warning("Chart generation failed for %s: %s", sig["ticker"], chart_exc)
-
-            # Send Telegram notification
-            notifier.notify_signal(sig, chart_bytes)
-
-            # Execute (paper or live)
-            engine.execute_signal(sig)
-
-        except Exception as exc:
-            log.error("Error processing signal for %s: %s", sig.get("ticker"), exc, exc_info=True)
-
-    log.info("=== %s scan complete ===", trade_type.upper())
-
-
-def run_scalp_scan():
-    _run_scan("scalp")
-
-
-def run_day_scan():
-    _run_scan("day")
-
-
-# ── Hourly desk summary ───────────────────────────────────────────────────────
-def send_desk_summary():
-    signals = _get_last_signals()
-    if not signals:
-        return
-    equity = state.get_equity()
-    stats = state.get_session_stats()
-    notifier.notify_summary(signals, equity, stats)
-    log.info("Desk summary sent. Equity: %.2f", equity)
-
-
-# ── Mini HTTP server (for dashboard.html) ────────────────────────────────────
-_STATE_FILE = Path(__file__).parent / "state.json"
-
-
-class _StateHandler(BaseHTTPRequestHandler):
+class _DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path in ("/state", "/state.json"):
+        if self.path in ("/", "/dashboard", "/dashboard.html", "/index.html"):
+            try:
+                content = _DASHBOARD_FILE.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(content)))
+                self.end_headers()
+                self.wfile.write(content)
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(f"Error loading dashboard: {e}".encode())
+        elif self.path in ("/state", "/state.json"):
             try:
                 data = _STATE_FILE.read_bytes()
             except Exception:
                 data = b"{}"
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(data)
-        elif self.path == "/signals":
-            data = json.dumps(_get_last_signals()).encode()
+        elif self.path in ("/signals", "/signals.json"):
+            with _signals_lock:
+                data = json.dumps(_last_signals).encode()
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(data)
@@ -224,56 +138,104 @@ class _StateHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def log_message(self, format, *a):
-        pass  # silence default HTTP log noise
+        pass
 
 
-def _start_http_server(port: int = 8765) -> None:
+def _start_http_server(port: int = 8765):
     try:
-        server = HTTPServer(("127.0.0.1", port), _StateHandler)
+        server = HTTPServer(("0.0.0.0", port), _DashboardHandler)
         t = threading.Thread(target=server.serve_forever, daemon=True, name="http-srv")
         t.start()
-        log.info("Dashboard state server: http://127.0.0.1:%d/state", port)
+        log.info("Xira Dashboard live at: http://localhost:%d", port)
     except Exception as exc:
-        log.warning("Could not start HTTP server on %d: %s", port, exc)
+        log.warning("Could not bind HTTP server: %s", exc)
 
 
-# ── Scheduler ─────────────────────────────────────────────────────────────────
+# ── Scan & Execution Cycle ──────────────────────────────────────────────────
+def run_scan_cycle(trade_type: str = "scalp"):
+    if state.is_paused():
+        log.info("Xira automated execution is PAUSED via Telegram command. Skipping %s scan cycle.", trade_type)
+        return
+
+    log.info("=== Running %s cycle ===", trade_type.upper())
+    core_sigs, extra_sigs, tape = scanner.run_scan(trade_type)
+    all_sigs = core_sigs + extra_sigs
+
+    with _signals_lock:
+        _last_signals.clear()
+        _last_signals.extend(all_sigs)
+
+    for sig in all_sigs:
+        ticker = sig["ticker"]
+        side = sig["side"]
+
+        if side == "WAIT":
+            state.save_signal(sig)
+            continue
+
+        # Check if an active open position already exists for this ticker
+        open_pos = state.get_open_positions()
+        has_active_pos = any(p.get("ticker") == ticker for p in open_pos.values())
+        if has_active_pos:
+            log.info("Active position already open for %s, skipping", ticker)
+            state.save_signal(sig)
+            continue
+
+        # Broadcast card to Telegram if fresh shelf
+        prev = state.get_last_signal(ticker)
+        is_fresh_shelf = True
+        if prev and prev.get("side") == side:
+            prev_low = prev.get("entry_low") or 0
+            curr_low = sig.get("entry_low") or 0
+            if prev_low and abs(curr_low - prev_low) / prev_low < 0.002:
+                is_fresh_shelf = False
+
+        if is_fresh_shelf:
+            notifier.notify_signal(sig)
+
+        # Execute order on Bybit (Demo or Live) since no active position exists
+        res = engine.execute_signal(sig)
+        log.info("Execution result for %s: %s", ticker, res)
+
+        # Save to state store after execution
+        state.save_signal(sig)
+
+    log.info("=== %s cycle complete ===", trade_type.upper())
+
+
+# ── Scheduler Setup ─────────────────────────────────────────────────────────
 _scheduler = BackgroundScheduler(timezone="UTC")
 
 
-def _setup_scheduler() -> None:
-    # Scalp: every 5 min
+def _setup_scheduler():
     _scheduler.add_job(
-        run_scalp_scan,
+        lambda: run_scan_cycle("scalp"),
         trigger=IntervalTrigger(seconds=cfg.scan_interval_scalp),
         id="scalp_scan",
         name="Scalp Scan (15m)",
         replace_existing=True,
-        max_instances=1,
     )
-    # Day: every 30 min
     _scheduler.add_job(
-        run_day_scan,
+        lambda: run_scan_cycle("day"),
         trigger=IntervalTrigger(seconds=cfg.scan_interval_day),
         id="day_scan",
         name="Day Scan (4h)",
         replace_existing=True,
-        max_instances=1,
     )
-    # Desk summary
-    if cfg.desk_summary_interval > 0:
-        _scheduler.add_job(
-            send_desk_summary,
-            trigger=IntervalTrigger(minutes=cfg.desk_summary_interval),
-            id="desk_summary",
-            name="Desk Summary",
-            replace_existing=True,
-        )
 
 
-# ── Graceful shutdown ─────────────────────────────────────────────────────────
+# ── One-shot Desk Report ────────────────────────────────────────────────────
+def print_live_desk_report():
+    """Run live scan and output formatted desk report to stdout."""
+    core_sigs, extra_sigs, tape = scanner.run_scan("scalp")
+    report = notifier.format_desk_report(core_sigs, extra_sigs, tape, include_executor_contract=True)
+    print(report)
+
+
+# ── Shutdown ────────────────────────────────────────────────────────────────
 def _shutdown(signum=None, frame=None):
-    log.info("Shutting down…")
+    log.info("Shutting down Trade Desk...")
+    telegram_bot.stop_telegram_listener()
     _scheduler.shutdown(wait=False)
     engine.stop_monitor()
     sys.exit(0)
@@ -283,33 +245,67 @@ signal.signal(signal.SIGINT, _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Main ────────────────────────────────────────────────────────────────────
 def main():
-    log.info("Trade Desk Bot starting — mode=%s", cfg.trade_mode.upper())
+    if args.test_connection:
+        print("=" * 60)
+        print("Bybit API Connection Diagnostic")
+        print("=" * 60)
+        conn = engine.client.check_connection()
+        print(f"Status:       {conn.get('status')}")
+        print(f"Target URL:   {conn.get('base_url')}")
+        print(f"Mode:         {conn.get('mode', cfg.trade_mode)}")
+        print(f"Environment:  {conn.get('demo_env', cfg.effective_demo_env)}")
+        print(f"API Key:      {conn.get('masked_key', 'None / Placeholder')}")
+        print(f"Message:      {conn.get('message')}")
+        if conn.get("equity_usdt") is not None and conn.get("equity_usdt") > 0:
+            print(f"USDT Equity:  ${conn.get('equity_usdt', 0.0):,.2f}")
+            print(f"Available:    ${conn.get('available_usdt', 0.0):,.2f}")
+        if conn.get("permissions"):
+            print(f"Permissions:  {json.dumps(conn.get('permissions'))}")
+        print("=" * 60)
+        return
 
-    if cfg.is_live and not cfg.binance_api_key:
-        log.error("LIVE mode requires BINANCE_API_KEY. Set it in .env.")
-        sys.exit(1)
+    if args.desk:
+        print_live_desk_report()
+        return
 
-    if not cfg.telegram_token and not args.no_telegram:
-        log.warning("No TELEGRAM_BOT_TOKEN set — notifications disabled.")
+    if args.execute:
+        print(f"Executing contract line: {args.execute}")
+        res = engine.parse_and_execute_contract_line(args.execute)
+        print(f"Result: {json.dumps(res, indent=2)}")
+        return
+
+    if args.execute_file:
+        path = Path(args.execute_file)
+        if not path.exists():
+            print(f"File not found: {path}")
+            return
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for line in lines:
+            line = line.strip()
+            if line.startswith("BOT|"):
+                print(f"Executing: {line}")
+                res = engine.parse_and_execute_contract_line(line)
+                print(f"Result: {json.dumps(res, indent=2)}")
+        return
+
+    log.info("Starting Xira Trade Desk Bot — Mode: %s (Environment: %s)", cfg.trade_mode.upper(), cfg.effective_demo_env)
+    log.info("Risk per trade: 0.5%% balance risk.")
 
     _start_http_server()
     engine.start_monitor()
+    telegram_bot.start_telegram_listener(scan_trigger_fn=lambda: run_scan_cycle("scalp"))
     _setup_scheduler()
     _scheduler.start()
 
-    notifier.send_startup_message(cfg.trade_mode)
+    # Initial scan
+    run_scan_cycle("scalp")
 
-    # Run initial scan immediately on start
-    log.info("Running initial scalp scan…")
-    run_scalp_scan()
-
-    log.info("Scheduler running. Press Ctrl+C to stop.")
+    log.info("Xira Trade Desk Bot is running. Press Ctrl+C to terminate.")
     try:
         while True:
-            import time as _time
-            _time.sleep(10)
+            time.sleep(1)
     except (KeyboardInterrupt, SystemExit):
         _shutdown()
 

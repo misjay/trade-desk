@@ -1,0 +1,15 @@
+[Unit]
+Description=Xira Autonomous Trade Desk Service (Bybit 24/7)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/xira
+ExecStart=/opt/xira/.venv/bin/python main.py
+Restart=always
+RestartSec=10
+EnvironmentFile=/opt/xira/.env
+
+[Install]
+WantedBy=multi-user.target

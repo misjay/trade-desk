@@ -1,25 +1,19 @@
 """
-test_scanner.py — Unit tests for scanner signal logic.
-Uses mock OHLCV data, no real network calls.
+test_scanner.py — Unit tests for scanner signal logic and desk methodology.
+Uses mock OHLCV data and verifies standalone calls, entry ranges, and contract lines.
 """
 import sys
 import os
-import types
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pandas as pd
 import numpy as np
 
-# Ensure project root is on path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# Mock config singleton before importing scanner
 os.environ.setdefault("TRADE_MODE", "demo")
-os.environ.setdefault("BINANCE_API_KEY", "test")
-os.environ.setdefault("BINANCE_API_SECRET", "test")
-os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test")
-os.environ.setdefault("TELEGRAM_CHAT_ID", "test")
+os.environ.setdefault("DEMO_ENV", "paper")
 
 
 def _make_ohlcv(n: int = 100, trend: str = "neutral") -> pd.DataFrame:
@@ -49,130 +43,87 @@ def _make_ohlcv(n: int = 100, trend: str = "neutral") -> pd.DataFrame:
     df = pd.DataFrame({
         "open": opens, "high": highs, "low": lows,
         "close": closes, "volume": volumes,
-        "quote_vol": [v * price for v in volumes],
+        "turnover": [v * price for v in volumes],
     }, index=idx)
     return df
 
 
-class TestSwingDetection(unittest.TestCase):
-    def setUp(self):
+class TestShelfDetection(unittest.TestCase):
+    def test_detect_shelves(self):
         import scanner as s
-        self.s = s
+        df = _make_ohlcv(60, "neutral")
+        struct = s.detect_shelves_and_edges(df)
+        self.assertIn("demand_shelf", struct)
+        self.assertIn("supply_shelf", struct)
+        self.assertGreater(struct["demand_shelf"][1], struct["demand_shelf"][0])
+        self.assertGreater(struct["supply_shelf"][1], struct["supply_shelf"][0])
 
-    def test_swing_lows_found(self):
-        df = _make_ohlcv(100, "neutral")
-        lows = self.s._find_swing_lows(df, n=5)
-        self.assertGreater(len(lows), 0)
-
-    def test_swing_highs_found(self):
-        df = _make_ohlcv(100, "neutral")
-        highs = self.s._find_swing_highs(df, n=5)
-        self.assertGreater(len(highs), 0)
-
-
-class TestTrendClassification(unittest.TestCase):
-    def setUp(self):
+    def test_vertical_candle_detection(self):
         import scanner as s
-        self.s = s
-
-    def test_up_trend_detected(self):
-        df = _make_ohlcv(100, "up")
-        result = self.s._trend(df)
-        self.assertEqual(result, "bullish_hh")
-
-    def test_down_trend_detected(self):
-        df = _make_ohlcv(100, "down")
-        result = self.s._trend(df)
-        self.assertEqual(result, "bearish_ll")
+        df = _make_ohlcv(60, "neutral")
+        # Inject vertical candle (> 2.5% body)
+        df.iloc[-1, df.columns.get_loc("open")] = 100.0
+        df.iloc[-1, df.columns.get_loc("close")] = 105.0 # 5% move
+        struct = s.detect_shelves_and_edges(df)
+        self.assertTrue(struct["is_vertical"])
 
 
 class TestSignalGeneration(unittest.TestCase):
     def test_wait_returned_when_no_data(self):
         import scanner as s
-        with patch.object(s, "fetch_ohlcv", return_value=None), \
-             patch.object(s, "fetch_live_price", return_value=60000.0):
+        with patch.object(s, "fetch_ohlcv", return_value=None):
             sig = s.analyze_ticker("BTC", "scalp")
         self.assertEqual(sig["side"], "WAIT")
+        self.assertIn("BOT|BTC|WAIT", sig["bot_line"])
 
-    def test_wait_returned_on_price_error(self):
+    def test_standalone_calls(self):
+        """Every call must have its own ticker, no comma-separated bundling."""
         import scanner as s
-        with patch.object(s, "fetch_ohlcv", return_value=None), \
-             patch.object(s, "fetch_live_price", return_value=None):
-            sig = s.analyze_ticker("BTC", "scalp")
-        self.assertEqual(sig["side"], "WAIT")
+        from config import CORE_TICKERS
+        df = _make_ohlcv(60, "neutral")
+        with patch.object(s, "fetch_ohlcv", return_value=df):
+            core_sigs, extra_sigs, tape = s.run_scan("scalp")
 
-    def test_entry_range_present_on_buy(self):
-        """Any BUY signal must have non-None entry_low and entry_high."""
-        import scanner as s
-        df = _make_ohlcv(150, "up")
-        with patch.object(s, "fetch_ohlcv", return_value=df), \
-             patch.object(s, "fetch_live_price", return_value=float(df["low"].quantile(0.1))):
-            sig = s.analyze_ticker("BTC", "scalp")
-        if sig["side"] == "BUY":
-            self.assertIsNotNone(sig["entry_low"])
-            self.assertIsNotNone(sig["entry_high"])
-
-    def test_rr_minimum(self):
-        """BUY/SELL signals must have R:R >= MIN_RR."""
-        import scanner as s
-        from config import MIN_RR
-        df = _make_ohlcv(150, "neutral")
-        with patch.object(s, "fetch_ohlcv", return_value=df), \
-             patch.object(s, "fetch_live_price", return_value=float(df["close"].mean())):
-            sig = s.analyze_ticker("ETH", "scalp")
-        if sig["side"] in ("BUY", "SELL"):
-            self.assertGreaterEqual(sig["rr"], MIN_RR)
-
-
-class TestBtcFloor(unittest.TestCase):
-    def setUp(self):
-        import scanner as s
-        self.s = s
-        # Reset floor state
-        s._btc_session_floor = None
-        s._btc_broke_floor_at = None
-        s._btc_hard_reclaim_at = None
-
-    def test_floor_suppresses_longs(self):
-        import scanner as s
-        import time
-        s._btc_session_floor = 60000.0
-        s._btc_broke_floor_at = time.time()  # just broke
-        self.assertTrue(s.alt_longs_suppressed())
-
-    def test_no_suppression_after_hour(self):
-        import scanner as s
-        import time
-        s._btc_session_floor = 60000.0
-        s._btc_broke_floor_at = time.time() - 3700  # > 1 hour ago
-        self.assertFalse(s.alt_longs_suppressed())
-
-
-class TestRunScanStructure(unittest.TestCase):
-    def test_all_tickers_returned(self):
-        """run_scan must return a signal for every ticker in ALL_TICKERS."""
-        import scanner as s
-        from config import ALL_TICKERS
-        df = _make_ohlcv(150, "neutral")
-        with patch.object(s, "fetch_ohlcv", return_value=df), \
-             patch.object(s, "fetch_live_price", return_value=60000.0), \
-             patch.object(s, "fetch_24h_quote_vol", return_value=1e9):
-            signals = s.run_scan("scalp")
-        tickers_returned = {sig["ticker"] for sig in signals}
-        for t in ALL_TICKERS:
-            self.assertIn(t, tickers_returned, f"Missing ticker: {t}")
-
-    def test_no_bundled_signals(self):
-        """Each signal must be for exactly one ticker."""
-        import scanner as s
-        df = _make_ohlcv(150, "neutral")
-        with patch.object(s, "fetch_ohlcv", return_value=df), \
-             patch.object(s, "fetch_live_price", return_value=60000.0), \
-             patch.object(s, "fetch_24h_quote_vol", return_value=1e9):
-            signals = s.run_scan("scalp")
-        for sig in signals:
+        self.assertEqual(len(core_sigs), len(CORE_TICKERS))
+        for sig in core_sigs:
             self.assertIsInstance(sig["ticker"], str)
-            self.assertNotIn(",", sig["ticker"])  # never bundled
+            self.assertNotIn(",", sig["ticker"])
+            self.assertIn("bot_line", sig)
+
+    def test_contract_line_format(self):
+        import scanner as s
+        sig = s._make_buy_sell(
+            ticker="SOL",
+            side="BUY",
+            trade_type="scalp",
+            tf="15m",
+            entry_low=150.0,
+            entry_high=151.0,
+            tp1=155.0,
+            tp2=160.0,
+            sl=148.5,
+            rr=2.5,
+            structure="Demand shelf test",
+            reason="Held demand",
+            live_price=150.5,
+            leverage=4,
+        )
+        line = sig["bot_line"]
+        self.assertTrue(line.startswith("BOT|SOL|BUY|PERP|15m|150.0000|151.0000|"))
+        parts = line.split("|")
+        self.assertEqual(len(parts), 14)
+
+    def test_4h_trend_confluence(self):
+        import scanner as s
+        df_bullish = _make_ohlcv(30, "up")
+        with patch.object(s, "fetch_ohlcv", return_value=df_bullish):
+            trend = s.get_4h_trend("BTC")
+            self.assertEqual(trend, "BULLISH")
+
+        df_bearish = _make_ohlcv(30, "down")
+        with patch.object(s, "fetch_ohlcv", return_value=df_bearish):
+            trend = s.get_4h_trend("BTC")
+            self.assertEqual(trend, "BEARISH")
 
 
 if __name__ == "__main__":

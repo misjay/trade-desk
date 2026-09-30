@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Trade Desk — Live Dashboard</title>
+  <title>Xira — Bybit Trade Desk</title>
   <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
   <style>
     body { background: #0d1117; color: #e6edf3; font-family: 'Menlo', 'Consolas', monospace; }
@@ -27,8 +27,8 @@
   <!-- Header -->
   <div class="flex items-center justify-between mb-6">
     <div>
-      <h1 class="text-xl font-bold tracking-tight">🖥 Trade Desk</h1>
-      <p class="text-sm" style="color:#8b949e">Bybit V5 SPOT + PERPS</p>
+      <h1 class="text-xl font-bold tracking-tight">⚡ Xira Trade Desk</h1>
+      <p class="text-sm" style="color:#8b949e">Bybit V5 SPOT + PERPS (0.5% Risk Model)</p>
     </div>
     <div class="flex gap-3 items-center">
       <span id="mode-badge" class="badge-demo px-3 py-1 rounded text-xs font-bold">DEMO</span>
@@ -64,13 +64,13 @@
       <table id="positions-table">
         <thead>
           <tr>
-            <th>Ticker</th><th>Side</th><th>Market</th><th>Type</th>
-            <th>Entry</th><th>TP1</th><th>TP2</th><th>SL</th>
-            <th>Lev</th><th>Qty</th><th>Opened</th>
+            <th>Ticker</th><th>Side</th><th>Market</th><th>Status</th>
+            <th>Entry</th><th>Live Mark</th><th>TP1</th><th>TP2</th><th>SL</th>
+            <th>Unrealised PnL</th><th>Lev</th><th>Qty</th><th>Opened</th>
           </tr>
         </thead>
         <tbody id="positions-body">
-          <tr><td colspan="11" style="color:#8b949e;text-align:center;padding:1.5rem">No open positions</td></tr>
+          <tr><td colspan="13" style="color:#8b949e;text-align:center;padding:1.5rem">No open positions</td></tr>
         </tbody>
       </table>
     </div>
@@ -118,8 +118,8 @@
   </p>
 
 <script>
-const STATE_URL   = 'http://127.0.0.1:8765/state';
-const SIGNALS_URL = 'http://127.0.0.1:8765/signals';
+const STATE_URL   = '/state';
+const SIGNALS_URL = '/signals';
 
 function fmt(v, decimals=2) {
   if (v == null) return '—';
@@ -182,22 +182,33 @@ async function refresh() {
     const posBody = document.getElementById('positions-body');
     const posEntries = Object.values(openPos);
     if (posEntries.length === 0) {
-      posBody.innerHTML = '<tr><td colspan="11" style="color:#8b949e;text-align:center;padding:1.5rem">No open positions</td></tr>';
+      posBody.innerHTML = '<tr><td colspan="13" style="color:#8b949e;text-align:center;padding:1.5rem">No open positions</td></tr>';
     } else {
-      posBody.innerHTML = posEntries.map(p => `
+      posBody.innerHTML = posEntries.map(p => {
+        const uPnl = p.unrealised_pnl != null ? p.unrealised_pnl : null;
+        const uPnlStr = uPnl != null ? ((uPnl >= 0 ? '+' : '') + '$' + uPnl.toFixed(2)) : '—';
+        const uPnlClass = uPnl != null ? (uPnl >= 0 ? 'pnl-pos' : 'pnl-neg') : '';
+        const statusBadge = (p.status === 'WORKING')
+          ? '<span style="color:#d29922;font-size:0.7rem;border:1px solid #d29922;padding:1px 5px;border-radius:3px">RESTING</span>'
+          : '<span style="color:#3fb950;font-size:0.7rem;border:1px solid #3fb950;padding:1px 5px;border-radius:3px">ACTIVE</span>';
+
+        return `
         <tr>
           <td><b>${p.ticker}</b></td>
           <td class="${sideClass(p.side)}">${p.side}</td>
           <td>${(p.market||'').toUpperCase()}</td>
-          <td>${p.trade_type||''}</td>
+          <td>${statusBadge}</td>
           <td>${fmt(p.entry_price)}</td>
+          <td>${fmt(p.mark_price)}</td>
           <td>${fmt(p.tp1)}</td>
           <td>${fmt(p.tp2)}</td>
           <td style="color:#f85149">${fmt(p.sl)}</td>
+          <td class="${uPnlClass}">${uPnlStr}</td>
           <td>${p.leverage||1}x</td>
           <td>${(p.qty||0).toFixed(4)}</td>
           <td style="color:#8b949e">${timeAgo(p.opened_at)}</td>
-        </tr>`).join('');
+        </tr>`;
+      }).join('');
     }
 
     // Signals table

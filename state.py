@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -60,10 +62,29 @@ def _default_state() -> Dict[str, Any]:
 
 def _save(state: Dict[str, Any]) -> None:
     state["updated_at"] = _now()
-    tmp = _STATE_FILE.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-    tmp.replace(_STATE_FILE)
+    content = json.dumps(state, indent=2)
+    # Retry loop to handle Windows file locking gracefully
+    for attempt in range(6):
+        tmp = _STATE_FILE.with_suffix(f".tmp_{os.getpid()}_{attempt}")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(content)
+            tmp.replace(_STATE_FILE)
+            return
+        except OSError:
+            if tmp.exists():
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            time.sleep(0.04)
+
+    # Fallback direct write
+    try:
+        with open(_STATE_FILE, "w", encoding="utf-8") as f:
+            f.write(content)
+    except Exception as exc:
+        log.warning("State direct write fallback: %s", exc)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -82,6 +103,18 @@ def set_equity(new_equity: float) -> None:
     with _lock:
         s = _load_raw()
         s["paper_equity"] = round(new_equity, 4)
+        _save(s)
+
+
+def is_paused() -> bool:
+    with _lock:
+        return bool(_load_raw().get("is_paused", False))
+
+
+def set_paused(paused: bool) -> None:
+    with _lock:
+        s = _load_raw()
+        s["is_paused"] = paused
         _save(s)
 
 
@@ -123,7 +156,7 @@ def open_position(pos: dict) -> None:
         _save(s)
 
 
-def close_position(pos_id: str, exit_price: float, reason: str) -> Optional[dict]:
+def close_position(pos_id: str, exit_price: float, reason: str, exact_pnl: Optional[float] = None) -> Optional[dict]:
     """
     Close position by ID. Returns closed position dict with PnL.
     """
@@ -138,12 +171,17 @@ def close_position(pos_id: str, exit_price: float, reason: str) -> Optional[dict
         qty = pos["qty"]
         leverage = pos.get("leverage", 1)
 
-        if pos["side"] == "BUY":
-            pnl_pct = (exit_price - entry) / entry * leverage
+        if exact_pnl is not None:
+            pnl_usdt = exact_pnl
+            notional = entry * qty
+            margin = notional / max(1, leverage) if leverage > 0 else notional
+            pnl_pct = (pnl_usdt / margin) if margin > 0 else 0.0
         else:
-            pnl_pct = (entry - exit_price) / entry * leverage
-
-        pnl_usdt = pnl_pct * (entry * qty)
+            if pos["side"] == "BUY":
+                pnl_pct = (exit_price - entry) / entry * leverage
+            else:
+                pnl_pct = (entry - exit_price) / entry * leverage
+            pnl_usdt = pnl_pct * (entry * qty)
 
         pos["exit_price"] = exit_price
         pos["exit_reason"] = reason
@@ -170,6 +208,51 @@ def close_position(pos_id: str, exit_price: float, reason: str) -> Optional[dict
 
         _save(s)
         return pos
+
+
+def update_open_position(pos_id: str, updates: dict) -> None:
+    with _lock:
+        s = _load_raw()
+        if pos_id in s["open_positions"]:
+            s["open_positions"][pos_id].update(updates)
+            _save(s)
+
+
+def remove_open_position(pos_id: str) -> Optional[dict]:
+    with _lock:
+        s = _load_raw()
+        pos = s["open_positions"].pop(pos_id, None)
+        if pos:
+            _save(s)
+        return pos
+
+
+def record_closed_position(closed: dict) -> None:
+    with _lock:
+        s = _load_raw()
+        order_id = closed.get("order_id")
+        cid = closed.get("id")
+        for existing in s["closed_positions"]:
+            if order_id and existing.get("order_id") == order_id:
+                return
+            if cid and existing.get("id") == cid:
+                return
+
+        s["closed_positions"].append(closed)
+        pnl = closed.get("pnl_usdt", 0.0)
+        if pnl > 0:
+            s["session"]["wins"] += 1
+        elif pnl < 0:
+            s["session"]["losses"] += 1
+        else:
+            s["session"]["breakevens"] += 1
+        s["session"]["total_pnl_usdt"] = round(s["session"]["total_pnl_usdt"] + pnl, 4)
+        _save(s)
+
+
+def get_closed_positions() -> List[dict]:
+    with _lock:
+        return list(_load_raw().get("closed_positions", []))
 
 
 def get_open_positions() -> Dict[str, dict]:

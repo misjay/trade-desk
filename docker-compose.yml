@@ -1,9 +1,9 @@
 version: '3.8'
 
 services:
-  trade-desk:
+  xira:
     build: .
-    container_name: trade-desk-bot
+    container_name: xira-trade-desk
     restart: always
     env_file:
       - .env
