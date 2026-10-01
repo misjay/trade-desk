@@ -288,6 +288,12 @@ class TestTelegramBot(unittest.TestCase):
                 self.assertEqual(cfg_fb["token"], "mock_token_123")
                 self.assertEqual(cfg_fb["chat_id"], "999888")
 
+                # Clean up state
+                s = state.get_state()
+                if "feedback_bot" in s:
+                    del s["feedback_bot"]
+                    state._save(s)
+
 
 if __name__ == "__main__":
     unittest.main()
