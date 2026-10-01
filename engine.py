@@ -279,8 +279,12 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
 
     entry_mid = (entry_low + entry_high) / 2.0
     equity = get_current_equity()
-    lev = sig.get("leverage") or get_leverage(ticker, scalp=(trade_type == "scalp"))
-    lev = min(lev, get_hard_cap(ticker))
+    custom_lev = state.get_custom_leverage(ticker)
+    if custom_lev is not None:
+        lev = int(custom_lev)
+    else:
+        lev = sig.get("leverage") or get_leverage(ticker, scalp=(trade_type == "scalp"))
+        lev = min(lev, get_hard_cap(ticker))
 
     # Pre-execution validation
     valid, reason = validate_execution_conditions(

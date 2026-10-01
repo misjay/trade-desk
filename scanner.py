@@ -41,6 +41,7 @@ from config import (
     tv_url,
     VERTICAL_CANDLE_BODY_PCT,
 )
+import state
 
 log = logging.getLogger(__name__)
 
@@ -283,7 +284,7 @@ def analyze_ticker(ticker: str, trade_type: str = "scalp") -> dict:
                     req_rr = 2.0  # require higher RR for counter-trend scalps
 
             if rr >= req_rr and sl < entry_low < entry_high < tp1 < tp2:
-                lev = get_leverage(ticker, scalp=(trade_type == "scalp"))
+                lev = state.get_effective_leverage(ticker, scalp=(trade_type == "scalp"))
                 return _make_buy_sell(
                     ticker=ticker,
                     side="BUY",
@@ -330,7 +331,7 @@ def analyze_ticker(ticker: str, trade_type: str = "scalp") -> dict:
                     req_rr = 2.0  # require higher RR for counter-trend scalps
 
             if rr >= req_rr and tp2 < tp1 < entry_low < entry_high < sl:
-                lev = get_leverage(ticker, scalp=(trade_type == "scalp"))
+                lev = state.get_effective_leverage(ticker, scalp=(trade_type == "scalp"))
                 return _make_buy_sell(
                     ticker=ticker,
                     side="SELL",

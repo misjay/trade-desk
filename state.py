@@ -17,7 +17,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from config import cfg
 
@@ -56,6 +56,7 @@ def _default_state() -> Dict[str, Any]:
             "total_pnl_usdt": 0.0,
         },
         "avoid_list": [],
+        "custom_leverage": {},
         "created_at": _now(),
         "updated_at": _now(),
     }
@@ -305,3 +306,30 @@ def remove_from_avoid_list(tickers: List[str]) -> List[str]:
         s["avoid_list"] = sorted(list(current))
         _save(s)
         return s["avoid_list"]
+
+
+def get_custom_leverage(ticker: Optional[str] = None) -> Union[Dict[str, int], Optional[int]]:
+    with _lock:
+        levs = _load_raw().get("custom_leverage", {})
+        if ticker:
+            return levs.get(ticker.upper())
+        return dict(levs)
+
+
+def set_custom_leverage(ticker: str, leverage: int) -> int:
+    with _lock:
+        s = _load_raw()
+        if "custom_leverage" not in s:
+            s["custom_leverage"] = {}
+        val = int(leverage)
+        s["custom_leverage"][ticker.upper()] = val
+        _save(s)
+        return val
+
+
+def get_effective_leverage(ticker: str, scalp: bool = True) -> int:
+    custom = get_custom_leverage(ticker)
+    if custom is not None:
+        return int(custom)
+    from config import get_leverage
+    return get_leverage(ticker, scalp=scalp)

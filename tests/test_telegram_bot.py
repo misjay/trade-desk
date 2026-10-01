@@ -152,6 +152,40 @@ class TestTelegramBot(unittest.TestCase):
             success = telegram_bot.register_bot_commands()
             self.assertTrue(success)
 
+    def test_leverage_command(self):
+        import telegram_bot
+        import state
+        import engine
+
+        with patch.object(engine.client, "set_isolated_margin_and_leverage", return_value=True), \
+             patch.object(telegram_bot, "_reply") as mock_reply:
+
+            telegram_bot.handle_command("/leverage BTC 10", "12345")
+            mock_reply.assert_called_once()
+            self.assertIn("Leverage for BTC set to 10x", mock_reply.call_args[0][1])
+            self.assertEqual(state.get_custom_leverage("BTC"), 10)
+            self.assertEqual(state.get_effective_leverage("BTC"), 10)
+
+    def test_existingleverage_command(self):
+        import telegram_bot
+        import engine
+
+        with patch.object(engine.client, "get_active_positions", return_value=[]), \
+             patch.object(telegram_bot, "_reply") as mock_reply:
+
+            # Query all
+            telegram_bot.handle_command("/existingleverage", "12345")
+            mock_reply.assert_called_once()
+            self.assertIn("Existing Leverage by Asset", mock_reply.call_args[0][1])
+
+        with patch.object(engine.client, "get_active_positions", return_value=[]), \
+             patch.object(telegram_bot, "_reply") as mock_reply:
+
+            # Query specific ticker
+            telegram_bot.handle_command("/existingleverage BTC", "12345")
+            mock_reply.assert_called_once()
+            self.assertIn("Leverage for BTC", mock_reply.call_args[0][1])
+
 
 if __name__ == "__main__":
     unittest.main()

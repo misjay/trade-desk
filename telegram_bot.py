@@ -52,6 +52,8 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
             "• `/status` — Balance, equity, open positions & win stats\n"
             "• `/positions` — Detailed active positions with live PnL & targets\n"
             "• `/derisk` — 🛡️ Close 100% of winning trades & trim 50% of losers\n"
+            "• `/leverage <COIN> <VAL>` — ⚡ Set leverage (e.g. `/leverage BTC 10`)\n"
+            "• `/existingleverage` — 📊 Show leverage used for each asset\n"
             "• `/avoid <COINS>` — 🚫 Blacklist assets (e.g. `/avoid DOGE PEPE`)\n"
             "• `/allow <COINS>` — 🟢 Restore assets (e.g. `/allow DOGE`)\n"
             "• `/avoided` — 📋 Show all currently avoided assets\n"
@@ -284,6 +286,96 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
         state.add_to_avoid_list([target_ticker])
         _reply(chat_id, f"✂️ *Dropped {target_ticker}:* {close_msg}Added to Avoid List.")
 
+    elif cmd == "/leverage":
+        if len(args) < 2:
+            _reply(chat_id, "⚠️ Usage: `/leverage <TICKER> <VALUE>`\nExample: `/leverage BTC 10`")
+            return
+        ticker = args[0].upper().replace("USDT", "")
+        try:
+            val = int(args[1])
+            if val < 1 or val > 100:
+                _reply(chat_id, "❌ Leverage must be an integer between 1 and 100.")
+                return
+        except ValueError:
+            _reply(chat_id, f"❌ Invalid leverage value: `{args[1]}`. Must be an integer.")
+            return
+
+        sym = bybit_linear_symbol(ticker)
+        # 1. Update on Bybit exchange
+        ex_res = engine.client.set_isolated_margin_and_leverage(sym, val)
+
+        # 2. Persist custom leverage in state
+        state.set_custom_leverage(ticker, val)
+
+        # 3. Update any currently open position locally
+        open_pos = state.get_open_positions()
+        for pid, p in open_pos.items():
+            if p.get("ticker") == ticker and p.get("market") == "perp":
+                state.update_open_position(pid, {"leverage": val})
+                break
+
+        ex_msg = "✅ Updated on Bybit exchange" if ex_res else "⚠️ Note: Applied locally for future orders (exchange update failed or off-market)"
+        _reply(
+            chat_id,
+            f"⚡ *Leverage for {ticker} set to {val}x!*\n\n"
+            f"• *Exchange Setting*: {ex_msg}\n"
+            f"• *Future Signals*: All new {ticker} orders will size & execute at `{val}x`\n"
+            f"• *Margin Mode*: Isolated"
+        )
+
+    elif cmd in ("/existingleverage", "/leverages"):
+        from config import CORE_TICKERS
+        if args:
+            ticker = args[0].upper().replace("USDT", "")
+            sym = bybit_linear_symbol(ticker)
+            eff_lev = state.get_effective_leverage(ticker)
+            custom = state.get_custom_leverage(ticker)
+            custom_str = " (User Custom Override)" if custom is not None else " (System Default)"
+            
+            active = engine.client.get_active_positions()
+            matched = [p for p in active if p["symbol"] == sym]
+            active_str = f"Active on Bybit ({matched[0]['size']} contracts)" if matched else "No active position"
+
+            _reply(
+                chat_id,
+                f"📊 *Leverage for {ticker}:*\n\n"
+                f"• *Effective Leverage*: `{eff_lev}x`{custom_str}\n"
+                f"• *Position State*: {active_str}\n"
+                f"• *Margin Mode*: Isolated\n\n"
+                f"Change it anytime with: `/leverage {ticker} <VALUE>`"
+            )
+            return
+
+        active = engine.client.get_active_positions()
+        active_map = {p["symbol"].replace("USDT", "").replace("1000", ""): p for p in active}
+        custom_map = state.get_custom_leverage()
+
+        lines = ["📊 *Existing Leverage by Asset:*", ""]
+
+        if active_map:
+            lines.append("🔥 *Active Positions on Bybit:*")
+            for t, p in sorted(active_map.items()):
+                lev = p.get("leverage", state.get_effective_leverage(t))
+                lines.append(f"• *{t}*: `{lev}x` ({p.get('side')} {p.get('size')} contracts)")
+            lines.append("")
+
+        if custom_map:
+            lines.append("⚡ *User Custom Overrides:*")
+            for t, lev in sorted(custom_map.items()):
+                lines.append(f"• *{t}*: `{lev}x` (Custom)")
+            lines.append("")
+
+        lines.append("🌐 *Core 24 Settings:*")
+        core_chunks = []
+        for t in CORE_TICKERS:
+            lev = state.get_effective_leverage(t)
+            is_cust = " [C]" if t in custom_map else ""
+            core_chunks.append(f"{t}: `{lev}x`{is_cust}")
+        lines.append(", ".join(core_chunks))
+        lines.append("\n_Use `/leverage <TICKER> <VALUE>` to change any asset._")
+
+        _reply(chat_id, "\n".join(lines))
+
     else:
         _reply(chat_id, f"Unknown command: `{cmd}`. Type `/help` for available commands.")
 
@@ -340,6 +432,8 @@ BOT_COMMANDS = [
     {"command": "status", "description": "Balance, equity & open positions"},
     {"command": "positions", "description": "Active Bybit positions & targets"},
     {"command": "derisk", "description": "Close winning trades & trim losers 50%"},
+    {"command": "leverage", "description": "Set leverage (e.g. /leverage BTC 10)"},
+    {"command": "existingleverage", "description": "Show leverage used for each asset"},
     {"command": "scan", "description": "Trigger immediate scalp scan"},
     {"command": "avoid", "description": "Blacklist assets from trading"},
     {"command": "allow", "description": "Restore asset to active trading"},
