@@ -142,6 +142,16 @@ class TestTelegramBot(unittest.TestCase):
             self.assertEqual(closed_calls[0], ("BTCUSDT", "Sell", 1.0))
             self.assertEqual(closed_calls[1], ("ETHUSDT", "Sell", 1.0))
 
+    def test_register_bot_commands(self):
+        import telegram_bot
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"ok": True}
+
+        with patch("requests.post", return_value=mock_resp):
+            success = telegram_bot.register_bot_commands()
+            self.assertTrue(success)
+
 
 if __name__ == "__main__":
     unittest.main()

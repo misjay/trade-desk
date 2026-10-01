@@ -336,11 +336,52 @@ def _poll_updates_loop(scan_trigger_fn=None) -> None:
         time.sleep(1)
 
 
+BOT_COMMANDS = [
+    {"command": "status", "description": "Balance, equity & open positions"},
+    {"command": "positions", "description": "Active Bybit positions & targets"},
+    {"command": "derisk", "description": "Close winning trades & trim losers 50%"},
+    {"command": "scan", "description": "Trigger immediate scalp scan"},
+    {"command": "avoid", "description": "Blacklist assets from trading"},
+    {"command": "allow", "description": "Restore asset to active trading"},
+    {"command": "avoided", "description": "List currently avoided assets"},
+    {"command": "drop", "description": "Close position & blacklist coin"},
+    {"command": "pause", "description": "Pause automated order execution"},
+    {"command": "resume", "description": "Resume automated execution"},
+    {"command": "close", "description": "Market close a specific ticker"},
+    {"command": "closeall", "description": "Emergency close all positions"},
+    {"command": "help", "description": "Show command guide and help"},
+]
+
+
+def register_bot_commands() -> bool:
+    """
+    Register bot commands with Telegram so typing '/' pops up the autocomplete command menu.
+    """
+    if not cfg.telegram_token:
+        return False
+    url = f"https://api.telegram.org/bot{cfg.telegram_token}/setMyCommands"
+    try:
+        r = requests.post(url, json={"commands": BOT_COMMANDS}, timeout=10)
+        if r.status_code == 200 and r.json().get("ok"):
+            log.info("Registered %d Telegram commands with setMyCommands", len(BOT_COMMANDS))
+            menu_btn_url = f"https://api.telegram.org/bot{cfg.telegram_token}/setChatMenuButton"
+            requests.post(menu_btn_url, json={"menu_button": {"type": "commands"}}, timeout=10)
+            return True
+        else:
+            log.warning("Telegram setMyCommands failed: %s", r.text)
+    except Exception as exc:
+        log.warning("Telegram setMyCommands error: %s", exc)
+    return False
+
+
 def start_telegram_listener(scan_trigger_fn=None) -> None:
     global _bot_running
     if not cfg.telegram_token:
         log.info("Telegram token not set, interactive listener disabled")
         return
+
+    # Register popup command menu with Telegram Bot API
+    register_bot_commands()
 
     if not _bot_running:
         _bot_running = True
