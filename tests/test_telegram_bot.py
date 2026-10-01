@@ -186,6 +186,15 @@ class TestTelegramBot(unittest.TestCase):
             mock_reply.assert_called_once()
             self.assertIn("Leverage for BTC", mock_reply.call_args[0][1])
 
+    def test_report_commands(self):
+        import telegram_bot
+        with patch("analytics.send_report") as mock_send, \
+             patch.object(telegram_bot, "_reply") as mock_reply:
+
+            for cmd in ("/hourlyreport", "/dailyreport", "/weeklyreport", "/monthlyreport"):
+                telegram_bot.handle_command(cmd, "12345")
+                self.assertIn("Analytics Report", mock_reply.call_args[0][1])
+
 
 if __name__ == "__main__":
     unittest.main()

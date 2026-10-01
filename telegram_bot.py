@@ -52,6 +52,10 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
             "• `/status` — Balance, equity, open positions & win stats\n"
             "• `/positions` — Detailed active positions with live PnL & targets\n"
             "• `/derisk` — 🛡️ Close 100% of winning trades & trim 50% of losers\n"
+            "• `/hourlyreport` — ⏱️ Hourly analytics breakdown & chart\n"
+            "• `/dailyreport` — 📅 Daily (24h) performance & chart\n"
+            "• `/weeklyreport` — 📆 Weekly (7d) performance & chart\n"
+            "• `/monthlyreport` — 🗓️ Monthly (30d) performance & chart\n"
             "• `/leverage <COIN> <VAL>` — ⚡ Set leverage (e.g. `/leverage BTC 10`)\n"
             "• `/existingleverage` — 📊 Show leverage used for each asset\n"
             "• `/avoid <COINS>` — 🚫 Blacklist assets (e.g. `/avoid DOGE PEPE`)\n"
@@ -376,6 +380,17 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
 
         _reply(chat_id, "\n".join(lines))
 
+    elif cmd in ("/hourlyreport", "/dailyreport", "/weeklyreport", "/monthlyreport"):
+        period = cmd.replace("/", "").replace("report", "")
+        _reply(chat_id, f"📊 *Generating {period.capitalize()} Analytics Report & Chart...*")
+        import analytics
+        threading.Thread(
+            target=analytics.send_report,
+            args=(chat_id, period),
+            daemon=True,
+            name=f"report-{period}",
+        ).start()
+
     else:
         _reply(chat_id, f"Unknown command: `{cmd}`. Type `/help` for available commands.")
 
@@ -432,6 +447,10 @@ BOT_COMMANDS = [
     {"command": "status", "description": "Balance, equity & open positions"},
     {"command": "positions", "description": "Active Bybit positions & targets"},
     {"command": "derisk", "description": "Close winning trades & trim losers 50%"},
+    {"command": "dailyreport", "description": "📅 Daily 24h analytics report & chart"},
+    {"command": "hourlyreport", "description": "⏱️ Hourly analytics breakdown & chart"},
+    {"command": "weeklyreport", "description": "📆 Weekly 7d analytics report & chart"},
+    {"command": "monthlyreport", "description": "🗓️ Monthly 30d analytics report & chart"},
     {"command": "leverage", "description": "Set leverage (e.g. /leverage BTC 10)"},
     {"command": "existingleverage", "description": "Show leverage used for each asset"},
     {"command": "scan", "description": "Trigger immediate scalp scan"},
