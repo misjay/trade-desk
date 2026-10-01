@@ -4,7 +4,7 @@ test_telegram_bot.py — Unit tests for interactive Telegram command handler.
 import os
 import sys
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, PropertyMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -212,6 +212,38 @@ class TestTelegramBot(unittest.TestCase):
             # Test /cancelallorders
             telegram_bot.handle_command("/cancelallorders", "12345")
             self.assertIn("Cancelled All Resting Orders", mock_reply.call_args[0][1])
+
+    def test_tp_command(self):
+        import telegram_bot
+        import engine
+
+        mock_positions = [
+            {"symbol": "BTCUSDT", "side": "Buy", "size": 0.1, "unrealised_pnl": 50.0},
+            {"symbol": "ETHUSDT", "side": "Buy", "size": 1.0, "unrealised_pnl": -20.0},
+        ]
+
+        with patch.object(type(engine.client), "is_paper", new_callable=PropertyMock, return_value=False), \
+             patch.object(engine.client, "get_active_positions", return_value=mock_positions), \
+             patch.object(engine.client, "close_position_market", return_value={"orderId": "tp_1"}) as mock_close, \
+             patch.object(engine, "_sync_with_bybit"), \
+             patch.object(engine.client, "get_wallet_balance", return_value={"equity": 50050.0, "available": 40000.0}), \
+             patch.object(telegram_bot, "_reply") as mock_reply:
+
+            # 1. Run /tp (should close only BTC, keep ETH open)
+            telegram_bot.handle_command("/tp", "12345")
+            self.assertIn("Take Profit Executed", mock_reply.call_args[0][1])
+            self.assertIn("BTC", mock_reply.call_args[0][1])
+            self.assertIn("50.00", mock_reply.call_args[0][1])
+            self.assertIn("Kept Open", mock_reply.call_args[0][1])
+            self.assertIn("ETH", mock_reply.call_args[0][1])
+            mock_close.assert_called_once_with("BTCUSDT", "Sell", 0.1)
+
+            # 2. When no positions in profit
+            mock_close.reset_mock()
+            with patch.object(engine.client, "get_active_positions", return_value=[mock_positions[1]]):
+                telegram_bot.handle_command("/tp", "12345")
+                self.assertIn("No positions are currently in profit", mock_reply.call_args[0][1])
+                mock_close.assert_not_called()
 
 
 if __name__ == "__main__":

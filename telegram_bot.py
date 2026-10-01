@@ -51,6 +51,7 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
             "🤖 *Xira Autonomous Trade Desk Control*\n\n"
             "• `/status` — Balance, equity, open positions & win stats\n"
             "• `/positions` — Detailed active positions with live PnL & targets\n"
+            "• `/tp` — 🎯 Close all open trades currently in profit\n"
             "• `/derisk` — 🛡️ Close 100% of winning trades & trim 50% of losers\n"
             "• `/hourlyreport` — ⏱️ Hourly analytics breakdown & chart\n"
             "• `/dailyreport` — 📅 Daily (24h) performance & chart\n"
@@ -180,6 +181,115 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
 
         _reply(chat_id, f"🚨 *EMERGENCY CLOSE ALL:* Market closed {closed_count}/{len(active)} positions on Bybit.")
         engine._sync_with_bybit()
+
+    elif cmd in ("/tp", "/takeprofit", "/closeprofit", "/closeinprofit"):
+        target_tickers = {a.upper().replace("USDT", "") for a in args} if args else set()
+
+        if engine.client.is_paper:
+            open_pos = state.get_open_positions()
+            if not open_pos:
+                _reply(chat_id, "ℹ️ No open paper positions to close.")
+                return
+
+            winners = []
+            for pid, pos in open_pos.items():
+                t = pos.get("ticker", "").upper().replace("USDT", "")
+                if target_tickers and t not in target_tickers:
+                    continue
+                pnl = float(pos.get("unrealised_pnl") or 0.0)
+                if pnl > 0:
+                    winners.append((pid, pos, pnl))
+
+            if not winners:
+                _reply(chat_id, "ℹ️ No open positions are currently in profit to close.")
+                return
+
+            total_profit_banked = 0.0
+            closed_list = []
+            for pid, pos, pnl in winners:
+                mark = float(pos.get("mark_price") or pos.get("entry_price") or 0.0)
+                closed = state.close_position(pid, mark, "MANUAL_TP")
+                if closed:
+                    pnl_val = float(closed.get("pnl_usdt", pnl))
+                    total_profit_banked += pnl_val
+                    closed_list.append(f"• *{pos.get('ticker')}* `{pos.get('side')}`: +${pnl_val:,.2f} USDT")
+
+            lines = [
+                f"🎯 *Take Profit Executed ({len(closed_list)} closed)*",
+                f"💰 *Total Profit Banked*: `+${total_profit_banked:,.2f} USDT`\n",
+            ]
+            lines.extend(closed_list)
+            _reply(chat_id, "\n".join(lines))
+            return
+
+        active = engine.client.get_active_positions(category="linear")
+        if not active:
+            _reply(chat_id, "ℹ️ No active linear positions on Bybit.")
+            return
+
+        positions_to_check = []
+        for p in active:
+            sym = p["symbol"]
+            ticker = sym.replace("USDT", "")
+            if ticker.startswith("1000"):
+                ticker = ticker[4:]
+            if not target_tickers or ticker in target_tickers:
+                positions_to_check.append((p, ticker))
+
+        if not positions_to_check:
+            _reply(chat_id, f"ℹ️ No active positions match specified ticker(s): {', '.join(args)}")
+            return
+
+        winners = [(p, t) for p, t in positions_to_check if float(p.get("unrealised_pnl") or 0.0) > 0]
+        if not winners:
+            status_lines = ["ℹ️ *No positions are currently in profit to close.*", "", "📊 *Current Open PnL:*"]
+            for p, t in positions_to_check:
+                pnl = float(p.get("unrealised_pnl") or 0.0)
+                status_lines.append(f"• *{t}* `{p.get('side')}`: ${pnl:+,.2f} USDT")
+            status_lines.append("\n_All positions remain protected by exchange Stop Loss._")
+            _reply(chat_id, "\n".join(status_lines))
+            return
+
+        closed_list = []
+        failed_list = []
+        total_profit_banked = 0.0
+
+        for pos, ticker in winners:
+            sym = pos["symbol"]
+            side = pos["side"]
+            size = float(pos["size"])
+            pnl = float(pos.get("unrealised_pnl") or 0.0)
+            close_side = "Sell" if side.lower() == "buy" else "Buy"
+
+            res = engine.client.close_position_market(sym, close_side, size)
+            if res:
+                closed_list.append(f"• *{ticker}* `{side}`: +${pnl:,.2f} USDT ({size} contracts)")
+                total_profit_banked += pnl
+            else:
+                failed_list.append(f"• *{ticker}* `{side}`: Market close order failed")
+
+        engine._sync_with_bybit()
+        bal = engine.client.get_wallet_balance("USDT")
+        eq = bal.get("equity", 0.0)
+        avail = bal.get("available", 0.0)
+
+        lines = [
+            f"🎯 *Take Profit Executed ({len(closed_list)}/{len(winners)} in profit closed)*",
+            f"💰 *Total Profit Banked*: `+${total_profit_banked:,.2f} USDT`\n",
+        ]
+        lines.extend(closed_list)
+        if failed_list:
+            lines.append("\n⚠️ *Failed:*")
+            lines.extend(failed_list)
+
+        remaining = [t for p, t in positions_to_check if float(p.get("unrealised_pnl") or 0.0) <= 0]
+        if remaining:
+            lines.append(f"\n🛡️ *Kept Open ({len(remaining)} in loss/breakeven protected by SL):* `{', '.join(remaining)}`")
+
+        lines.append(f"\n💼 *Account Equity*: `${eq:,.2f} USDT`")
+        lines.append(f"🟢 *Available Margin*: `${avail:,.2f} USDT`")
+
+        _reply(chat_id, "\n".join(lines))
 
     elif cmd in ("/derisk", "/harvest"):
         active = engine.client.get_active_positions(category="linear")
@@ -505,6 +615,7 @@ def _poll_updates_loop(scan_trigger_fn=None) -> None:
 BOT_COMMANDS = [
     {"command": "status", "description": "Balance, equity & open positions"},
     {"command": "positions", "description": "Active Bybit positions & targets"},
+    {"command": "tp", "description": "🎯 Close all open trades in profit"},
     {"command": "derisk", "description": "Close winning trades & trim losers 50%"},
     {"command": "dailyreport", "description": "📅 Daily 24h analytics report & chart"},
     {"command": "hourlyreport", "description": "⏱️ Hourly analytics breakdown & chart"},
