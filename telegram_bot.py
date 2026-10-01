@@ -57,6 +57,9 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
             "• `/dailyreport` — 📅 Daily (24h) performance & chart\n"
             "• `/weeklyreport` — 📆 Weekly (7d) performance & chart\n"
             "• `/monthlyreport` — 🗓️ Monthly (30d) performance & chart\n"
+            "• `/feedback` — 🧠 Daily intelligence feedback: most lost/profit assets & learning\n"
+            "• `/setfeedbackbot <TOKEN> <CHAT_ID>` — 🤖 Connect another bot for daily feedback\n"
+            "• `/feedbackbot` — 📋 View current feedback bot destination\n"
             "• `/leverage <COIN> <VAL>` — ⚡ Set leverage (e.g. `/leverage BTC 10`)\n"
             "• `/existingleverage` — 📊 Show leverage used for each asset\n"
             "• `/avoid <COINS>` — 🚫 Blacklist assets (e.g. `/avoid DOGE PEPE`)\n"
@@ -526,6 +529,52 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
             name=f"report-{period}",
         ).start()
 
+    elif cmd in ("/feedback", "/dailyfeedback", "/learning"):
+        _reply(chat_id, "🧠 *Compiling Daily Intelligence & Learning Feedback...*")
+        import learning_engine
+        threading.Thread(
+            target=learning_engine.send_daily_feedback,
+            kwargs={"chat_id": chat_id},
+            daemon=True,
+            name="feedback-thread",
+        ).start()
+
+    elif cmd == "/setfeedbackbot":
+        if len(args) < 2:
+            _reply(chat_id, "⚠️ Usage: `/setfeedbackbot <BOT_TOKEN> <CHAT_ID>`\nExample: `/setfeedbackbot 123456:ABC-DEF -1001234567890`")
+            return
+        fb_token = args[0]
+        fb_chat = args[1]
+        state.set_feedback_bot_config(fb_token, fb_chat)
+        test_url = f"https://api.telegram.org/bot{fb_token}/sendMessage"
+        try:
+            r = requests.post(
+                test_url,
+                json={
+                    "chat_id": fb_chat,
+                    "text": "✅ *Feedback Connection Established!* Xira will deliver daily intelligence and learning feedback to this destination.",
+                    "parse_mode": "Markdown",
+                },
+                timeout=8,
+            )
+            if r.status_code == 200 and r.json().get("ok"):
+                _reply(chat_id, f"✅ *Feedback Bot Successfully Configured!*\n\n• Token: `{fb_token[:10]}...`\n• Chat ID: `{fb_chat}`\n• Test message delivered to your other bot.")
+            else:
+                _reply(chat_id, f"⚠️ Config saved, but test message to other bot failed: `{r.text}`. Please check token & chat ID.")
+        except Exception as exc:
+            _reply(chat_id, f"⚠️ Config saved, but connection error: `{exc}`.")
+
+    elif cmd == "/feedbackbot":
+        cfg_fb = state.get_feedback_bot_config()
+        masked_tok = (cfg_fb['token'][:8] + "..." + cfg_fb['token'][-4:]) if len(cfg_fb['token']) > 15 else "Primary Bot Token"
+        _reply(
+            chat_id,
+            f"🤖 *Current Daily Feedback Destination:*\n\n"
+            f"• *Bot Token*: `{masked_tok}`\n"
+            f"• *Destination Chat ID*: `{cfg_fb['chat_id']}`\n\n"
+            f"To change or point to another bot:\n`/setfeedbackbot <BOT_TOKEN> <CHAT_ID>`"
+        )
+
     elif cmd in ("/cancelorder", "/cancel"):
         if not args:
             _reply(chat_id, "⚠️ Usage: `/cancelorder <ASSET1> <ASSET2> ...`\nExample: `/cancelorder BTC ETH`")
@@ -645,6 +694,8 @@ BOT_COMMANDS = [
     {"command": "hourlyreport", "description": "⏱️ Hourly analytics breakdown & chart"},
     {"command": "weeklyreport", "description": "📆 Weekly 7d analytics report & chart"},
     {"command": "monthlyreport", "description": "🗓️ Monthly 30d analytics report & chart"},
+    {"command": "feedback", "description": "🧠 Daily feedback, worst/best assets & learning"},
+    {"command": "feedbackbot", "description": "View current feedback bot destination"},
     {"command": "leverage", "description": "Set leverage (e.g. /leverage BTC 10)"},
     {"command": "existingleverage", "description": "Show leverage used for each asset"},
     {"command": "scan", "description": "Trigger immediate scalp scan"},

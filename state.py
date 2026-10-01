@@ -365,3 +365,41 @@ def set_spot_enabled(enabled: bool) -> bool:
         _save(s)
         return s["spot_enabled"]
 
+
+def get_feedback_bot_config() -> Dict[str, str]:
+    with _lock:
+        s = _load_raw()
+        cfg_custom = s.get("feedback_bot", {})
+        token = cfg_custom.get("token") or cfg.feedback_bot_token or cfg.telegram_token
+        chat_id = cfg_custom.get("chat_id") or cfg.feedback_chat_id or cfg.telegram_chat_id
+        return {"token": token, "chat_id": str(chat_id)}
+
+
+def set_feedback_bot_config(token: str, chat_id: str) -> Dict[str, str]:
+    with _lock:
+        s = _load_raw()
+        s["feedback_bot"] = {
+            "token": token.strip(),
+            "chat_id": str(chat_id).strip(),
+            "updated_at": _now(),
+        }
+        _save(s)
+        return s["feedback_bot"]
+
+
+def record_learning_event(event: dict) -> None:
+    with _lock:
+        s = _load_raw()
+        if "learning_events" not in s:
+            s["learning_events"] = []
+        event["timestamp"] = _now()
+        s["learning_events"].append(event)
+        if len(s["learning_events"]) > 50:
+            s["learning_events"] = s["learning_events"][-50:]
+        _save(s)
+
+
+def get_learning_history() -> List[dict]:
+    with _lock:
+        return list(_load_raw().get("learning_events", []))
+

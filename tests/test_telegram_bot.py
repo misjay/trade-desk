@@ -260,6 +260,35 @@ class TestTelegramBot(unittest.TestCase):
                 self.assertIn("No positions are currently in profit", mock_reply.call_args[0][1])
                 mock_close.assert_not_called()
 
+    def test_feedback_commands(self):
+        import telegram_bot
+        import state
+
+        with patch("learning_engine.send_daily_feedback") as mock_send, \
+             patch.object(telegram_bot, "_reply") as mock_reply:
+
+            # Test /feedback
+            telegram_bot.handle_command("/feedback", "12345")
+            self.assertIn("Compiling Daily Intelligence", mock_reply.call_args[0][1])
+
+            # Test /feedbackbot
+            telegram_bot.handle_command("/feedbackbot", "12345")
+            self.assertIn("Daily Feedback Destination", mock_reply.call_args[0][1])
+
+            # Test /setfeedbackbot
+            with patch("requests.post") as mock_post:
+                mock_resp = MagicMock()
+                mock_resp.status_code = 200
+                mock_resp.json.return_value = {"ok": True}
+                mock_post.return_value = mock_resp
+
+                telegram_bot.handle_command("/setfeedbackbot mock_token_123 999888", "12345")
+                self.assertIn("Feedback Bot Successfully Configured", mock_reply.call_args[0][1])
+                cfg_fb = state.get_feedback_bot_config()
+                self.assertEqual(cfg_fb["token"], "mock_token_123")
+                self.assertEqual(cfg_fb["chat_id"], "999888")
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -228,6 +228,14 @@ def _setup_scheduler():
         name="Day Scan (4h)",
         replace_existing=True,
     )
+    import learning_engine
+    _scheduler.add_job(
+        lambda: learning_engine.send_daily_feedback(),
+        trigger=IntervalTrigger(hours=24),
+        id="daily_learning_feedback",
+        name="Daily Learning Feedback (24h)",
+        replace_existing=True,
+    )
 
 
 # ── One-shot Desk Report ────────────────────────────────────────────────────
