@@ -152,18 +152,22 @@ def _start_http_server(port: int = 8765):
 
 
 # ── Scan & Execution Cycle ──────────────────────────────────────────────────
-def run_scan_cycle(trade_type: str = "scalp"):
-    if state.is_paused():
-        log.info("Xira automated execution is PAUSED via Telegram command. Skipping %s scan cycle.", trade_type)
+def run_scan_cycle(trade_type: str = "scalp", manual: bool = False):
+    is_paused = state.is_paused()
+    if is_paused and not manual:
+        log.info("Xira automated execution is PAUSED via Telegram command. Skipping scheduled %s scan cycle.", trade_type)
         return
 
-    log.info("=== Running %s cycle ===", trade_type.upper())
+    log.info("=== Running %s cycle (manual=%s, paused=%s) ===", trade_type.upper(), manual, is_paused)
     core_sigs, extra_sigs, tape = scanner.run_scan(trade_type)
     all_sigs = core_sigs + extra_sigs
 
     with _signals_lock:
         _last_signals.clear()
         _last_signals.extend(all_sigs)
+
+    skipped_paused_count = 0
+    executed_count = 0
 
     for sig in all_sigs:
         ticker = sig["ticker"]
@@ -204,14 +208,29 @@ def run_scan_cycle(trade_type: str = "scalp"):
         if is_fresh_shelf:
             notifier.notify_signal(sig)
 
-        # Execute order on Bybit (Demo or Live) since no active position exists
+        # If bot is paused, do NOT execute any automated orders
+        if is_paused:
+            skipped_paused_count += 1
+            log.info("Bot is PAUSED: skipping order placement for %s %s. Use /resume to enable execution.", ticker, side)
+            state.save_signal(sig)
+            continue
+
+        # Execute order on Bybit (Demo or Live) since no active position exists and not paused
         res = engine.execute_signal(sig)
+        executed_count += 1
         log.info("Execution result for %s: %s", ticker, res)
 
         # Save to state store after execution
         state.save_signal(sig)
 
-    log.info("=== %s cycle complete ===", trade_type.upper())
+    log.info("=== %s cycle complete (executed=%d, skipped_paused=%d) ===", trade_type.upper(), executed_count, skipped_paused_count)
+
+    if manual:
+        if is_paused:
+            pause_note = f"\n\n⏸ *Execution is PAUSED.* ({skipped_paused_count} setups analyzed, 0 orders placed).\n_Bot will remain paused until you type `/resume`._"
+        else:
+            pause_note = f"\n\n🟢 *Execution is ACTIVE.* ({executed_count} orders placed)."
+        notifier.send_text(f"🔍 *Manual {trade_type.upper()} Scan Complete!*\nScanned Core 24 and Extras.{pause_note}")
 
 
 # ── Scheduler Setup ─────────────────────────────────────────────────────────
@@ -314,7 +333,7 @@ def main():
 
     _start_http_server()
     engine.start_monitor()
-    telegram_bot.start_telegram_listener(scan_trigger_fn=lambda: run_scan_cycle("scalp"))
+    telegram_bot.start_telegram_listener(scan_trigger_fn=lambda: run_scan_cycle("scalp", manual=True))
     _setup_scheduler()
     _scheduler.start()
 

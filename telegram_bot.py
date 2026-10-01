@@ -38,6 +38,13 @@ def _reply(chat_id: str, text: str) -> None:
         log.warning("Telegram reply failed: %s", exc)
 
 
+def _paused_footer() -> str:
+    """Returns a footer reminder if automated execution is currently paused."""
+    if state.is_paused():
+        return "\n\n_(⏸ Execution remains PAUSED. Will NOT resume automatically until you type `/resume`.)_"
+    return ""
+
+
 def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
     parts = cmd_text.strip().split()
     if not parts:
@@ -141,7 +148,13 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
 
     elif cmd == "/pause":
         state.set_paused(True)
-        _reply(chat_id, "⏸ *Automated execution PAUSED.* Existing positions remain protected by exchange TP/SL.")
+        _reply(
+            chat_id,
+            "⏸ *Automated execution PAUSED.*\n\n"
+            "• Existing positions remain protected by exchange TP/SL.\n"
+            "• You can execute any manual instruction (`/scan`, `/tp`, `/derisk`, `/close`, `/cancelorder`, etc.) while paused.\n"
+            "• Automated scanning & new order placement will NOT resume automatically until you explicitly type `/resume`."
+        )
 
     elif cmd == "/resume":
         state.set_paused(False)
@@ -154,6 +167,7 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
             "🟢 *Spot Trading ENABLED (/onspot)*\n\n"
             "• Bot will execute dual-venue trades (Linear Perps + Spot buys/sells) when valid setups occur.\n"
             "• Use `/offspot` anytime to trade Perpetuals only."
+            + _paused_footer()
         )
 
     elif cmd in ("/offspot", "/spotoff"):
@@ -164,14 +178,15 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
             "• Bot is now in *Perpetual Futures Only* mode.\n"
             "• No USDT balance will be spent purchasing spot coins.\n"
             "• Use `/onspot` anytime to re-enable spot execution."
+            + _paused_footer()
         )
 
     elif cmd == "/scan":
-        _reply(chat_id, "🔍 *Triggering scalp scan across Core 24 and Extras...*")
+        _reply(chat_id, f"🔍 *Triggering scalp scan across Core 24 and Extras...*{_paused_footer()}")
         if scan_trigger_fn:
             threading.Thread(target=scan_trigger_fn, daemon=True).start()
         else:
-            _reply(chat_id, "Scan will execute on next scheduled cycle.")
+            _reply(chat_id, f"Scan will execute on next scheduled cycle.{_paused_footer()}")
 
     elif cmd == "/close":
         if not args:
@@ -182,22 +197,22 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
         active = engine.client.get_active_positions()
         matched = [p for p in active if p["symbol"] == sym]
         if not matched:
-            _reply(chat_id, f"❌ No active linear position found for {target_ticker} on Bybit.")
+            _reply(chat_id, f"❌ No active linear position found for {target_ticker} on Bybit.{_paused_footer()}")
             return
 
         pos = matched[0]
         close_side = "Sell" if pos["side"].lower() == "buy" else "Buy"
         res = engine.client.close_position_market(sym, close_side, pos["size"])
         if res:
-            _reply(chat_id, f"✅ *Closed {target_ticker} position on Bybit* ({pos['size']} contracts).")
+            _reply(chat_id, f"✅ *Closed {target_ticker} position on Bybit* ({pos['size']} contracts).{_paused_footer()}")
             engine._sync_with_bybit()
         else:
-            _reply(chat_id, f"❌ Failed to close {target_ticker} on Bybit. Check logs.")
+            _reply(chat_id, f"❌ Failed to close {target_ticker} on Bybit. Check logs.{_paused_footer()}")
 
     elif cmd in ("/closeall", "/panic"):
         active = engine.client.get_active_positions()
         if not active:
-            _reply(chat_id, "ℹ️ No active linear positions to close on Bybit.")
+            _reply(chat_id, f"ℹ️ No active linear positions to close on Bybit.{_paused_footer()}")
             return
 
         closed_count = 0
@@ -208,7 +223,7 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
             if res:
                 closed_count += 1
 
-        _reply(chat_id, f"🚨 *EMERGENCY CLOSE ALL:* Market closed {closed_count}/{len(active)} positions on Bybit.")
+        _reply(chat_id, f"🚨 *EMERGENCY CLOSE ALL:* Market closed {closed_count}/{len(active)} positions on Bybit.{_paused_footer()}")
         engine._sync_with_bybit()
 
     elif cmd in ("/tp", "/takeprofit", "/closeprofit", "/closeinprofit"):
@@ -230,7 +245,7 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
                     winners.append((pid, pos, pnl))
 
             if not winners:
-                _reply(chat_id, "ℹ️ No open positions are currently in profit to close.")
+                _reply(chat_id, f"ℹ️ No open positions are currently in profit to close.{_paused_footer()}")
                 return
 
             total_profit_banked = 0.0
@@ -248,12 +263,12 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
                 f"💰 *Total Profit Banked*: `+${total_profit_banked:,.2f} USDT`\n",
             ]
             lines.extend(closed_list)
-            _reply(chat_id, "\n".join(lines))
+            _reply(chat_id, "\n".join(lines) + _paused_footer())
             return
 
         active = engine.client.get_active_positions(category="linear")
         if not active:
-            _reply(chat_id, "ℹ️ No active linear positions on Bybit.")
+            _reply(chat_id, f"ℹ️ No active linear positions on Bybit.{_paused_footer()}")
             return
 
         positions_to_check = []
@@ -266,7 +281,7 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
                 positions_to_check.append((p, ticker))
 
         if not positions_to_check:
-            _reply(chat_id, f"ℹ️ No active positions match specified ticker(s): {', '.join(args)}")
+            _reply(chat_id, f"ℹ️ No active positions match specified ticker(s): {', '.join(args)}{_paused_footer()}")
             return
 
         winners = [(p, t) for p, t in positions_to_check if float(p.get("unrealised_pnl") or 0.0) > 0]
@@ -276,7 +291,7 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
                 pnl = float(p.get("unrealised_pnl") or 0.0)
                 status_lines.append(f"• *{t}* `{p.get('side')}`: ${pnl:+,.2f} USDT")
             status_lines.append("\n_All positions remain protected by exchange Stop Loss._")
-            _reply(chat_id, "\n".join(status_lines))
+            _reply(chat_id, "\n".join(status_lines) + _paused_footer())
             return
 
         closed_list = []
@@ -318,12 +333,12 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
         lines.append(f"\n💼 *Account Equity*: `${eq:,.2f} USDT`")
         lines.append(f"🟢 *Available Margin*: `${avail:,.2f} USDT`")
 
-        _reply(chat_id, "\n".join(lines))
+        _reply(chat_id, "\n".join(lines) + _paused_footer())
 
     elif cmd in ("/derisk", "/harvest"):
         active = engine.client.get_active_positions(category="linear")
         if not active:
-            _reply(chat_id, "ℹ️ No active linear positions on Bybit to derisk.")
+            _reply(chat_id, f"ℹ️ No active linear positions on Bybit to derisk.{_paused_footer()}")
             return
 
         winners_closed = []
@@ -383,22 +398,22 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
             lines.append("ℹ️ *Unchanged:*")
             lines.extend(unchanged)
 
-        _reply(chat_id, "\n".join(lines))
+        _reply(chat_id, "\n".join(lines) + _paused_footer())
 
     elif cmd in ("/avoid", "/block"):
         if not args:
-            _reply(chat_id, "⚠️ Specify tickers to avoid: e.g. `/avoid DOGE PEPE XLM`")
+            _reply(chat_id, f"⚠️ Specify tickers to avoid: e.g. `/avoid DOGE PEPE XLM`{_paused_footer()}")
             return
         avoided = state.add_to_avoid_list(args)
-        _reply(chat_id, f"🚫 *Added to Avoid List.* Scanner will ignore:\n`{', '.join(avoided)}`")
+        _reply(chat_id, f"🚫 *Added to Avoid List.* Scanner will ignore:\n`{', '.join(avoided)}`{_paused_footer()}")
 
     elif cmd in ("/allow", "/unavoid", "/unblock"):
         if not args:
-            _reply(chat_id, "⚠️ Specify tickers to allow: e.g. `/allow DOGE PEPE`")
+            _reply(chat_id, f"⚠️ Specify tickers to allow: e.g. `/allow DOGE PEPE`{_paused_footer()}")
             return
         updated = state.remove_from_avoid_list(args)
         current_str = f"`{', '.join(updated)}`" if updated else "_None (all assets allowed)_"
-        _reply(chat_id, f"✅ *Removed from Avoid List.* Currently avoided:\n{current_str}")
+        _reply(chat_id, f"✅ *Removed from Avoid List.* Currently avoided:\n{current_str}{_paused_footer()}")
 
     elif cmd in ("/avoided", "/blacklist"):
         current = state.get_avoid_list()
@@ -484,7 +499,7 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
 
     elif cmd == "/drop":
         if not args:
-            _reply(chat_id, "⚠️ Specify ticker to drop & avoid: e.g. `/drop XLM`")
+            _reply(chat_id, f"⚠️ Specify ticker to drop & avoid: e.g. `/drop XLM`{_paused_footer()}")
             return
         target_ticker = args[0].upper()
         sym = bybit_linear_symbol(target_ticker)
@@ -504,20 +519,20 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
             close_msg = f"No active position found for {target_ticker}. "
 
         state.add_to_avoid_list([target_ticker])
-        _reply(chat_id, f"✂️ *Dropped {target_ticker}:* {close_msg}Added to Avoid List.")
+        _reply(chat_id, f"✂️ *Dropped {target_ticker}:* {close_msg}Added to Avoid List.{_paused_footer()}")
 
     elif cmd == "/leverage":
         if len(args) < 2:
-            _reply(chat_id, "⚠️ Usage: `/leverage <TICKER> <VALUE>`\nExample: `/leverage BTC 10`")
+            _reply(chat_id, f"⚠️ Usage: `/leverage <TICKER> <VALUE>`\nExample: `/leverage BTC 10`{_paused_footer()}")
             return
         ticker = args[0].upper().replace("USDT", "")
         try:
             val = int(args[1])
             if val < 1 or val > 100:
-                _reply(chat_id, "❌ Leverage must be an integer between 1 and 100.")
+                _reply(chat_id, f"❌ Leverage must be an integer between 1 and 100.{_paused_footer()}")
                 return
         except ValueError:
-            _reply(chat_id, f"❌ Invalid leverage value: `{args[1]}`. Must be an integer.")
+            _reply(chat_id, f"❌ Invalid leverage value: `{args[1]}`. Must be an integer.{_paused_footer()}")
             return
 
         sym = bybit_linear_symbol(ticker)
@@ -541,6 +556,7 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
             f"• *Exchange Setting*: {ex_msg}\n"
             f"• *Future Signals*: All new {ticker} orders will size & execute at `{val}x`\n"
             f"• *Margin Mode*: Isolated"
+            + _paused_footer()
         )
 
     elif cmd in ("/existingleverage", "/leverages"):
@@ -654,7 +670,7 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
 
     elif cmd in ("/cancelorder", "/cancel"):
         if not args:
-            _reply(chat_id, "⚠️ Usage: `/cancelorder <ASSET1> <ASSET2> ...`\nExample: `/cancelorder BTC ETH`")
+            _reply(chat_id, f"⚠️ Usage: `/cancelorder <ASSET1> <ASSET2> ...`\nExample: `/cancelorder BTC ETH`{_paused_footer()}")
             return
 
         results = []
@@ -686,10 +702,10 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
         ]
         lines.extend(results)
         lines.append(f"\n💼 *Available Margin*: `${avail:,.2f} USDT`")
-        _reply(chat_id, "\n".join(lines))
+        _reply(chat_id, "\n".join(lines) + _paused_footer())
 
     elif cmd in ("/cancelallorders", "/cancelall"):
-        _reply(chat_id, "🧹 *Cancelling all resting orders across Bybit...*")
+        _reply(chat_id, f"🧹 *Cancelling all resting orders across Bybit...*{_paused_footer()}")
         lin_ids = engine.client.cancel_all_orders(category="linear")
         spot_ids = engine.client.cancel_all_orders(category="spot")
         cleared_local = state.remove_working_orders()
@@ -708,6 +724,7 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
             f"• *Local Working State Cleared*: `{cleared_local}`\n"
             f"• *Available Margin Unlocked*: `${avail:,.2f} USDT`\n\n"
             f"*(Active open positions remain protected by exchange TP/SL)*"
+            + _paused_footer()
         )
 
     else:

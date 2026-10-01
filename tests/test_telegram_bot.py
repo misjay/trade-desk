@@ -352,6 +352,77 @@ class TestTelegramBot(unittest.TestCase):
             self.assertTrue(success)
 
 
+    def test_commands_while_paused_remain_paused(self):
+        """
+        Verify that issuing ANY command while paused executes the instruction
+        normally, includes the paused reminder footer, and NEVER automatically resumes.
+        Only explicit /resume should resume.
+        """
+        import telegram_bot
+        import state
+        import engine
+
+        state.set_paused(True)
+        self.assertTrue(state.is_paused())
+
+        # 1. /onspot while paused
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/onspot", "12345")
+            self.assertTrue(state.is_spot_enabled())
+            self.assertTrue(state.is_paused(), "Bot must remain paused after /onspot")
+            self.assertIn("Execution remains PAUSED", mock_reply.call_args[0][1])
+
+        # 2. /offspot while paused
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/offspot", "12345")
+            self.assertFalse(state.is_spot_enabled())
+            self.assertTrue(state.is_paused(), "Bot must remain paused after /offspot")
+            self.assertIn("Execution remains PAUSED", mock_reply.call_args[0][1])
+
+        # 3. /avoid and /allow while paused
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/avoid AVAX", "12345")
+            self.assertIn("AVAX", state.get_avoid_list())
+            self.assertTrue(state.is_paused(), "Bot must remain paused after /avoid")
+            self.assertIn("Execution remains PAUSED", mock_reply.call_args[0][1])
+
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/allow AVAX", "12345")
+            self.assertNotIn("AVAX", state.get_avoid_list())
+            self.assertTrue(state.is_paused(), "Bot must remain paused after /allow")
+            self.assertIn("Execution remains PAUSED", mock_reply.call_args[0][1])
+
+        # 4. /leverage while paused
+        with patch.object(engine.client, "set_isolated_margin_and_leverage", return_value=True), \
+             patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/leverage AVAX 5", "12345")
+            self.assertEqual(state.get_custom_leverage("AVAX"), 5)
+            self.assertTrue(state.is_paused(), "Bot must remain paused after /leverage")
+            self.assertIn("Execution remains PAUSED", mock_reply.call_args[0][1])
+
+        # 5. /cancelallorders while paused
+        with patch.object(engine.client, "cancel_all_orders", return_value=[]), \
+             patch.object(engine, "_sync_with_bybit"), \
+             patch.object(engine.client, "get_wallet_balance", return_value={"available": 100000.0}), \
+             patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/cancelallorders", "12345")
+            self.assertTrue(state.is_paused(), "Bot must remain paused after /cancelallorders")
+            self.assertIn("Execution remains PAUSED", mock_reply.call_args[0][1])
+
+        # 6. /scan while paused
+        scan_executed = []
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/scan", "12345", scan_trigger_fn=lambda: scan_executed.append(True))
+            self.assertTrue(state.is_paused(), "Bot must remain paused after /scan")
+            self.assertIn("Execution remains PAUSED", mock_reply.call_args[0][1])
+
+        # 7. Finally, only explicit /resume unpauses the bot
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/resume", "12345")
+            self.assertFalse(state.is_paused(), "Bot should be resumed after explicit /resume")
+            self.assertIn("Automated execution RESUMED", mock_reply.call_args[0][1])
+
+
 if __name__ == "__main__":
     unittest.main()
 

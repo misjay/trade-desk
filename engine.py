@@ -297,6 +297,10 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
         lev = min(lev, get_hard_cap(ticker))
 
     # Pre-execution validation
+    if state.is_paused():
+        log.info("Execution rejected for %s %s: Bot execution is PAUSED", ticker, side)
+        return {"status": "SKIPPED", "reason": "Bot execution is PAUSED. Send /resume to enable order placement."}
+
     open_pos = state.get_open_positions()
     if len(open_pos) >= cfg.max_concurrent_positions:
         log.info("Max concurrent positions reached (%d/%d), rejecting %s", len(open_pos), cfg.max_concurrent_positions, ticker)
