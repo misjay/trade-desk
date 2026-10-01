@@ -11,7 +11,7 @@ from typing import Optional
 
 import requests
 
-from config import cfg, bybit_linear_symbol
+from config import cfg, bybit_linear_symbol, bybit_spot_symbol, CORE_TICKERS
 from notifier import send_text, fmt_dollar
 import state
 
@@ -65,6 +65,8 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
             "• `/scan` — Trigger an immediate market scalp scan\n"
             "• `/pause` — Pause opening new orders\n"
             "• `/resume` — Resume automatic order execution\n"
+            "• `/cancelorder <COINS>` — 🚫 Cancel resting limit orders (e.g. `/cancelorder BTC`)\n"
+            "• `/cancelallorders` — 🧹 Cancel ALL resting limit orders on Bybit\n"
             "• `/close <TICKER>` — Market close position for ticker (e.g. `/close HYPE`)\n"
             "• `/closeall` — 🚨 Emergency market close all open positions\n"
             "• `/help` — Show this command list\n\n"
@@ -328,7 +330,6 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
         )
 
     elif cmd in ("/existingleverage", "/leverages"):
-        from config import CORE_TICKERS
         if args:
             ticker = args[0].upper().replace("USDT", "")
             sym = bybit_linear_symbol(ticker)
@@ -390,6 +391,64 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
             daemon=True,
             name=f"report-{period}",
         ).start()
+
+    elif cmd in ("/cancelorder", "/cancel"):
+        if not args:
+            _reply(chat_id, "⚠️ Usage: `/cancelorder <ASSET1> <ASSET2> ...`\nExample: `/cancelorder BTC ETH`")
+            return
+
+        results = []
+        total_canceled = 0
+
+        for raw_t in args:
+            ticker = raw_t.upper().replace("USDT", "")
+            lin_sym = bybit_linear_symbol(ticker)
+            spot_sym = bybit_spot_symbol(ticker)
+
+            lin_ids = engine.client.cancel_all_orders(category="linear", symbol=lin_sym)
+            spot_ids = engine.client.cancel_all_orders(category="spot", symbol=spot_sym)
+            state.remove_working_orders(ticker)
+
+            count = len(lin_ids) + len(spot_ids)
+            total_canceled += count
+            if count > 0:
+                results.append(f"• *{ticker}*: Cancelled {count} resting order(s)")
+            else:
+                results.append(f"• *{ticker}*: No resting orders found")
+
+        engine._sync_with_bybit()
+        bal = engine.client.get_wallet_balance("USDT")
+        avail = bal.get("available", 0.0)
+
+        lines = [
+            f"🚫 *Cancel Order Result (Total: {total_canceled} orders cancelled):*",
+            "",
+        ]
+        lines.extend(results)
+        lines.append(f"\n💼 *Available Margin*: `${avail:,.2f} USDT`")
+        _reply(chat_id, "\n".join(lines))
+
+    elif cmd in ("/cancelallorders", "/cancelall"):
+        _reply(chat_id, "🧹 *Cancelling all resting orders across Bybit...*")
+        lin_ids = engine.client.cancel_all_orders(category="linear")
+        spot_ids = engine.client.cancel_all_orders(category="spot")
+        cleared_local = state.remove_working_orders()
+
+        total = len(lin_ids) + len(spot_ids)
+        engine._sync_with_bybit()
+        bal = engine.client.get_wallet_balance("USDT")
+        avail = bal.get("available", 0.0)
+
+        _reply(
+            chat_id,
+            f"🧹 *Cancelled All Resting Orders on Bybit!*\n\n"
+            f"• *Linear Perpetual Orders Cancelled*: `{len(lin_ids)}`\n"
+            f"• *Spot Orders Cancelled*: `{len(spot_ids)}`\n"
+            f"• *Total Orders Cancelled*: `{total}`\n"
+            f"• *Local Working State Cleared*: `{cleared_local}`\n"
+            f"• *Available Margin Unlocked*: `${avail:,.2f} USDT`\n\n"
+            f"*(Active open positions remain protected by exchange TP/SL)*"
+        )
 
     else:
         _reply(chat_id, f"Unknown command: `{cmd}`. Type `/help` for available commands.")
@@ -460,6 +519,8 @@ BOT_COMMANDS = [
     {"command": "drop", "description": "Close position & blacklist coin"},
     {"command": "pause", "description": "Pause automated order execution"},
     {"command": "resume", "description": "Resume automated execution"},
+    {"command": "cancelorder", "description": "Cancel resting orders for asset(s)"},
+    {"command": "cancelallorders", "description": "Cancel all resting orders on Bybit"},
     {"command": "close", "description": "Market close a specific ticker"},
     {"command": "closeall", "description": "Emergency close all positions"},
     {"command": "help", "description": "Show command guide and help"},

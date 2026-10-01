@@ -485,6 +485,23 @@ class BybitClient:
         })
         return bool(resp and resp.get("retCode") == 0)
 
+    def cancel_all_orders(self, category: str = "linear", symbol: Optional[str] = None) -> List[str]:
+        """Cancel all resting orders on Bybit for given category and optional symbol."""
+        if self.is_paper:
+            return []
+        params: Dict[str, Any] = {"category": category}
+        if symbol:
+            params["symbol"] = symbol
+        elif category == "linear":
+            params["settleCoin"] = "USDT"
+
+        res = self.request("POST", "/v5/order/cancel-all", params)
+        if res and res.get("retCode") == 0:
+            order_list = res.get("result", {}).get("list", [])
+            return [o.get("orderId") for o in order_list if o.get("orderId")]
+        log.warning("cancel_all_orders failed for %s (%s): %s", category, symbol, res)
+        return []
+
     def get_open_orders(self, category: str = "linear", symbol: Optional[str] = None) -> List[dict]:
         """Fetch open/unfilled resting orders from Bybit."""
         if self.is_paper:

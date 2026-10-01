@@ -333,3 +333,20 @@ def get_effective_leverage(ticker: str, scalp: bool = True) -> int:
         return int(custom)
     from config import get_leverage
     return get_leverage(ticker, scalp=scalp)
+
+
+def remove_working_orders(ticker: Optional[str] = None) -> int:
+    """Remove unfilled resting (WORKING) orders from state."""
+    with _lock:
+        s = _load_raw()
+        open_pos = s.get("open_positions", {})
+        to_delete = []
+        for pid, p in open_pos.items():
+            if p.get("status") == "WORKING":
+                if ticker is None or p.get("ticker", "").upper() == ticker.upper():
+                    to_delete.append(pid)
+        for pid in to_delete:
+            del open_pos[pid]
+        if to_delete:
+            _save(s)
+        return len(to_delete)

@@ -195,6 +195,24 @@ class TestTelegramBot(unittest.TestCase):
                 telegram_bot.handle_command(cmd, "12345")
                 self.assertIn("Analytics Report", mock_reply.call_args[0][1])
 
+    def test_cancel_commands(self):
+        import telegram_bot
+        import engine
+
+        with patch.object(engine.client, "cancel_all_orders", return_value=["ord_1", "ord_2"]), \
+             patch.object(engine, "_sync_with_bybit"), \
+             patch.object(engine.client, "get_wallet_balance", return_value={"available": 50000.0}), \
+             patch.object(telegram_bot, "_reply") as mock_reply:
+
+            # Test /cancelorder BTC ETH
+            telegram_bot.handle_command("/cancelorder BTC ETH", "12345")
+            self.assertIn("Cancel Order Result", mock_reply.call_args[0][1])
+            self.assertIn("BTC", mock_reply.call_args[0][1])
+
+            # Test /cancelallorders
+            telegram_bot.handle_command("/cancelallorders", "12345")
+            self.assertIn("Cancelled All Resting Orders", mock_reply.call_args[0][1])
+
 
 if __name__ == "__main__":
     unittest.main()
