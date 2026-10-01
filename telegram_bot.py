@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import requests
@@ -60,6 +61,7 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
             "• `/feedback` — 🧠 Daily intelligence feedback: most lost/profit assets & learning\n"
             "• `/setfeedbackbot <TOKEN> <CHAT_ID>` — 🤖 Connect another bot for daily feedback\n"
             "• `/feedbackbot` — 📋 View current feedback bot destination\n"
+            "• `/probation` — 🧪 View 24h quarantined & 50% probation assets\n"
             "• `/leverage <COIN> <VAL>` — ⚡ Set leverage (e.g. `/leverage BTC 10`)\n"
             "• `/existingleverage` — 📊 Show leverage used for each asset\n"
             "• `/avoid <COINS>` — 🚫 Blacklist assets (e.g. `/avoid DOGE PEPE`)\n"
@@ -400,10 +402,85 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
 
     elif cmd in ("/avoided", "/blacklist"):
         current = state.get_avoid_list()
-        if not current:
+        quar_dict = state.get_quarantine_list()
+        prob_dict = state.get_probation_list()
+        if not current and not prob_dict:
             _reply(chat_id, "ℹ️ Avoid list is empty. All Core 24 and Extras are actively scanned.")
         else:
-            _reply(chat_id, f"🚫 *Currently Avoided Assets ({len(current)}):*\n`{', '.join(current)}`\n\nUse `/allow <TICKER>` to resume trading them.")
+            lines = [f"🚫 *Currently Avoided / Filtered Assets ({len(current)}):*"]
+            now = datetime.now(timezone.utc)
+            for a in current:
+                if a in quar_dict:
+                    exp_str = quar_dict[a].get("expires_at", "")
+                    rem_str = "24h quarantine"
+                    if exp_str:
+                        try:
+                            exp_dt = datetime.fromisoformat(exp_str)
+                            diff = exp_dt - now
+                            mins = max(0, int(diff.total_seconds() // 60))
+                            hrs = mins // 60
+                            rem_str = f"24h quarantine ({hrs}h {mins % 60}m left)"
+                        except Exception:
+                            pass
+                    reason = quar_dict[a].get("reason", "")
+                    r_str = f" [{reason}]" if reason else ""
+                    lines.append(f"• *{a}*: 🔒 {rem_str}{r_str}")
+                else:
+                    lines.append(f"• *{a}*: 🚫 Manual blacklist")
+
+            if prob_dict:
+                lines.append(f"\n🧪 *Assets on 50% Probation ({len(prob_dict)}):*")
+                for t, info in prob_dict.items():
+                    rem = info.get("trades_remaining", 3)
+                    pnl = info.get("probation_pnl", 0.0)
+                    lines.append(f"• *{t}*: {rem} trades left | PnL: ${pnl:+,.2f} USDT")
+
+            lines.append("\n_Use `/allow <TICKER>` to resume normal trading, or `/probation` for full health details._")
+            _reply(chat_id, "\n".join(lines))
+
+    elif cmd in ("/probation", "/probations", "/quarantine"):
+        prob_dict = state.get_probation_list()
+        quar_dict = state.get_quarantine_list()
+
+        lines = ["🧪 *Xira Asset Health: Quarantine & Probation Monitor*", ""]
+        if not prob_dict and not quar_dict:
+            lines.append("✅ *All systems clear!*")
+            lines.append("No assets are currently quarantined or on probation.")
+            lines.append("All Core 24 and approved Extras trade with *100% position sizing*.")
+        else:
+            if quar_dict:
+                now = datetime.now(timezone.utc)
+                lines.append(f"🔒 *Quarantined Assets (24h Lockout - {len(quar_dict)}):*")
+                for t, info in sorted(quar_dict.items()):
+                    exp_str = info.get("expires_at", "")
+                    rem_str = "expiring soon"
+                    if exp_str:
+                        try:
+                            exp_dt = datetime.fromisoformat(exp_str)
+                            diff = exp_dt - now
+                            mins = max(0, int(diff.total_seconds() // 60))
+                            hrs = mins // 60
+                            rem_str = f"{hrs}h {mins % 60}m left"
+                        except Exception:
+                            pass
+                    reason = info.get("reason", "")
+                    reason_str = f" — _{reason}_" if reason else ""
+                    lines.append(f"• *{t}*: 🔒 {rem_str}{reason_str}")
+                lines.append("_(Assets auto-transition to 50% probation when 24h expires)_\n")
+
+            if prob_dict:
+                lines.append(f"⚠️ *Probation Assets (50% Position Sizing - {len(prob_dict)}):*")
+                for t, info in sorted(prob_dict.items()):
+                    rem = info.get("trades_remaining", 3)
+                    pnl = info.get("probation_pnl", 0.0)
+                    pnl_str = f"+${pnl:,.2f}" if pnl >= 0 else f"-${abs(pnl):,.2f}"
+                    lines.append(f"• *{t}*: `{rem} trade(s) left` | Probation PnL: `{pnl_str} USDT`")
+                lines.append("\n_Graduates back to 100% full sizing on net profit after 3 trades. Re-quarantined for 24h on net loss._")
+            else:
+                lines.append("ℹ️ No assets currently in 50% probation sizing.")
+
+        lines.append("\n_Use `/allow <TICKER>` to manually restore any asset to full 100% trading._")
+        _reply(chat_id, "\n".join(lines))
 
     elif cmd == "/drop":
         if not args:
@@ -696,6 +773,8 @@ BOT_COMMANDS = [
     {"command": "monthlyreport", "description": "🗓️ Monthly 30d analytics report & chart"},
     {"command": "feedback", "description": "🧠 Daily feedback, worst/best assets & learning"},
     {"command": "feedbackbot", "description": "View current feedback bot destination"},
+    {"command": "setfeedbackbot", "description": "Connect another bot for daily feedback"},
+    {"command": "probation", "description": "🧪 Quarantined & 50% probation assets"},
     {"command": "leverage", "description": "Set leverage (e.g. /leverage BTC 10)"},
     {"command": "existingleverage", "description": "Show leverage used for each asset"},
     {"command": "scan", "description": "Trigger immediate scalp scan"},
@@ -718,22 +797,38 @@ BOT_COMMANDS = [
 def register_bot_commands() -> bool:
     """
     Register bot commands with Telegram so typing '/' pops up the autocomplete command menu.
+    Registers on both primary bot and secondary feedback bot (if configured).
     """
-    if not cfg.telegram_token:
-        return False
-    url = f"https://api.telegram.org/bot{cfg.telegram_token}/setMyCommands"
+    tokens = []
+    if cfg.telegram_token:
+        tokens.append(cfg.telegram_token)
     try:
-        r = requests.post(url, json={"commands": BOT_COMMANDS}, timeout=10)
-        if r.status_code == 200 and r.json().get("ok"):
-            log.info("Registered %d Telegram commands with setMyCommands", len(BOT_COMMANDS))
-            menu_btn_url = f"https://api.telegram.org/bot{cfg.telegram_token}/setChatMenuButton"
-            requests.post(menu_btn_url, json={"menu_button": {"type": "commands"}}, timeout=10)
-            return True
-        else:
-            log.warning("Telegram setMyCommands failed: %s", r.text)
-    except Exception as exc:
-        log.warning("Telegram setMyCommands error: %s", exc)
-    return False
+        fb_cfg = state.get_feedback_bot_config()
+        fb_tok = fb_cfg.get("token")
+        if fb_tok and fb_tok not in tokens:
+            tokens.append(fb_tok)
+    except Exception:
+        pass
+
+    if not tokens:
+        return False
+
+    all_success = True
+    for token in tokens:
+        url = f"https://api.telegram.org/bot{token}/setMyCommands"
+        try:
+            r = requests.post(url, json={"commands": BOT_COMMANDS}, timeout=10)
+            if r.status_code == 200 and r.json().get("ok"):
+                log.info("Registered %d Telegram commands with setMyCommands on %s...", len(BOT_COMMANDS), token[:10])
+                menu_btn_url = f"https://api.telegram.org/bot{token}/setChatMenuButton"
+                requests.post(menu_btn_url, json={"menu_button": {"type": "commands"}}, timeout=10)
+            else:
+                log.warning("Telegram setMyCommands failed for %s...: %s", token[:10], r.text)
+                all_success = False
+        except Exception as exc:
+            log.warning("Telegram setMyCommands error for %s...: %s", token[:10], exc)
+            all_success = False
+    return all_success
 
 
 def start_telegram_listener(scan_trigger_fn=None) -> None:

@@ -205,8 +205,8 @@ def validate_execution_conditions(
         if not tick_data:
             return False, "Failed to fetch live market data from Bybit"
 
-    mark = tick_data["mark_price"]
-    funding = tick_data["funding_rate"]
+    mark = float(tick_data.get("mark_price") or tick_data.get("last_price") or 0.0)
+    funding = float(tick_data.get("funding_rate") or 0.0)
     if t == "PEPE":
         mark = mark / 1000.0
 
@@ -313,6 +313,12 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
 
     perp_sym = bybit_linear_symbol(ticker)
     spot_sym = bybit_spot_symbol(ticker)
+
+    if state.is_on_probation(ticker):
+        perp_qty = client.quantize_qty(perp_sym, perp_qty * 0.5, category="linear")
+        spot_qty = client.quantize_qty(spot_sym, spot_qty * 0.5, category="spot")
+        log.info("Asset %s is on PROBATION: Applied 50%% size reduction (perp_qty=%.4f)", ticker, perp_qty)
+
     now_ts = datetime.now(timezone.utc).isoformat()
     pos_id_perp = f"{ticker}_{side}_perp_{trade_type}_{uuid.uuid4().hex[:8]}"
     pos_id_spot = f"{ticker}_{side}_spot_{trade_type}_{uuid.uuid4().hex[:8]}"
@@ -645,8 +651,16 @@ def _sync_with_bybit() -> None:
             state.record_closed_position(closed_entry)
             if matched_pos_id:
                 state.remove_open_position(matched_pos_id)
-            log.info("Recorded closed trade on Bybit: %s %s PnL: $%.2f", ticker, c_side, pnl_u)
             notifier.notify_trade_closed(closed_entry)
+
+            # Record probation lifecycle outcome if asset was on probation
+            prob_status = state.record_probation_trade(ticker, pnl_u)
+            if prob_status == "GRADUATED":
+                log.info("%s graduated from probation! Restored to full size.", ticker)
+                notifier.send_text(f"🎓 *Probation Graduated:* {ticker} finished 3 probation trades in profit! Restored to 100% position sizing.")
+            elif prob_status == "RE_QUARANTINED":
+                log.info("%s failed probation and re-quarantined for 24h.", ticker)
+                notifier.send_text(f"🚫 *Probation Failed:* {ticker} incurred net loss on probation (${pnl_u:,.2f}). Quarantined on Avoid List for 24h.")
 
     # 3. Check Bybit active positions
     bybit_positions = client.get_active_positions(category="linear")

@@ -15,7 +15,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -24,7 +24,7 @@ from config import cfg
 log = logging.getLogger(__name__)
 
 _STATE_FILE = Path(__file__).parent / "state.json"
-_lock = threading.Lock()
+_lock = threading.RLock()
 
 
 def _now() -> str:
@@ -56,6 +56,8 @@ def _default_state() -> Dict[str, Any]:
             "total_pnl_usdt": 0.0,
         },
         "avoid_list": [],
+        "quarantine": {},
+        "probation": {},
         "custom_leverage": {},
         "spot_enabled": False,
         "created_at": _now(),
@@ -279,7 +281,81 @@ def reset_state(keep_equity: bool = False) -> None:
         log.info("State reset. Equity: %.2f", fresh["paper_equity"])
 
 
+def quarantine_asset(ticker: str, hours: float = 24.0, reason: str = "") -> dict:
+    """Quarantine an asset for N hours. Adds to avoid_list with expiration timestamp."""
+    with _lock:
+        s = _load_raw()
+        t = ticker.strip().upper()
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(hours=hours)
+
+        if "quarantine" not in s:
+            s["quarantine"] = {}
+        if "probation" in s and t in s["probation"]:
+            del s["probation"][t]
+
+        s["quarantine"][t] = {
+            "ticker": t,
+            "quarantined_at": now.isoformat(),
+            "expires_at": expires.isoformat(),
+            "hours": hours,
+            "reason": reason,
+        }
+        current_avoid = set(s.get("avoid_list", []))
+        current_avoid.add(t)
+        s["avoid_list"] = sorted(list(current_avoid))
+        _save(s)
+        return s["quarantine"][t]
+
+
+def check_and_update_quarantines() -> None:
+    """Check if any 24h quarantine expired and transition the asset to 50% probation."""
+    with _lock:
+        s = _load_raw()
+        quarantine = s.get("quarantine", {})
+        probation = s.get("probation", {})
+        avoid_list = set(s.get("avoid_list", []))
+        now = datetime.now(timezone.utc)
+        changed = False
+
+        expired_tickers = []
+        for t, data in list(quarantine.items()):
+            exp_str = data.get("expires_at")
+            if exp_str:
+                try:
+                    exp_dt = datetime.fromisoformat(exp_str)
+                    if now >= exp_dt:
+                        expired_tickers.append(t)
+                except Exception:
+                    pass
+
+        for t in expired_tickers:
+            del quarantine[t]
+            avoid_list.discard(t)
+            probation[t] = {
+                "ticker": t,
+                "started_at": now.isoformat(),
+                "trades_remaining": 3,
+                "probation_pnl": 0.0,
+            }
+            changed = True
+            log.info("24h Quarantine expired for %s. Moved to 50%% probation for 3 trades.", t)
+
+        if changed:
+            s["quarantine"] = quarantine
+            s["probation"] = probation
+            s["avoid_list"] = sorted(list(avoid_list))
+            _save(s)
+
+
+def get_quarantine_list() -> Dict[str, dict]:
+    check_and_update_quarantines()
+    with _lock:
+        return dict(_load_raw().get("quarantine", {}))
+
+
 def get_avoid_list() -> List[str]:
+    check_and_update_quarantines()
     with _lock:
         return list(_load_raw().get("avoid_list", []))
 
@@ -301,12 +377,63 @@ def remove_from_avoid_list(tickers: List[str]) -> List[str]:
     with _lock:
         s = _load_raw()
         current = set(s.get("avoid_list", []))
+        quarantine = s.get("quarantine", {})
+        probation = s.get("probation", {})
         for t in tickers:
             clean = t.strip().upper()
             current.discard(clean)
+            quarantine.pop(clean, None)
+            probation.pop(clean, None)
         s["avoid_list"] = sorted(list(current))
+        s["quarantine"] = quarantine
+        s["probation"] = probation
         _save(s)
         return s["avoid_list"]
+
+
+def is_on_probation(ticker: str) -> bool:
+    check_and_update_quarantines()
+    with _lock:
+        return ticker.upper() in _load_raw().get("probation", {})
+
+
+def get_probation_list() -> Dict[str, dict]:
+    check_and_update_quarantines()
+    with _lock:
+        return dict(_load_raw().get("probation", {}))
+
+
+def record_probation_trade(ticker: str, pnl: float) -> Optional[str]:
+    """
+    Called when a trade completes for an asset on probation.
+    Returns: 'GRADUATED', 'RE_QUARANTINED', or 'CONTINUING'
+    """
+    with _lock:
+        s = _load_raw()
+        t = ticker.upper()
+        prob = s.get("probation", {})
+        if t not in prob:
+            return None
+
+        p_info = prob[t]
+        p_info["trades_remaining"] = max(0, p_info.get("trades_remaining", 3) - 1)
+        p_info["probation_pnl"] = round(p_info.get("probation_pnl", 0.0) + pnl, 4)
+
+        if p_info["trades_remaining"] <= 0:
+            pnl_final = p_info["probation_pnl"]
+            del prob[t]
+            if pnl_final >= 0:
+                _save(s)
+                log.info("Probation GRADUATED for %s: net PnL $%.2f", t, pnl_final)
+                return "GRADUATED"
+            else:
+                _save(s)
+                quarantine_asset(t, hours=24.0, reason=f"Failed probation (PnL: ${pnl_final:,.2f})")
+                log.info("Probation FAILED for %s: Re-quarantined for 24h", t)
+                return "RE_QUARANTINED"
+        else:
+            _save(s)
+            return "CONTINUING"
 
 
 def get_custom_leverage(ticker: Optional[str] = None) -> Union[Dict[str, int], Optional[int]]:

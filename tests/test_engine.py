@@ -64,16 +64,17 @@ class TestEngineAndSizing(unittest.TestCase):
 
     def test_no_chase_rule(self):
         import engine
+        from unittest.mock import patch
         # If live mark has left the band (e.g. Price is far above demand shelf)
-        valid, reason = engine.validate_execution_conditions(
-            ticker="BTC",
-            side="BUY",
-            entry_low=60000.0,
-            entry_high=60200.0,
-        )
-        # Since live BTC is around ~84,000, buying at 60,000 band will trigger NO_CHASE
-        self.assertFalse(valid)
-        self.assertIn("NO_CHASE", reason)
+        with patch.object(engine.client, "get_ticker", return_value={"last_price": 84000.0, "mark_price": 84000.0}):
+            valid, reason = engine.validate_execution_conditions(
+                ticker="BTC",
+                side="BUY",
+                entry_low=60000.0,
+                entry_high=60200.0,
+            )
+            self.assertFalse(valid)
+            self.assertIn("NO_CHASE", reason)
 
 
 class TestContractParsing(unittest.TestCase):
@@ -85,10 +86,12 @@ class TestContractParsing(unittest.TestCase):
 
     def test_parse_buy_line(self):
         import engine
+        from unittest.mock import patch
         line = "BOT|ETH|BUY|PERP|15m|2500|2520|2650|2750|2460|4|0.005|2026-09-30 20:00 UTC|valid"
-        res = engine.parse_and_execute_contract_line(line)
-        # Should be processed (either NO_CHASE or executed based on live mark)
-        self.assertIn(res["status"], ["INVALID", "SUCCESS", "REJECTED"])
+        with patch.object(engine.client, "get_ticker", return_value={"last_price": 3000.0, "mark_price": 3000.0}):
+            res = engine.parse_and_execute_contract_line(line)
+            # Should be processed (either NO_CHASE or executed based on live mark)
+            self.assertIn(res["status"], ["INVALID", "SUCCESS", "REJECTED"])
 
 
 class TestDemoState(unittest.TestCase):

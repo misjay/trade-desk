@@ -294,6 +294,63 @@ class TestTelegramBot(unittest.TestCase):
                     del s["feedback_bot"]
                     state._save(s)
 
+    def test_probation_and_avoided_commands(self):
+        import telegram_bot
+        import state
+
+        # Clean state
+        state.remove_from_avoid_list(["TESTX"])
+
+        # When nothing on probation
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/probation", "12345")
+            self.assertIn("All systems clear", mock_reply.call_args[0][1])
+
+        # Quarantine asset
+        state.quarantine_asset("TESTX", hours=24.0, reason="Drawdown limit")
+
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/probation", "12345")
+            self.assertIn("Quarantined Assets", mock_reply.call_args[0][1])
+            self.assertIn("TESTX", mock_reply.call_args[0][1])
+
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/avoided", "12345")
+            self.assertIn("TESTX", mock_reply.call_args[0][1])
+            self.assertIn("quarantine", mock_reply.call_args[0][1])
+
+        # Cleanup
+        state.remove_from_avoid_list(["TESTX"])
+
+    def test_all_bot_commands_registered(self):
+        import telegram_bot
+        cmd_names = [c["command"] for c in telegram_bot.BOT_COMMANDS]
+
+        # Verify key commands are in BOT_COMMANDS
+        required = [
+            "status", "positions", "tp", "derisk", "dailyreport", "hourlyreport",
+            "weeklyreport", "monthlyreport", "feedback", "feedbackbot", "setfeedbackbot",
+            "probation", "leverage", "existingleverage", "scan", "avoid", "allow",
+            "avoided", "drop", "pause", "resume", "onspot", "offspot", "cancelorder",
+            "cancelallorders", "close", "closeall", "help"
+        ]
+        for cmd in required:
+            self.assertIn(cmd, cmd_names, f"Command /{cmd} missing from BOT_COMMANDS")
+
+        # Telegram constraints:
+        for c in telegram_bot.BOT_COMMANDS:
+            self.assertTrue(1 <= len(c["command"]) <= 32)
+            self.assertTrue(c["command"].islower())
+            self.assertTrue(1 <= len(c["description"]) <= 256)
+
+        # Test registration
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"ok": True}
+        with patch("requests.post", return_value=mock_resp):
+            success = telegram_bot.register_bot_commands()
+            self.assertTrue(success)
+
 
 if __name__ == "__main__":
     unittest.main()
