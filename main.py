@@ -169,6 +169,12 @@ def run_scan_cycle(trade_type: str = "scalp"):
         ticker = sig["ticker"]
         side = sig["side"]
 
+        # Check if asset is on Avoid list
+        if ticker in state.get_avoid_list():
+            log.info("Ticker %s is on Avoid list, skipping execution", ticker)
+            state.save_signal(sig)
+            continue
+
         if side == "WAIT":
             state.save_signal(sig)
             continue

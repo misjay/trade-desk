@@ -55,6 +55,7 @@ def _default_state() -> Dict[str, Any]:
             "breakevens": 0,
             "total_pnl_usdt": 0.0,
         },
+        "avoid_list": [],
         "created_at": _now(),
         "updated_at": _now(),
     }
@@ -274,3 +275,33 @@ def reset_state(keep_equity: bool = False) -> None:
             fresh["paper_equity"] = existing.get("paper_equity", cfg.paper_equity)
         _save(fresh)
         log.info("State reset. Equity: %.2f", fresh["paper_equity"])
+
+
+def get_avoid_list() -> List[str]:
+    with _lock:
+        return list(_load_raw().get("avoid_list", []))
+
+
+def add_to_avoid_list(tickers: List[str]) -> List[str]:
+    with _lock:
+        s = _load_raw()
+        current = set(s.get("avoid_list", []))
+        for t in tickers:
+            clean = t.strip().upper()
+            if clean:
+                current.add(clean)
+        s["avoid_list"] = sorted(list(current))
+        _save(s)
+        return s["avoid_list"]
+
+
+def remove_from_avoid_list(tickers: List[str]) -> List[str]:
+    with _lock:
+        s = _load_raw()
+        current = set(s.get("avoid_list", []))
+        for t in tickers:
+            clean = t.strip().upper()
+            current.discard(clean)
+        s["avoid_list"] = sorted(list(current))
+        _save(s)
+        return s["avoid_list"]

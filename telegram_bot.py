@@ -51,6 +51,11 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
             "🤖 *Xira Autonomous Trade Desk Control*\n\n"
             "• `/status` — Balance, equity, open positions & win stats\n"
             "• `/positions` — Detailed active positions with live PnL & targets\n"
+            "• `/derisk` — 🛡️ Close 100% of winning trades & trim 50% of losers\n"
+            "• `/avoid <COINS>` — 🚫 Blacklist assets (e.g. `/avoid DOGE PEPE`)\n"
+            "• `/allow <COINS>` — 🟢 Restore assets (e.g. `/allow DOGE`)\n"
+            "• `/avoided` — 📋 Show all currently avoided assets\n"
+            "• `/drop <COIN>` — ✂️ Close position & immediately add to avoid list\n"
             "• `/scan` — Trigger an immediate market scalp scan\n"
             "• `/pause` — Pause opening new orders\n"
             "• `/resume` — Resume automatic order execution\n"
@@ -167,6 +172,117 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
 
         _reply(chat_id, f"🚨 *EMERGENCY CLOSE ALL:* Market closed {closed_count}/{len(active)} positions on Bybit.")
         engine._sync_with_bybit()
+
+    elif cmd in ("/derisk", "/harvest"):
+        active = engine.client.get_active_positions(category="linear")
+        if not active:
+            _reply(chat_id, "ℹ️ No active linear positions on Bybit to derisk.")
+            return
+
+        winners_closed = []
+        losers_trimmed = []
+        unchanged = []
+
+        total_profit_banked = 0.0
+        total_loss_trimmed = 0.0
+
+        for pos in active:
+            sym = pos["symbol"]
+            ticker = sym.replace("USDT", "")
+            if ticker.startswith("1000"):
+                ticker = ticker[4:]
+            side = pos["side"]
+            size = float(pos["size"])
+            pnl = float(pos.get("unrealised_pnl") or 0.0)
+            close_side = "Sell" if side.lower() == "buy" else "Buy"
+
+            if pnl > 0:
+                # 100% close in profit
+                res = engine.client.close_position_market(sym, close_side, size)
+                if res:
+                    winners_closed.append(f"• *{ticker}* `{side}`: +${pnl:,.2f} USDT (100% closed)")
+                    total_profit_banked += pnl
+                else:
+                    unchanged.append(f"• *{ticker}* `{side}`: close failed")
+            elif pnl < 0:
+                # 50% trim in loss
+                half_size = engine.client.quantize_qty(sym, size * 0.5, category="linear")
+                info = engine.client.get_instrument_info(sym, category="linear")
+                if half_size >= info.get("min_qty", 0.001):
+                    res = engine.client.close_position_market(sym, close_side, half_size)
+                    if res:
+                        trimmed_pnl = pnl * (half_size / size) if size > 0 else 0.0
+                        total_loss_trimmed += trimmed_pnl
+                        losers_trimmed.append(f"• *{ticker}* `{side}`: 50% trimmed ({half_size} contracts, {trimmed_pnl:+,.2f} USDT)")
+                    else:
+                        unchanged.append(f"• *{ticker}* `{side}`: trim failed")
+                else:
+                    unchanged.append(f"• *{ticker}* `{side}`: size too small to split (kept open)")
+            else:
+                unchanged.append(f"• *{ticker}* `{side}`: at breakeven ($0.00)")
+
+        engine._sync_with_bybit()
+
+        lines = ["🛡️ *Derisk Execution Summary:*", ""]
+        if winners_closed:
+            lines.append(f"💰 *Banked in Profit (Total: +${total_profit_banked:,.2f} USDT):*")
+            lines.extend(winners_closed)
+            lines.append("")
+        if losers_trimmed:
+            lines.append(f"✂️ *Trimmed Losses 50% (Loss cut: ${abs(total_loss_trimmed):,.2f} USDT):*")
+            lines.extend(losers_trimmed)
+            lines.append("*(Remaining 50% remains protected by exchange Stop Loss)*\n")
+        if unchanged:
+            lines.append("ℹ️ *Unchanged:*")
+            lines.extend(unchanged)
+
+        _reply(chat_id, "\n".join(lines))
+
+    elif cmd in ("/avoid", "/block"):
+        if not args:
+            _reply(chat_id, "⚠️ Specify tickers to avoid: e.g. `/avoid DOGE PEPE XLM`")
+            return
+        avoided = state.add_to_avoid_list(args)
+        _reply(chat_id, f"🚫 *Added to Avoid List.* Scanner will ignore:\n`{', '.join(avoided)}`")
+
+    elif cmd in ("/allow", "/unavoid", "/unblock"):
+        if not args:
+            _reply(chat_id, "⚠️ Specify tickers to allow: e.g. `/allow DOGE PEPE`")
+            return
+        updated = state.remove_from_avoid_list(args)
+        current_str = f"`{', '.join(updated)}`" if updated else "_None (all assets allowed)_"
+        _reply(chat_id, f"✅ *Removed from Avoid List.* Currently avoided:\n{current_str}")
+
+    elif cmd in ("/avoided", "/blacklist"):
+        current = state.get_avoid_list()
+        if not current:
+            _reply(chat_id, "ℹ️ Avoid list is empty. All Core 24 and Extras are actively scanned.")
+        else:
+            _reply(chat_id, f"🚫 *Currently Avoided Assets ({len(current)}):*\n`{', '.join(current)}`\n\nUse `/allow <TICKER>` to resume trading them.")
+
+    elif cmd == "/drop":
+        if not args:
+            _reply(chat_id, "⚠️ Specify ticker to drop & avoid: e.g. `/drop XLM`")
+            return
+        target_ticker = args[0].upper()
+        sym = bybit_linear_symbol(target_ticker)
+        active = engine.client.get_active_positions()
+        matched = [p for p in active if p["symbol"] == sym]
+        close_msg = ""
+        if matched:
+            pos = matched[0]
+            close_side = "Sell" if pos["side"].lower() == "buy" else "Buy"
+            res = engine.client.close_position_market(sym, close_side, pos["size"])
+            if res:
+                close_msg = f"Closed active {target_ticker} position ({pos['size']} contracts). "
+            else:
+                close_msg = f"Attempted to close {target_ticker} (check logs). "
+            engine._sync_with_bybit()
+        else:
+            close_msg = f"No active position found for {target_ticker}. "
+
+        state.add_to_avoid_list([target_ticker])
+        _reply(chat_id, f"✂️ *Dropped {target_ticker}:* {close_msg}Added to Avoid List.")
 
     else:
         _reply(chat_id, f"Unknown command: `{cmd}`. Type `/help` for available commands.")
