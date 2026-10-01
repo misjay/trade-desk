@@ -172,6 +172,60 @@ class TestDemoState(unittest.TestCase):
         closed_pos = st.get_closed_positions()
         self.assertTrue(any(c["order_id"] == "test_order_closed_1" for c in closed_pos))
 
+    def test_max_position_notional_cap(self):
+        import engine
+        from config import cfg
+        # Large equity ($200,000) and super tight stop (Entry: $2.00, SL: $1.99 -> dist: 0.01)
+        # Raw qty would be: (200,000 * 0.005) / 0.01 = 100,000 XRP = $200,000 notional
+        # Should be capped to cfg.max_position_notional ($25,000) -> 12,500 XRP
+        perp_qty, spot_qty, note = engine.compute_position_size(
+            ticker="XRP",
+            entry_price=2.00,
+            sl=1.99,
+            equity=200000.0,
+            leverage=5,
+            risk_pct=0.005,
+        )
+        self.assertEqual(note, "OK")
+        notional = perp_qty * 2.00
+        self.assertLessEqual(notional, cfg.max_position_notional + 1e-4)
+        self.assertAlmostEqual(perp_qty, 12500.0, places=1)
+
+    def test_max_concurrent_positions_rejection(self):
+        import engine
+        import state
+        from config import cfg
+
+        fake_positions = {f"pos_{i}": {"id": f"pos_{i}", "ticker": f"COIN_{i}"} for i in range(cfg.max_concurrent_positions)}
+        with unittest.mock.patch("state.get_open_positions", return_value=fake_positions):
+            res = engine.execute_signal({
+                "ticker": "SOL",
+                "side": "BUY",
+                "entry_low": 120.0,
+                "entry_high": 122.0,
+                "tp1": 130.0,
+                "tp2": 140.0,
+                "sl": 115.0,
+            })
+            self.assertEqual(res["status"], "REJECTED")
+            self.assertIn("Max concurrent positions cap", res["reason"])
+
+    def test_consecutive_loss_circuit_breaker(self):
+        import state
+        state.remove_from_avoid_list(["TESTCOIN"])
+
+        # Add 2 losing trades
+        state.record_closed_position({"ticker": "TESTCOIN", "symbol": "TESTCOINUSDT", "pnl_usdt": -50.0, "order_id": "test_loss_1"})
+        state.record_closed_position({"ticker": "TESTCOIN", "symbol": "TESTCOINUSDT", "pnl_usdt": -40.0, "order_id": "test_loss_2"})
+
+        quar = state.check_and_trigger_consecutive_loss_quarantine("TESTCOIN")
+        self.assertIsNotNone(quar)
+        self.assertIn("TESTCOIN", state.get_avoid_list())
+        self.assertIn("TESTCOIN", state.get_quarantine_list())
+
+        # Cleanup
+        state.remove_from_avoid_list(["TESTCOIN"])
+
 
 if __name__ == "__main__":
     unittest.main()

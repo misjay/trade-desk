@@ -181,9 +181,14 @@ def run_scan_cycle(trade_type: str = "scalp"):
 
         # Check if an active open position already exists for this ticker
         open_pos = state.get_open_positions()
-        has_active_pos = any(p.get("ticker") == ticker for p in open_pos.values())
-        if has_active_pos:
+        if has_active_pos := any(p.get("ticker") == ticker for p in open_pos.values()):
             log.info("Active position already open for %s, skipping", ticker)
+            state.save_signal(sig)
+            continue
+
+        # Check max concurrent positions cap to prevent margin exhaustion
+        if len(open_pos) >= cfg.max_concurrent_positions:
+            log.info("Active positions at cap (%d/%d). Skipping %s execution to minimize risk.", len(open_pos), cfg.max_concurrent_positions, ticker)
             state.save_signal(sig)
             continue
 
@@ -317,11 +322,15 @@ def main():
     run_scan_cycle("scalp")
 
     log.info("Xira Trade Desk Bot is running. Press Ctrl+C to terminate.")
-    try:
-        while True:
+    while True:
+        try:
             time.sleep(1)
-    except (KeyboardInterrupt, SystemExit):
-        _shutdown()
+        except (KeyboardInterrupt, SystemExit):
+            _shutdown()
+            break
+        except Exception as exc:
+            log.exception("Unexpected exception in main loop: %s", exc)
+            time.sleep(5)
 
 
 if __name__ == "__main__":

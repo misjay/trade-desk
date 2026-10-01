@@ -55,6 +55,11 @@ class Config:
     risk_per_trade: float = field(default_factory=lambda: float(os.getenv("RISK_PER_TRADE", "0.005")))
     paper_equity: float = field(default_factory=lambda: float(os.getenv("PAPER_EQUITY", "10000")))
 
+    # Loss Mitigation & Exposure Caps
+    max_concurrent_positions: int = field(default_factory=lambda: int(os.getenv("MAX_CONCURRENT_POSITIONS", "6")))
+    min_free_margin_pct: float = field(default_factory=lambda: float(os.getenv("MIN_FREE_MARGIN_PCT", "0.30")))
+    max_position_notional: float = field(default_factory=lambda: float(os.getenv("MAX_POSITION_NOTIONAL", "25000.0")))
+
     # Scanner settings
     scalp_tf: int = field(default_factory=lambda: int(os.getenv("SCALP_TF", "15")))
     day_tf: int = field(default_factory=lambda: int(os.getenv("DAY_TF", "4")))

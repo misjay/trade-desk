@@ -436,6 +436,31 @@ def record_probation_trade(ticker: str, pnl: float) -> Optional[str]:
             return "CONTINUING"
 
 
+def check_and_trigger_consecutive_loss_quarantine(ticker: str) -> Optional[dict]:
+    """
+    Real-time circuit breaker:
+    If ticker has 2 consecutive closed losses, immediately quarantine for 24h.
+    """
+    with _lock:
+        s = _load_raw()
+        t_clean = ticker.upper()
+        if t_clean in s.get("quarantine", {}):
+            return None
+
+        closed = s.get("closed_positions", [])
+        ticker_closed = [
+            c for c in reversed(closed)
+            if c.get("ticker", "").upper() == t_clean or c.get("symbol", "").replace("USDT", "").replace("1000", "") == t_clean
+        ]
+        if len(ticker_closed) >= 2:
+            pnl1 = float(ticker_closed[0].get("pnl_usdt", 0.0) or ticker_closed[0].get("closed_pnl", 0.0))
+            pnl2 = float(ticker_closed[1].get("pnl_usdt", 0.0) or ticker_closed[1].get("closed_pnl", 0.0))
+            if pnl1 < -1.0 and pnl2 < -1.0:
+                log.warning("Real-Time Circuit Breaker: %s had 2 consecutive losses ($%.2f, $%.2f). Auto-quarantining for 24h.", t_clean, pnl2, pnl1)
+                return quarantine_asset(t_clean, hours=24.0, reason=f"2 consecutive stop-outs (${pnl2:,.2f}, ${pnl1:,.2f})")
+    return None
+
+
 def get_custom_leverage(ticker: Optional[str] = None) -> Union[Dict[str, int], Optional[int]]:
     with _lock:
         levs = _load_raw().get("custom_leverage", {})

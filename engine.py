@@ -123,14 +123,24 @@ def compute_position_size(
 
     # Check margin required at given leverage:
     notional = raw_qty * entry_price
+
+    # Hard position notional ceiling:
+    if notional > cfg.max_position_notional:
+        raw_qty = cfg.max_position_notional / entry_price
+        notional = cfg.max_position_notional
+        log.info("Capped %s position notional to $%.2f (raw_qty=%.4f)", ticker, cfg.max_position_notional, raw_qty)
+
     required_margin = notional / max(1, leverage)
     max_safe_margin = equity * 0.80  # don't tie up more than 80% equity in one trade
 
     if not client.is_paper:
         avail_bal = client.get_wallet_balance("USDT").get("available", 0.0)
+        min_buffer = equity * cfg.min_free_margin_pct
+        if avail_bal < min_buffer:
+            return 0.0, 0.0, f"Available margin ${avail_bal:,.2f} below {int(cfg.min_free_margin_pct*100)}% buffer (${min_buffer:,.2f})"
         if avail_bal > 0:
-            max_safe_margin = min(max_safe_margin, avail_bal * 0.60)
-        elif avail_bal == 0.0 and len(client.get_active_positions()) >= 3:
+            max_safe_margin = min(max_safe_margin, avail_bal * 0.50)
+        elif avail_bal == 0.0:
             return 0.0, 0.0, "Available margin exhausted by existing open positions"
 
     if required_margin > max_safe_margin:
@@ -287,6 +297,11 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
         lev = min(lev, get_hard_cap(ticker))
 
     # Pre-execution validation
+    open_pos = state.get_open_positions()
+    if len(open_pos) >= cfg.max_concurrent_positions:
+        log.info("Max concurrent positions reached (%d/%d), rejecting %s", len(open_pos), cfg.max_concurrent_positions, ticker)
+        return {"status": "REJECTED", "reason": f"Max concurrent positions cap reached ({len(open_pos)}/{cfg.max_concurrent_positions})"}
+
     valid, reason = validate_execution_conditions(
         ticker=ticker,
         side=side,
@@ -661,6 +676,17 @@ def _sync_with_bybit() -> None:
             elif prob_status == "RE_QUARANTINED":
                 log.info("%s failed probation and re-quarantined for 24h.", ticker)
                 notifier.send_text(f"🚫 *Probation Failed:* {ticker} incurred net loss on probation (${pnl_u:,.2f}). Quarantined on Avoid List for 24h.")
+            elif pnl_u < -1.0:
+                # Real-time 2-loss circuit breaker
+                quar_info = state.check_and_trigger_consecutive_loss_quarantine(ticker)
+                if quar_info:
+                    log.warning("Real-time circuit breaker triggered for %s", ticker)
+                    notifier.send_text(
+                        f"🚨 *Instant Circuit Breaker Triggered: {ticker}*\n\n"
+                        f"• *Reason*: Asset suffered 2 consecutive stop-outs.\n"
+                        f"• *Action*: Automatically quarantined on Avoid List for 24 hours.\n"
+                        f"• *Outcome*: Capital protected from repeated drawdowns."
+                    )
 
     # 3. Check Bybit active positions
     bybit_positions = client.get_active_positions(category="linear")
@@ -761,7 +787,33 @@ def _sync_with_bybit() -> None:
             matched_id = pos_id
 
         # Check TP1 Trailing SL condition (adjust Bybit SL to Break-Even)
+        # Check Early Break-Even condition (at 50% distance to TP1 / +1R progress)
         tp1 = matched_pos.get("tp1")
+        if tp1 and not matched_pos.get("be_trailed") and not matched_pos.get("tp1_hit"):
+            early_be = False
+            if b_side == "BUY":
+                be_trigger = b_entry + (tp1 - b_entry) * 0.50
+                if b_mark >= be_trigger:
+                    early_be = True
+            elif b_side == "SELL":
+                be_trigger = b_entry - (b_entry - tp1) * 0.50
+                if b_mark <= be_trigger:
+                    early_be = True
+
+            if early_be:
+                log.info("Early +1R reached for %s %s! Trailing SL to Break-Even @%.4f", ticker, b_side, b_entry)
+                state.update_open_position(matched_id, {"be_trailed": True})
+                matched_pos["be_trailed"] = True
+                be_sl = b_entry * 1000.0 if ticker == "PEPE" else b_entry
+                client.set_trading_stop(sym, stop_loss=be_sl)
+                notifier.send_text(
+                    f"🛡️ *Capital Protection Active: {ticker}*\n\n"
+                    f"• *Progress*: +1R (50% progress to TP1) reached at `{fmt_dollar(b_mark)}`\n"
+                    f"• *Action*: Exchange Stop Loss shifted to Break-Even (`{fmt_dollar(b_entry)}`)\n"
+                    f"• *Downside Risk*: **$0.00** (Risk-free trade)"
+                )
+
+        # Check TP1 Trailing SL condition (adjust Bybit SL to Break-Even)
         if tp1 and not matched_pos.get("tp1_hit"):
             hit = False
             if b_side == "BUY" and b_mark >= tp1:
@@ -771,8 +823,9 @@ def _sync_with_bybit() -> None:
 
             if hit:
                 log.info("TP1 reached on Bybit for %s %s! Trailing SL to BE @%.4f", ticker, b_side, b_entry)
-                state.update_open_position(matched_id, {"tp1_hit": True})
+                state.update_open_position(matched_id, {"tp1_hit": True, "be_trailed": True})
                 matched_pos["tp1_hit"] = True
+                matched_pos["be_trailed"] = True
                 be_sl = b_entry * 1000.0 if ticker == "PEPE" else b_entry
                 client.set_trading_stop(sym, stop_loss=be_sl)
                 notifier.notify_tp1_be(matched_pos, b_mark)
