@@ -432,9 +432,11 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
     log.info("Opened PERP order: %s %s @$%.4f qty=%.6f lev=%dx status=%s", ticker, side, entry_mid, perp_qty, lev, pos_perp["status"])
 
     # ── 2. Execute SPOT Block ────────────────────────────────────────────────
-    # Rule: Spot sell only if user holds the coin. If flat, drop spot sell.
-    execute_spot = True
-    if side == "SELL":
+    # Check if spot trading is enabled via /onspot (disabled via /offspot)
+    execute_spot = state.is_spot_enabled()
+    if not execute_spot:
+        log.info("Spot trade for %s skipped: spot trading is disabled (/offspot)", ticker)
+    elif side == "SELL":
         if client.is_paper:
             execute_spot = False  # Paper mode does not assume spot inventory
         else:

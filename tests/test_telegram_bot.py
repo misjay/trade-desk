@@ -34,6 +34,21 @@ class TestTelegramBot(unittest.TestCase):
             telegram_bot.handle_command("/resume", "12345")
             self.assertFalse(state.is_paused())
 
+    def test_spot_toggle_commands(self):
+        import telegram_bot
+        import state
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/offspot", "12345")
+            self.assertFalse(state.is_spot_enabled())
+            self.assertIn("Spot Trading DISABLED", mock_reply.call_args[0][1])
+
+            telegram_bot.handle_command("/onspot", "12345")
+            self.assertTrue(state.is_spot_enabled())
+            self.assertIn("Spot Trading ENABLED", mock_reply.call_args[0][1])
+
+            # Reset back to False
+            state.set_spot_enabled(False)
+
     def test_status_command(self):
         import telegram_bot
         with patch.object(telegram_bot, "_reply") as mock_reply:

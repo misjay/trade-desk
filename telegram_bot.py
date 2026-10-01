@@ -66,6 +66,8 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
             "• `/scan` — Trigger an immediate market scalp scan\n"
             "• `/pause` — Pause opening new orders\n"
             "• `/resume` — Resume automatic order execution\n"
+            "• `/onspot` — 🟢 Enable Spot order execution\n"
+            "• `/offspot` — 🔴 Disable Spot orders (Perps only)\n"
             "• `/cancelorder <COINS>` — 🚫 Cancel resting limit orders (e.g. `/cancelorder BTC`)\n"
             "• `/cancelallorders` — 🧹 Cancel ALL resting limit orders on Bybit\n"
             "• `/close <TICKER>` — Market close position for ticker (e.g. `/close HYPE`)\n"
@@ -83,14 +85,17 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
         active_count = len(open_pos)
         stats = state.get_session_stats()
         paused = state.is_paused()
+        spot_on = state.is_spot_enabled()
 
         mode_str = cfg.trade_mode.upper()
         pause_str = "⏸ PAUSED" if paused else "🟢 ACTIVE"
+        spot_str = "🟢 ON (Dual-Venue)" if spot_on else "🔴 OFF (Perps Only)"
 
         msg = (
             f"📊 *Xira Trade Desk Status*\n\n"
             f"• *Mode*: `{mode_str}` ({cfg.effective_demo_env})\n"
             f"• *Execution*: {pause_str}\n"
+            f"• *Spot Trading*: {spot_str}\n"
             f"• *Total Equity*: `${eq:,.2f} USDT`\n"
             f"• *Available*: `${avail:,.2f} USDT`\n"
             f"• *Open Positions*: `{active_count}`\n"
@@ -136,6 +141,25 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
     elif cmd == "/resume":
         state.set_paused(False)
         _reply(chat_id, "🟢 *Automated execution RESUMED.* Scanning and placing orders.")
+
+    elif cmd in ("/onspot", "/spoton"):
+        state.set_spot_enabled(True)
+        _reply(
+            chat_id,
+            "🟢 *Spot Trading ENABLED (/onspot)*\n\n"
+            "• Bot will execute dual-venue trades (Linear Perps + Spot buys/sells) when valid setups occur.\n"
+            "• Use `/offspot` anytime to trade Perpetuals only."
+        )
+
+    elif cmd in ("/offspot", "/spotoff"):
+        state.set_spot_enabled(False)
+        _reply(
+            chat_id,
+            "🔴 *Spot Trading DISABLED (/offspot)*\n\n"
+            "• Bot is now in *Perpetual Futures Only* mode.\n"
+            "• No USDT balance will be spent purchasing spot coins.\n"
+            "• Use `/onspot` anytime to re-enable spot execution."
+        )
 
     elif cmd == "/scan":
         _reply(chat_id, "🔍 *Triggering scalp scan across Core 24 and Extras...*")
@@ -630,6 +654,8 @@ BOT_COMMANDS = [
     {"command": "drop", "description": "Close position & blacklist coin"},
     {"command": "pause", "description": "Pause automated order execution"},
     {"command": "resume", "description": "Resume automated execution"},
+    {"command": "onspot", "description": "🟢 Enable Spot trade execution"},
+    {"command": "offspot", "description": "🔴 Disable Spot trades (Perps only)"},
     {"command": "cancelorder", "description": "Cancel resting orders for asset(s)"},
     {"command": "cancelallorders", "description": "Cancel all resting orders on Bybit"},
     {"command": "close", "description": "Market close a specific ticker"},

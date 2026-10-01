@@ -57,6 +57,7 @@ def _default_state() -> Dict[str, Any]:
         },
         "avoid_list": [],
         "custom_leverage": {},
+        "spot_enabled": False,
         "created_at": _now(),
         "updated_at": _now(),
     }
@@ -350,3 +351,17 @@ def remove_working_orders(ticker: Optional[str] = None) -> int:
         if to_delete:
             _save(s)
         return len(to_delete)
+
+
+def is_spot_enabled() -> bool:
+    with _lock:
+        return bool(_load_raw().get("spot_enabled", False))
+
+
+def set_spot_enabled(enabled: bool) -> bool:
+    with _lock:
+        s = _load_raw()
+        s["spot_enabled"] = bool(enabled)
+        _save(s)
+        return s["spot_enabled"]
+
