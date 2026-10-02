@@ -153,17 +153,128 @@ ASSET_CATALYSTS: Dict[str, Dict[str, str]] = {
         "fundamental": "Hedera Hashgraph asynchronous Byzantine fault tolerance and Governing Council (Google, IBM, Dell)",
         "speculation": "Enterprise supply chain tracking and tokenized asset custody adoption",
         "sector": "Enterprise Hashgraph DLT",
+        "hook": "most chains are chasing retail attention.\n\n$HBAR has been quietly chasing enterprise integration. different game & payoff.\n\nwhen this moves, won't be because of a tweet. it'll be because the infra was already there.",
     },
     "NEAR": {
         "fundamental": "User-owned AI and Chain Abstraction pioneer with Nightshade sharding infrastructure",
         "speculation": "Decentralized AI developer traction and Web3 user abstraction integration",
         "sector": "Chain Abstraction & AI L1",
+        "hook": "most L1s battle for fleeting DEX memecoins.\n\n$NEAR is quietly building the operating system for AI agents and chain abstraction.\n\nwhen the wave hits, adoption won't be speculative—it'll be structural.",
     },
     "WLD": {
         "fundamental": "World Network Proof of Human identity iris biometric verification and World Chain infrastructure",
         "speculation": "AI agent verification demand and identity-gated decentralized compute allocation",
         "sector": "Proof of Personhood & Biometric Identity",
+        "hook": "most projects optimize for bot activity.\n\n$WLD is anchoring verifiable human identity in an AI agent world.\n\nscarcity of verified attention is the ultimate asymmetric play.",
     },
+}
+
+TWITTER_HOOKS: Dict[str, str] = {
+    "BTC": (
+        "most macro assets react to quarter-to-quarter headlines.\n\n"
+        "$BTC is quietly absorbing institutional ETF balances and structural supply.\n\n"
+        "when this reprices, it won't be hype. it'll be the math of liquid scarcity."
+    ),
+    "ETH": (
+        "the market debated gas fees while $ETH quietly turned into the settlement layer for global finance and Layer 2s.\n\n"
+        "settlement velocity doesn't need hype—it commands structural floor."
+    ),
+    "SOL": (
+        "most ecosystems struggle to generate real consumer on-chain volume.\n\n"
+        "$SOL captured the entire retail flow and velocity engine.\n\n"
+        "liquidity goes where users transact, not where whitepapers promise."
+    ),
+    "XRP": (
+        "most tokens are looking for a use case.\n\n"
+        "$XRP has spent years embedding into institutional banking corridors.\n\n"
+        "when settlement rails flip on, it won't be retail noise driving it."
+    ),
+    "BNB": (
+        "market cycles rotate, but exchange utility remains the ultimate cash machine.\n\n"
+        "$BNB burns supply while powering the largest CeFi-to-DeFi capital funnel."
+    ),
+    "DOGE": (
+        "critics call it a meme, yet $DOGE commands the deepest organic liquidity and merchant brand in crypto.\n\n"
+        "never underestimate relentless cultural attention."
+    ),
+    "ADA": (
+        "most networks ship fast and break things.\n\n"
+        "$ADA built peer-reviewed formal infrastructure for the long horizon.\n\n"
+        "governance is live—now watch structural positioning."
+    ),
+    "LINK": (
+        "everyone talks about Real-World Asset (RWA) tokenization.\n\n"
+        "$LINK already owns the institutional pipeline (CCIP, Swift, DTCC).\n\n"
+        "you can't bring trillions on-chain without the standard."
+    ),
+    "AVAX": (
+        "monolithic chains run into limits.\n\n"
+        "$AVAX built custom enterprise Subnets quietly adopted by institutions.\n\n"
+        "modular enterprise scale is an entirely different ballgame."
+    ),
+    "SUI": (
+        "most L1s were built on legacy architectures.\n\n"
+        "$SUI re-engineered speed from first principles with Move and sub-400ms finality.\n\n"
+        "performance this clean attracts serious liquidity."
+    ),
+    "HYPE": (
+        "centralized exchanges used to hold all derivatives power.\n\n"
+        "$HYPE built a zero-fee custom chain redistributing 100% revenue to users.\n\n"
+        "the decentralized perps shift is inevitable."
+    ),
+    "LTC": (
+        "through every bull and bear market, $LTC maintains 100% uninterrupted uptime and rock-solid payment utility.\n\n"
+        "commodity purity with institutional staying power."
+    ),
+    "AAVE": (
+        "speculative protocols vanish, but $AAVE remains the unyielding backbone of on-chain credit and liquidity.\n\n"
+        "money markets don't sleep."
+    ),
+    "ZEC": (
+        "in an era of complete transparent surveillance, privacy becomes the rarest luxury.\n\n"
+        "$ZEC zk-SNARK cryptography is the gold standard for shielded value."
+    ),
+    "UNI": (
+        "DEXs come and go, but $UNI commands the deepest spot liquidity in all of DeFi.\n\n"
+        "v4 hooks and Unichain cement its moat."
+    ),
+    "BCH": (
+        "high fees push everyday commerce away.\n\n"
+        "$BCH has quietly stayed true to fast, sub-cent peer-to-peer settlement."
+    ),
+    "TRX": (
+        "while others debated tech stacks, $TRX quietly became the undisputed highway for >50% of global Tether volume.\n\n"
+        "cashflow and transaction volume tell the real story."
+    ),
+    "XLM": (
+        "remittances are broken worldwide.\n\n"
+        "$XLM built real-world cash-to-crypto ramps with MoneyGram and global anchors.\n\n"
+        "real utility beats speculative noise."
+    ),
+    "TAO": (
+        "most AI tokens slapped a logo on a wrapper.\n\n"
+        "$TAO built a decentralized neural network commoditizing machine intelligence across competitive subnets.\n\n"
+        "compute and intelligence are the new reserve assets."
+    ),
+    "ONDO": (
+        "trillions in institutional capital want on-chain risk-free treasury yield.\n\n"
+        "$ONDO bridged BlackRock BUIDL into decentralized rails.\n\n"
+        "this is where traditional finance actually enters."
+    ),
+    "PEPE": (
+        "zero taxes, no team tokens, pure unadulterated market liquidity.\n\n"
+        "$PEPE is the ultimate liquidity sponge when market risk appetite explodes."
+    ),
+    "ENA": (
+        "traditional stablecoins rely on fiat reserves.\n\n"
+        "$ENA built the internet bond through basis arbitrage yield.\n\n"
+        "a structural paradigm shift for decentralized capital."
+    ),
+    "HBAR": (
+        "most chains are chasing retail attention.\n\n"
+        "$HBAR has been quietly chasing enterprise integration. different game & payoff.\n\n"
+        "when this moves, won't be because of a tweet. it'll be because the infra was already there."
+    ),
 }
 
 DEFAULT_CATALYST: Dict[str, str] = {
@@ -533,50 +644,110 @@ def send_call_research_to_feedback_bot(sig: dict) -> bool:
 
 
 # ── Twitter / X Post Converter ──────────────────────────────────────────────
+def _fmt_tweet_price(val: Optional[float]) -> str:
+    """Compact price formatting designed for Twitter character economy."""
+    if val is None or math.isnan(val):
+        return "—"
+    if val >= 1000:
+        return f"${val:,.0f}"
+    if val >= 1:
+        s = f"{val:.2f}".rstrip("0").rstrip(".")
+        return f"${s}"
+    if val >= 0.001:
+        s = f"{val:.4f}".rstrip("0").rstrip(".")
+        return f"${s}"
+    s = f"{val:.6f}".rstrip("0").rstrip(".")
+    return f"${s}"
+
+
 def format_twitter_post(sig: dict) -> str:
     """
     Convert a research setup into a punchy, high-impact Twitter / X post
-    strictly optimized to fit within the 280-character limit.
+    featuring an asymmetric thesis narrative hook followed by entry, TP, and SL speculation.
+    Optimized strictly to fit within the 280-character limit.
     """
     ticker = sig.get("ticker", "BTC").upper()
     side = sig.get("side", "BUY").upper()
     tf = sig.get("tf", "15m")
-    el = fmt_dollar(sig.get("entry_low"))
-    eh = fmt_dollar(sig.get("entry_high"))
-    tp1 = fmt_dollar(sig.get("tp1"))
-    tp2 = fmt_dollar(sig.get("tp2"))
-    sl = fmt_dollar(sig.get("sl"))
-    rr = sig.get("rr", 2.0)
+    el = _fmt_tweet_price(sig.get("entry_low"))
+    eh = _fmt_tweet_price(sig.get("entry_high"))
+    tp1 = _fmt_tweet_price(sig.get("tp1"))
+    tp2 = _fmt_tweet_price(sig.get("tp2"))
+    sl = _fmt_tweet_price(sig.get("sl"))
 
-    cat = ASSET_CATALYSTS.get(ticker, DEFAULT_CATALYST)
-    sector = cat.get("sector", "Crypto")
+    # Pull asset-specific narrative hook
+    hook = TWITTER_HOOKS.get(ticker)
+    if not hook:
+        cat = ASSET_CATALYSTS.get(ticker, DEFAULT_CATALYST)
+        sector = cat.get("sector", "Crypto")
+        hook = f"most chains chase short-term attention.\n\n${ticker} is quietly building in {sector}.\n\nreal payoff comes when the structural shift hits."
 
-    telemetry = get_market_telemetry(ticker)
-    rsi_4h = telemetry.get("rsi_4h", 50.0)
-
-    # Single tweet layout (< 280 chars)
-    tweet = (
-        f"${ticker} {side} Setup ({tf}) 🎯\n\n"
-        f"Thesis: {sector}. 4H RSI {rsi_4h:.0f}.\n"
+    # Try Option 1: Full 3-line speculation with header
+    opt1 = (
+        f"{hook}\n\n"
+        f"Speculation:\n"
         f"• Entry: {el} – {eh}\n"
-        f"• Targets: {tp1} / {tp2} (R:R {rr:.1f})\n"
-        f"• Invalidation: {sl}\n\n"
-        f"Verdict: Confirm {tf} shelf hold before entering.\n\n"
-        f"#{ticker} #CryptoTrading"
+        f"• TP: {tp1} / {tp2}\n"
+        f"• SL: {sl}"
     )
+    if len(opt1) <= 280:
+        return opt1
 
-    if len(tweet) > 280:
-        tweet = (
-            f"${ticker} {side} ({tf}) 🎯\n"
+    # Try Option 2: Full hook with 3 bullet lines directly (Entry, TP, SL)
+    opt2 = (
+        f"{hook}\n\n"
+        f"• Entry: {el} – {eh}\n"
+        f"• TP: {tp1} / {tp2}\n"
+        f"• SL: {sl}"
+    )
+    if len(opt2) <= 280:
+        return opt2
+
+    # Try Option 3: Full hook with Speculation header on 1 line
+    opt3 = (
+        f"{hook}\n\n"
+        f"Speculation:\n"
+        f"• Entry {el}–{eh} | TP {tp1}/{tp2} | SL {sl}"
+    )
+    if len(opt3) <= 280:
+        return opt3
+
+    # Try Option 4: Full hook with 2 bullet lines (Entry + Targets/SL)
+    opt4 = (
+        f"{hook}\n\n"
+        f"Speculation:\n"
+        f"• Entry: {el} – {eh}\n"
+        f"• TP: {tp1} / {tp2} | SL: {sl}"
+    )
+    if len(opt4) <= 280:
+        return opt4
+
+    # Try Option 5: Full hook with single-line speculation
+    opt_single = f"{hook}\n\nSpeculation: {el}–{eh} | TP {tp1}/{tp2} | SL {sl}"
+    if len(opt_single) <= 280:
+        return opt_single
+
+    # Option 5: Condensed middle line fallback
+    lines = [ln.strip() for ln in hook.split("\n") if ln.strip()]
+    if len(lines) >= 3:
+        condensed_hook = f"{lines[0]}\n${ticker} has been quietly building different rails & payoff.\n{lines[2]}"
+        opt5 = (
+            f"{condensed_hook}\n\n"
+            f"Speculation:\n"
             f"• Entry: {el} – {eh}\n"
-            f"• Targets: {tp1} / {tp2}\n"
-            f"• Stop: {sl} (R:R {rr:.1f})\n"
-            f"• 4H RSI: {rsi_4h:.0f}\n\n"
-            f"Verdict: Confirm {tf} shelf hold.\n"
-            f"#{ticker} #Crypto"
+            f"• TP: {tp1} / {tp2} | SL: {sl}"
         )
+        if len(opt5) <= 280:
+            return opt5
 
-    return tweet
+    # Safe compact fallback
+    return (
+        f"{lines[0] if lines else 'most projects chase retail hype.'}\n"
+        f"${ticker} has the infra already there.\n\n"
+        f"• Entry: {el} – {eh}\n"
+        f"• TP: {tp1} / {tp2}\n"
+        f"• SL: {sl}"
+    )
 
 
 def send_twitter_post(
