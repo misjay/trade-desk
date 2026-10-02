@@ -294,6 +294,16 @@ class TestTelegramBot(unittest.TestCase):
                     del s["feedback_bot"]
                     state._save(s)
 
+    def test_research_command(self):
+        import telegram_bot
+        with patch("market_research.generate_market_research", return_value="The thesis:\n- Sample thesis"), \
+             patch("market_research.send_call_research_to_feedback_bot") as mock_send, \
+             patch.object(telegram_bot, "_reply") as mock_reply:
+
+            telegram_bot.handle_command("/research BTC", "12345")
+            mock_reply.assert_called()
+            self.assertIn("Compiling Institutional Market Research for BTC", mock_reply.call_args[0][1])
+
     def test_probation_and_avoided_commands(self):
         import telegram_bot
         import state
@@ -332,7 +342,7 @@ class TestTelegramBot(unittest.TestCase):
         # Verify key commands are in BOT_COMMANDS
         required = [
             "status", "positions", "tp", "derisk", "dailyreport", "hourlyreport",
-            "weeklyreport", "monthlyreport", "feedback", "feedbackbot", "setfeedbackbot",
+            "weeklyreport", "monthlyreport", "feedback", "research", "feedbackbot", "setfeedbackbot",
             "probation", "leverage", "existingleverage", "scan", "avoid", "allow",
             "avoided", "drop", "pause", "resume", "onspot", "offspot", "cancelorder",
             "cancelallorders", "close", "closeall", "help"

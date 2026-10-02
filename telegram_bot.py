@@ -66,6 +66,7 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
             "• `/weeklyreport` — 📆 Weekly (7d) performance & chart\n"
             "• `/monthlyreport` — 🗓️ Monthly (30d) performance & chart\n"
             "• `/feedback` — 🧠 Daily intelligence feedback: most lost/profit assets & learning\n"
+            "• `/research <COIN>` — 🔬 Institutional research note: thesis, what to watch, verdict\n"
             "• `/setfeedbackbot <TOKEN> <CHAT_ID>` — 🤖 Connect another bot for daily feedback\n"
             "• `/feedbackbot` — 📋 View current feedback bot destination\n"
             "• `/probation` — 🧪 View 24h quarantined & 50% probation assets\n"
@@ -670,6 +671,37 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
             f"To change or point to another bot:\n`/setfeedbackbot <BOT_TOKEN> <CHAT_ID>`"
         )
 
+    elif cmd in ("/research", "/call", "/thesis"):
+        target_ticker = args[0].upper().replace("USDT", "") if args else "BTC"
+        _reply(chat_id, f"🔬 *Compiling Institutional Market Research for {target_ticker}...*")
+        import market_research
+
+        def _do_research(t: str):
+            sig = state.get_last_signal(t)
+            if not sig:
+                from scanner import fetch_live_price
+                lp = fetch_live_price(t) or 100.0
+                sig = {
+                    "ticker": t,
+                    "side": "BUY",
+                    "trade_type": "scalp",
+                    "tf": "15m",
+                    "entry_low": lp * 0.995,
+                    "entry_high": lp * 1.002,
+                    "tp1": lp * 1.025,
+                    "tp2": lp * 1.050,
+                    "sl": lp * 0.985,
+                    "rr": 2.0,
+                    "structure": f"Demand zone near ${lp:,.2f}",
+                    "reason": "Institutional order block retest",
+                    "live_price": lp,
+                }
+            note = market_research.generate_market_research(sig)
+            _reply(chat_id, note + _paused_footer())
+            market_research.send_call_research_to_feedback_bot(sig)
+
+        threading.Thread(target=_do_research, args=(target_ticker,), daemon=True, name=f"research-{target_ticker}").start()
+
     elif cmd in ("/cancelorder", "/cancel"):
         if not args:
             _reply(chat_id, f"⚠️ Usage: `/cancelorder <ASSET1> <ASSET2> ...`\nExample: `/cancelorder BTC ETH`{_paused_footer()}")
@@ -791,6 +823,7 @@ BOT_COMMANDS = [
     {"command": "weeklyreport", "description": "📆 Weekly 7d analytics report & chart"},
     {"command": "monthlyreport", "description": "🗓️ Monthly 30d analytics report & chart"},
     {"command": "feedback", "description": "🧠 Daily feedback, worst/best assets & learning"},
+    {"command": "research", "description": "🔬 Deep thesis & research note (e.g. /research BTC)"},
     {"command": "feedbackbot", "description": "View current feedback bot destination"},
     {"command": "setfeedbackbot", "description": "Connect another bot for daily feedback"},
     {"command": "probation", "description": "🧪 Quarantined & 50% probation assets"},

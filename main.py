@@ -207,6 +207,14 @@ def run_scan_cycle(trade_type: str = "scalp", manual: bool = False):
 
         if is_fresh_shelf:
             notifier.notify_signal(sig)
+            if side in ("BUY", "SELL"):
+                import market_research
+                threading.Thread(
+                    target=market_research.send_call_research_to_feedback_bot,
+                    args=(sig,),
+                    daemon=True,
+                    name=f"research-{ticker}",
+                ).start()
 
         # If bot is paused, do NOT execute any automated orders
         if is_paused:
