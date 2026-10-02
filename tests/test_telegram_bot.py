@@ -298,29 +298,32 @@ class TestTelegramBot(unittest.TestCase):
         import telegram_bot
         import state
 
-        # Clean state
-        state.remove_from_avoid_list(["TESTX"])
-
         # When nothing on probation
-        with patch.object(telegram_bot, "_reply") as mock_reply:
+        with patch.object(state, "get_probation_list", return_value={}), \
+             patch.object(state, "get_quarantine_list", return_value={}), \
+             patch.object(telegram_bot, "_reply") as mock_reply:
             telegram_bot.handle_command("/probation", "12345")
             self.assertIn("All systems clear", mock_reply.call_args[0][1])
 
         # Quarantine asset
-        state.quarantine_asset("TESTX", hours=24.0, reason="Drawdown limit")
-
-        with patch.object(telegram_bot, "_reply") as mock_reply:
+        mock_quar = {
+            "TESTX": {
+                "ticker": "TESTX",
+                "expires_at": "2026-10-03T00:00:00+00:00",
+                "reason": "Drawdown limit"
+            }
+        }
+        with patch.object(state, "get_probation_list", return_value={}), \
+             patch.object(state, "get_quarantine_list", return_value=mock_quar), \
+             patch.object(state, "get_avoid_list", return_value=["TESTX"]), \
+             patch.object(telegram_bot, "_reply") as mock_reply:
             telegram_bot.handle_command("/probation", "12345")
             self.assertIn("Quarantined Assets", mock_reply.call_args[0][1])
             self.assertIn("TESTX", mock_reply.call_args[0][1])
 
-        with patch.object(telegram_bot, "_reply") as mock_reply:
             telegram_bot.handle_command("/avoided", "12345")
             self.assertIn("TESTX", mock_reply.call_args[0][1])
             self.assertIn("quarantine", mock_reply.call_args[0][1])
-
-        # Cleanup
-        state.remove_from_avoid_list(["TESTX"])
 
     def test_all_bot_commands_registered(self):
         import telegram_bot

@@ -158,7 +158,9 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
 
     elif cmd == "/resume":
         state.set_paused(False)
-        _reply(chat_id, "🟢 *Automated execution RESUMED.* Scanning and placing orders.")
+        _reply(chat_id, "🟢 *Automated execution RESUMED.* Triggering immediate market scan and order placement now...")
+        if scan_trigger_fn:
+            threading.Thread(target=scan_trigger_fn, daemon=True).start()
 
     elif cmd in ("/onspot", "/spoton"):
         state.set_spot_enabled(True)
