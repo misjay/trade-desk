@@ -302,7 +302,7 @@ class TestTelegramBot(unittest.TestCase):
 
             telegram_bot.handle_command("/research BTC", "12345")
             mock_reply.assert_called()
-            self.assertIn("Compiling Institutional Market Research for BTC", mock_reply.call_args[0][1])
+            self.assertIn("Institutional Research & Charts for BTC", mock_reply.call_args[0][1])
 
     def test_probation_and_avoided_commands(self):
         import telegram_bot
@@ -342,7 +342,7 @@ class TestTelegramBot(unittest.TestCase):
         # Verify key commands are in BOT_COMMANDS
         required = [
             "status", "positions", "tp", "derisk", "dailyreport", "hourlyreport",
-            "weeklyreport", "monthlyreport", "feedback", "research", "feedbackbot", "setfeedbackbot",
+            "weeklyreport", "monthlyreport", "feedback", "research", "tweet", "feedbackbot", "setfeedbackbot",
             "probation", "leverage", "existingleverage", "scan", "avoid", "allow",
             "avoided", "drop", "pause", "resume", "onspot", "offspot", "cancelorder",
             "cancelallorders", "close", "closeall", "help"
@@ -435,7 +435,51 @@ class TestTelegramBot(unittest.TestCase):
             self.assertFalse(state.is_paused(), "Bot should be resumed after explicit /resume")
             self.assertIn("Automated execution RESUMED", mock_reply.call_args[0][1])
 
+    def test_research_timeframes_command(self):
+        import telegram_bot
+        import market_research
+
+        with patch.object(telegram_bot, "_reply") as mock_reply, \
+             patch.object(market_research, "build_signal_for_timeframe") as mock_build, \
+             patch.object(market_research, "send_research_with_chart") as mock_send:
+
+            mock_build.return_value = {
+                "ticker": "ETH", "side": "BUY", "tf": "15m",
+                "entry_low": 2400.0, "entry_high": 2420.0,
+                "tp1": 2460.0, "tp2": 2500.0, "sl": 2370.0, "rr": 2.0
+            }
+
+            # 1. Natural language research (day and scalp) ETH
+            telegram_bot.handle_command("research (day and scalp) ETH", "12345")
+            mock_reply.assert_called()
+            self.assertIn("Compiling Day & Scalp", mock_reply.call_args[0][1])
+
+            # 2. Scalp only: research (scalp) SOL
+            telegram_bot.handle_command("research (scalp) SOL", "12345")
+            self.assertIn("Compiling Scalp", mock_reply.call_args[0][1])
+
+            # 3. Day only: /research day BTC
+            telegram_bot.handle_command("/research day BTC", "12345")
+            self.assertIn("Compiling Day", mock_reply.call_args[0][1])
+
+    def test_twitter_post_command(self):
+        import telegram_bot
+        import market_research
+
+        with patch.object(market_research, "send_twitter_post") as mock_send_tweet:
+            mock_send_tweet.return_value = True
+
+            # 1. /tweet BTC
+            telegram_bot.handle_command("/tweet BTC", "12345")
+            mock_send_tweet.assert_called()
+
+            # 2. Natural language: convert to Twitter post
+            mock_send_tweet.reset_mock()
+            telegram_bot.handle_command("convert to Twitter post", "12345")
+            mock_send_tweet.assert_called()
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

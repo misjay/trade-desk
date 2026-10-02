@@ -555,3 +555,15 @@ def get_learning_history() -> List[dict]:
     with _lock:
         return list(_load_raw().get("learning_events", []))
 
+
+def set_last_researched_signal(sig: dict) -> None:
+    with _lock:
+        s = _load_raw()
+        s["last_researched_signal"] = sig
+        _save(s)
+
+
+def get_last_researched_signal() -> Optional[dict]:
+    with _lock:
+        return _load_raw().get("last_researched_signal")
+

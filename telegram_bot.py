@@ -22,10 +22,14 @@ _bot_running = False
 _last_update_id = 0
 
 
-def _reply(chat_id: str, text: str) -> None:
-    if not cfg.telegram_token:
+_current_bot_token: Optional[str] = None
+
+
+def _reply(chat_id: str, text: str, bot_token: Optional[str] = None) -> None:
+    token = bot_token or _current_bot_token or cfg.telegram_token
+    if not token:
         return
-    url = f"https://api.telegram.org/bot{cfg.telegram_token}/sendMessage"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -45,8 +49,36 @@ def _paused_footer() -> str:
     return ""
 
 
-def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
-    parts = cmd_text.strip().split()
+def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token: Optional[str] = None) -> None:
+    global _current_bot_token
+    if bot_token:
+        _current_bot_token = bot_token
+
+    raw_text = cmd_text.strip()
+    if not raw_text:
+        return
+
+    # Natural Language Interceptors
+    lower_raw = raw_text.lower()
+    if "convert to twitter post" in lower_raw or "convert to twitter" in lower_raw or "convert to tweet" in lower_raw or lower_raw == "tweet":
+        parts = ["/tweet"]
+    elif lower_raw.startswith("tweet ") or lower_raw.startswith("/tweet "):
+        parts = ["/tweet"] + raw_text.split()[1:]
+    elif "research" in lower_raw and "(" in lower_raw and ")" in lower_raw:
+        # e.g. research (day and scalp) BTC or /research (scalp) ETH
+        import re
+        m = re.search(r"research\s*\(([^)]+)\)\s*(?:for\s+)?([A-Za-z0-9_-]+)?", raw_text, re.IGNORECASE)
+        if m:
+            mode_arg = m.group(1).strip()
+            ticker_arg = (m.group(2) or "").strip()
+            parts = ["/research", mode_arg]
+            if ticker_arg:
+                parts.append(ticker_arg)
+        else:
+            parts = raw_text.split()
+    else:
+        parts = raw_text.split()
+
     if not parts:
         return
     cmd = parts[0].lower().split("@")[0]
@@ -66,7 +98,8 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
             "• `/weeklyreport` — 📆 Weekly (7d) performance & chart\n"
             "• `/monthlyreport` — 🗓️ Monthly (30d) performance & chart\n"
             "• `/feedback` — 🧠 Daily intelligence feedback: most lost/profit assets & learning\n"
-            "• `/research <COIN>` — 🔬 Institutional research note: thesis, what to watch, verdict\n"
+            "• `/research <COIN>` — 🔬 Institutional research note & chart (e.g. `research (day and scalp) BTC`)\n"
+            "• `/tweet [COIN]` — 🐦 Convert research into 280-char Twitter/X post\n"
             "• `/setfeedbackbot <TOKEN> <CHAT_ID>` — 🤖 Connect another bot for daily feedback\n"
             "• `/feedbackbot` — 📋 View current feedback bot destination\n"
             "• `/probation` — 🧪 View 24h quarantined & 50% probation assets\n"
@@ -672,35 +705,68 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
         )
 
     elif cmd in ("/research", "/call", "/thesis"):
-        target_ticker = args[0].upper().replace("USDT", "") if args else "BTC"
-        _reply(chat_id, f"🔬 *Compiling Institutional Market Research for {target_ticker}...*")
         import market_research
 
-        def _do_research(t: str):
-            sig = state.get_last_signal(t)
-            if not sig:
-                from scanner import fetch_live_price
-                lp = fetch_live_price(t) or 100.0
-                sig = {
-                    "ticker": t,
-                    "side": "BUY",
-                    "trade_type": "scalp",
-                    "tf": "15m",
-                    "entry_low": lp * 0.995,
-                    "entry_high": lp * 1.002,
-                    "tp1": lp * 1.025,
-                    "tp2": lp * 1.050,
-                    "sl": lp * 0.985,
-                    "rr": 2.0,
-                    "structure": f"Demand zone near ${lp:,.2f}",
-                    "reason": "Institutional order block retest",
-                    "live_price": lp,
-                }
-            note = market_research.generate_market_research(sig)
-            _reply(chat_id, note + _paused_footer())
-            market_research.send_call_research_to_feedback_bot(sig)
+        req_mode = "both"
+        target_ticker = "BTC"
 
-        threading.Thread(target=_do_research, args=(target_ticker,), daemon=True, name=f"research-{target_ticker}").start()
+        if args:
+            first_arg = args[0].strip().lower()
+            if first_arg in ("day and scalp", "day & scalp", "both", "scalp and day", "scalp & day"):
+                req_mode = "both"
+                if len(args) > 1:
+                    target_ticker = args[1].upper().replace("USDT", "")
+            elif first_arg in ("scalp", "15m"):
+                req_mode = "scalp"
+                if len(args) > 1:
+                    target_ticker = args[1].upper().replace("USDT", "")
+            elif first_arg in ("day", "4h", "daily"):
+                req_mode = "day"
+                if len(args) > 1:
+                    target_ticker = args[1].upper().replace("USDT", "")
+            else:
+                target_ticker = args[0].upper().replace("USDT", "")
+                if len(args) > 1:
+                    second_arg = args[1].strip().lower()
+                    if second_arg in ("day and scalp", "both"):
+                        req_mode = "both"
+                    elif second_arg in ("scalp", "15m"):
+                        req_mode = "scalp"
+                    elif second_arg in ("day", "4h"):
+                        req_mode = "day"
+
+        mode_desc = "Day & Scalp" if req_mode == "both" else ("Scalp (15m)" if req_mode == "scalp" else "Day (4h)")
+        _reply(chat_id, f"🔬 *Compiling {mode_desc} Institutional Research & Charts for {target_ticker}...*")
+
+        def _do_research(t: str, mode: str, cid: str):
+            tok = _current_bot_token or cfg.telegram_token
+            # 1. Scalp setup (15m)
+            if mode in ("both", "scalp"):
+                sig_scalp = market_research.build_signal_for_timeframe(t, tf_minutes=15)
+                state.set_last_researched_signal(sig_scalp)
+                market_research.send_research_with_chart(sig_scalp, bot_token=tok, chat_id=cid, tf_minutes=15)
+
+            # 2. Day setup (4h)
+            if mode in ("both", "day"):
+                sig_day = market_research.build_signal_for_timeframe(t, tf_minutes=240)
+                state.set_last_researched_signal(sig_day)
+                market_research.send_research_with_chart(sig_day, bot_token=tok, chat_id=cid, tf_minutes=240)
+
+        threading.Thread(target=_do_research, args=(target_ticker, req_mode, chat_id), daemon=True, name=f"research-{target_ticker}").start()
+
+    elif cmd in ("/tweet", "/twitter"):
+        import market_research
+        target_ticker = args[0].upper().replace("USDT", "") if args else ""
+        sig = None
+        if target_ticker:
+            sig = market_research.build_signal_for_timeframe(target_ticker, tf_minutes=15)
+        else:
+            sig = state.get_last_researched_signal() or state.get_last_signal("BTC")
+            if not sig:
+                sig = market_research.build_signal_for_timeframe("BTC", tf_minutes=15)
+
+        tok = _current_bot_token or cfg.telegram_token
+        market_research.send_twitter_post(sig, bot_token=tok, chat_id=chat_id)
 
     elif cmd in ("/cancelorder", "/cancel"):
         if not args:
@@ -765,34 +831,27 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None) -> None:
         _reply(chat_id, f"Unknown command: `{cmd}`. Type `/help` for available commands.")
 
 
-def _poll_updates_loop(scan_trigger_fn=None) -> None:
-    global _last_update_id, _bot_running
-    log.info("Telegram interactive command listener started")
-
-    # Get initial update offset so old historical messages aren't re-executed
+def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_trigger_fn=None) -> None:
+    last_update_id = 0
     try:
-        init_url = f"https://api.telegram.org/bot{cfg.telegram_token}/getUpdates"
+        init_url = f"https://api.telegram.org/bot{token}/getUpdates"
         init_r = requests.get(init_url, timeout=10)
         if init_r.status_code == 200:
             results = init_r.json().get("result", [])
             if results:
-                _last_update_id = results[-1]["update_id"]
+                last_update_id = results[-1]["update_id"]
     except Exception:
         pass
 
     while _bot_running:
-        if not cfg.telegram_token:
-            time.sleep(10)
-            continue
-
         try:
-            url = f"https://api.telegram.org/bot{cfg.telegram_token}/getUpdates"
-            params = {"offset": _last_update_id + 1, "timeout": 15}
+            url = f"https://api.telegram.org/bot{token}/getUpdates"
+            params = {"offset": last_update_id + 1, "timeout": 15}
             resp = requests.get(url, params=params, timeout=20)
             if resp.status_code == 200:
                 data = resp.json()
                 for update in data.get("result", []):
-                    _last_update_id = update["update_id"]
+                    last_update_id = update["update_id"]
                     msg = update.get("message") or update.get("edited_message")
                     if not msg:
                         continue
@@ -800,17 +859,67 @@ def _poll_updates_loop(scan_trigger_fn=None) -> None:
                     chat_id = str(msg.get("chat", {}).get("id"))
                     text = msg.get("text", "")
 
-                    if cfg.telegram_chat_id and chat_id != str(cfg.telegram_chat_id):
-                        log.warning("Ignoring message from unauthorized chat_id: %s", chat_id)
+                    if allowed_chat_id and chat_id != str(allowed_chat_id):
+                        log.warning("Ignoring message from unauthorized chat_id: %s on bot %s", chat_id, token[:10])
                         continue
 
-                    if text.startswith("/"):
-                        log.info("Received Telegram command: %s from %s", text, chat_id)
-                        handle_command(text, chat_id, scan_trigger_fn=scan_trigger_fn)
+                    raw_text = text.strip()
+                    lower_text = raw_text.lower()
+                    # Trigger on slash commands OR natural language research/tweet requests
+                    is_cmd = (
+                        raw_text.startswith("/")
+                        or "convert to twitter" in lower_text
+                        or "tweet" in lower_text
+                        or ("research" in lower_text and "(" in lower_text and ")" in lower_text)
+                    )
+                    if is_cmd:
+                        log.info("Received command on bot %s: %s from %s", token[:10], raw_text, chat_id)
+                        handle_command(raw_text, chat_id, scan_trigger_fn=scan_trigger_fn, bot_token=token)
         except Exception as exc:
-            log.debug("Telegram polling exception: %s", exc)
+            log.debug("Telegram polling exception for %s: %s", token[:10], exc)
 
         time.sleep(1)
+
+
+def _poll_updates_loop(scan_trigger_fn=None) -> None:
+    log.info("Telegram interactive command listeners starting")
+
+    # Primary bot listener
+    if cfg.telegram_token:
+        t_prim = threading.Thread(
+            target=_poll_single_bot,
+            kwargs={
+                "token": cfg.telegram_token,
+                "allowed_chat_id": str(cfg.telegram_chat_id) if cfg.telegram_chat_id else None,
+                "scan_trigger_fn": scan_trigger_fn,
+            },
+            daemon=True,
+            name="tg-poller-primary",
+        )
+        t_prim.start()
+
+    # Feedback bot listener (if distinct)
+    try:
+        fb_cfg = state.get_feedback_bot_config()
+        fb_tok = fb_cfg.get("token")
+        fb_cid = fb_cfg.get("chat_id")
+        if fb_tok and fb_tok != cfg.telegram_token:
+            t_fb = threading.Thread(
+                target=_poll_single_bot,
+                kwargs={
+                    "token": fb_tok,
+                    "allowed_chat_id": str(fb_cid) if fb_cid else None,
+                    "scan_trigger_fn": scan_trigger_fn,
+                },
+                daemon=True,
+                name="tg-poller-feedback",
+            )
+            t_fb.start()
+    except Exception as exc:
+        log.warning("Could not launch feedback bot polling listener: %s", exc)
+
+    while _bot_running:
+        time.sleep(2)
 
 
 BOT_COMMANDS = [
@@ -824,6 +933,7 @@ BOT_COMMANDS = [
     {"command": "monthlyreport", "description": "🗓️ Monthly 30d analytics report & chart"},
     {"command": "feedback", "description": "🧠 Daily feedback, worst/best assets & learning"},
     {"command": "research", "description": "🔬 Deep thesis & research note (e.g. /research BTC)"},
+    {"command": "tweet", "description": "🐦 Convert research setup into 280-char Twitter post"},
     {"command": "feedbackbot", "description": "View current feedback bot destination"},
     {"command": "setfeedbackbot", "description": "Connect another bot for daily feedback"},
     {"command": "probation", "description": "🧪 Quarantined & 50% probation assets"},

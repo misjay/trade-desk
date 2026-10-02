@@ -372,38 +372,240 @@ def generate_market_research(sig: dict) -> str:
     return "\n".join(lines)
 
 
-# ── Delivery Helper ─────────────────────────────────────────────────────────
-def send_call_research_to_feedback_bot(sig: dict) -> bool:
+# ── Dynamic Timeframe Setup Generator ───────────────────────────────────────
+def build_signal_for_timeframe(ticker: str, tf_minutes: int = 15) -> dict:
     """
-    Generate the institutional research note for a call and deliver
-    it directly to the secondary Feedback Bot destination.
+    Build a dynamic structural signal on the requested timeframe (15m scalp or 240m day trade)
+    using live Bybit OHLCV candles, swing extremes, and demand/supply shelves.
+    """
+    t_clean = ticker.strip().upper().replace("USDT", "")
+    from scanner import fetch_ohlcv, detect_shelves_and_edges
+
+    tf_str = "15m" if tf_minutes == 15 else ("4h" if tf_minutes == 240 else f"{tf_minutes}m")
+    trade_type = "scalp" if tf_minutes == 15 else "day"
+
+    df = fetch_ohlcv(t_clean, tf_minutes=tf_minutes, limit=80)
+    if df is not None and len(df) >= 10:
+        struct = detect_shelves_and_edges(df)
+        live_price = struct["live_price"]
+        range_pos = struct["range_pos"]
+
+        if range_pos <= 0.45:
+            side = "BUY"
+            d_low, d_high = struct["demand_shelf"]
+            entry_low = min(d_low, live_price * 0.996)
+            entry_high = max(d_high, live_price * 1.002)
+            sl = round(entry_low * 0.988, 8)
+            tp1 = round(struct["mid_range"], 8)
+            tp2 = round(struct["session_high"], 8)
+            reason = f"Pullback into {tf_str} demand shelf ${entry_low:,.2f}–${entry_high:,.2f}"
+            structure_str = f"Demand shelf at session discount ({range_pos*100:.1f}% range)"
+        else:
+            side = "SELL"
+            s_low, s_high = struct["supply_shelf"]
+            entry_low = min(s_low, live_price * 0.998)
+            entry_high = max(s_high, live_price * 1.004)
+            sl = round(entry_high * 1.012, 8)
+            tp1 = round(struct["mid_range"], 8)
+            tp2 = round(struct["session_low"], 8)
+            reason = f"Rejection at {tf_str} supply ceiling ${entry_low:,.2f}–${entry_high:,.2f}"
+            structure_str = f"Supply ceiling at session premium ({range_pos*100:.1f}% range)"
+
+        risk = abs(live_price - sl)
+        reward = abs(tp1 - live_price)
+        rr = round(reward / risk, 2) if risk > 0 else 1.5
+    else:
+        from scanner import fetch_live_price
+        lp = fetch_live_price(t_clean) or 100.0
+        side = "BUY"
+        live_price = lp
+        entry_low = lp * 0.995
+        entry_high = lp * 1.002
+        sl = lp * 0.985
+        tp1 = lp * 1.025
+        tp2 = lp * 1.050
+        rr = 2.0
+        reason = f"Structural {tf_str} order block setup"
+        structure_str = f"Support shelf near ${lp:,.2f}"
+
+    return {
+        "ticker": t_clean,
+        "side": side,
+        "trade_type": trade_type,
+        "tf": tf_str,
+        "entry_low": entry_low,
+        "entry_high": entry_high,
+        "tp1": tp1,
+        "tp2": tp2,
+        "sl": sl,
+        "rr": max(1.5, rr),
+        "structure": structure_str,
+        "reason": reason,
+        "live_price": live_price,
+    }
+
+
+# ── Chart & Research Delivery Helper ────────────────────────────────────────
+def send_research_with_chart(
+    sig: dict,
+    bot_token: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    tf_minutes: int = 15,
+) -> bool:
+    """
+    Generate candlestick chart with marked up levels and deliver alongside
+    the full institutional research note.
     """
     fb_cfg = state.get_feedback_bot_config()
-    target_token = fb_cfg.get("token") or cfg.feedback_bot_token or cfg.telegram_token
-    target_chat = fb_cfg.get("chat_id") or cfg.feedback_chat_id or cfg.telegram_chat_id
+    target_token = bot_token or fb_cfg.get("token") or cfg.telegram_token
+    target_chat = chat_id or fb_cfg.get("chat_id") or cfg.telegram_chat_id
 
     if not target_token or not target_chat:
-        log.warning("Market research delivery skipped: feedback bot token or chat ID not configured")
+        log.warning("Research delivery skipped: missing bot token or chat ID")
         return False
 
-    research_text = generate_market_research(sig)
+    ticker = sig.get("ticker", "BTC").upper()
+    side = sig.get("side", "BUY").upper()
+    tf_str = "15m" if tf_minutes == 15 else ("4h" if tf_minutes == 240 else "1h")
 
-    url = f"https://api.telegram.org/bot{target_token}/sendMessage"
+    # Persist as last researched signal
+    state.set_last_researched_signal(sig)
+
+    # 1. Fetch OHLCV & generate chart PNG
+    from scanner import fetch_ohlcv
+    import chart
+    df = fetch_ohlcv(ticker, tf_minutes=tf_minutes, limit=80)
+    png_bytes = chart.generate_chart(
+        df=df,
+        ticker=ticker,
+        side=side,
+        tf=tf_str,
+        entry_low=sig.get("entry_low"),
+        entry_high=sig.get("entry_high"),
+        tp1=sig.get("tp1"),
+        tp2=sig.get("tp2"),
+        sl=sig.get("sl"),
+        live_price=sig.get("live_price"),
+    )
+
+    caption_summary = (
+        f"📈 *{ticker}/USDT {sig.get('trade_type', 'Scalp').capitalize()} Breakdown ({tf_str})*\n"
+        f"• *Side*: `{side}` | Mark: `{fmt_dollar(sig.get('live_price'))}`\n"
+        f"• *Entry Shelf*: `{fmt_dollar(sig.get('entry_low'))}–{fmt_dollar(sig.get('entry_high'))}`\n"
+        f"• *TP1*: `{fmt_dollar(sig.get('tp1'))}` | *TP2*: `{fmt_dollar(sig.get('tp2'))}` | *SL*: `{fmt_dollar(sig.get('sl'))}`"
+    )
+
+    # Send chart image if generated
+    if png_bytes and len(png_bytes) > 1000:
+        photo_url = f"https://api.telegram.org/bot{target_token}/sendPhoto"
+        try:
+            files = {"photo": (f"{ticker}_{tf_str}_chart.png", png_bytes, "image/png")}
+            data = {
+                "chat_id": target_chat,
+                "caption": caption_summary,
+                "parse_mode": "Markdown",
+            }
+            requests.post(photo_url, data=data, files=files, timeout=20)
+        except Exception as exc:
+            log.warning("sendPhoto failed for %s: %s", ticker, exc)
+
+    # Send detailed research note text
+    research_text = generate_market_research(sig)
+    text_url = f"https://api.telegram.org/bot{target_token}/sendMessage"
     payload = {
         "chat_id": target_chat,
         "text": research_text,
         "parse_mode": "Markdown",
         "disable_web_page_preview": True,
     }
+    try:
+        r = requests.post(text_url, json=payload, timeout=12)
+        return r.status_code == 200 and r.json().get("ok")
+    except Exception as exc:
+        log.error("Failed to send research note to %s: %s", target_chat, exc)
+        return False
 
+
+def send_call_research_to_feedback_bot(sig: dict) -> bool:
+    """Convenience alias for automatic scan dispatch."""
+    tf_minutes = 240 if str(sig.get("tf", "")).lower() in ("4h", "240") else 15
+    return send_research_with_chart(sig, tf_minutes=tf_minutes)
+
+
+# ── Twitter / X Post Converter ──────────────────────────────────────────────
+def format_twitter_post(sig: dict) -> str:
+    """
+    Convert a research setup into a punchy, high-impact Twitter / X post
+    strictly optimized to fit within the 280-character limit.
+    """
+    ticker = sig.get("ticker", "BTC").upper()
+    side = sig.get("side", "BUY").upper()
+    tf = sig.get("tf", "15m")
+    el = fmt_dollar(sig.get("entry_low"))
+    eh = fmt_dollar(sig.get("entry_high"))
+    tp1 = fmt_dollar(sig.get("tp1"))
+    tp2 = fmt_dollar(sig.get("tp2"))
+    sl = fmt_dollar(sig.get("sl"))
+    rr = sig.get("rr", 2.0)
+
+    cat = ASSET_CATALYSTS.get(ticker, DEFAULT_CATALYST)
+    sector = cat.get("sector", "Crypto")
+
+    telemetry = get_market_telemetry(ticker)
+    rsi_4h = telemetry.get("rsi_4h", 50.0)
+
+    # Single tweet layout (< 280 chars)
+    tweet = (
+        f"${ticker} {side} Setup ({tf}) 🎯\n\n"
+        f"Thesis: {sector}. 4H RSI {rsi_4h:.0f}.\n"
+        f"• Entry: {el} – {eh}\n"
+        f"• Targets: {tp1} / {tp2} (R:R {rr:.1f})\n"
+        f"• Invalidation: {sl}\n\n"
+        f"Verdict: Confirm {tf} shelf hold before entering.\n\n"
+        f"#{ticker} #CryptoTrading"
+    )
+
+    if len(tweet) > 280:
+        tweet = (
+            f"${ticker} {side} ({tf}) 🎯\n"
+            f"• Entry: {el} – {eh}\n"
+            f"• Targets: {tp1} / {tp2}\n"
+            f"• Stop: {sl} (R:R {rr:.1f})\n"
+            f"• 4H RSI: {rsi_4h:.0f}\n\n"
+            f"Verdict: Confirm {tf} shelf hold.\n"
+            f"#{ticker} #Crypto"
+        )
+
+    return tweet
+
+
+def send_twitter_post(
+    sig: dict,
+    bot_token: Optional[str] = None,
+    chat_id: Optional[str] = None,
+) -> bool:
+    """Format and deliver Twitter post to the requested chat."""
+    fb_cfg = state.get_feedback_bot_config()
+    target_token = bot_token or fb_cfg.get("token") or cfg.telegram_token
+    target_chat = chat_id or fb_cfg.get("chat_id") or cfg.telegram_chat_id
+
+    if not target_token or not target_chat:
+        return False
+
+    tweet = format_twitter_post(sig)
+    char_count = len(tweet)
+    msg = f"🐦 *Twitter / X Post ({char_count}/280 chars):*\n\n```\n{tweet}\n```\n_Tap to copy & paste directly into X/Twitter._"
+
+    url = f"https://api.telegram.org/bot{target_token}/sendMessage"
+    payload = {
+        "chat_id": target_chat,
+        "text": msg,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
     try:
         r = requests.post(url, json=payload, timeout=12)
-        if r.status_code == 200 and r.json().get("ok"):
-            log.info("Delivered Market Research Note for %s to Feedback Bot (%s)", sig.get("ticker"), target_chat)
-            return True
-        else:
-            log.warning("Market research delivery to %s failed: %s", target_chat, r.text)
+        return r.status_code == 200 and r.json().get("ok")
     except Exception as exc:
-        log.error("Market research delivery error for %s: %s", sig.get("ticker"), exc)
-
-    return False
+        log.error("Failed to deliver Twitter post: %s", exc)
+        return False
