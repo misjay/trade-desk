@@ -82,7 +82,7 @@ def fmt_raw(val: Optional[float]) -> str:
 def fetch_ohlcv(ticker: str, tf_minutes: int = 15, limit: int = 100) -> Optional[pd.DataFrame]:
     """Fetch OHLCV candles from Bybit Linear (or Spot)."""
     sym = bybit_linear_symbol(ticker)
-    tf_str = "15" if tf_minutes == 15 else ("60" if tf_minutes == 60 else "240")
+    tf_str = "15" if tf_minutes == 15 else ("60" if tf_minutes == 60 else ("D" if tf_minutes >= 1440 else "240"))
     klines = _client.get_klines(sym, interval=tf_str, limit=limit, category="linear")
     if not klines:
         klines = _client.get_klines(bybit_spot_symbol(ticker), interval=tf_str, limit=limit, category="spot")

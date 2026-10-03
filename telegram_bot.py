@@ -745,12 +745,22 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
         )
 
     elif cmd in ("/hourlycalls", "/sendcalls"):
-        _reply(chat_id, "🚀 *Generating and Dispatching 10 Hourly Calls (6 Scalps + 4 Day Trades with Charts)...*")
+        _reply(chat_id, "🚀 *Generating and Dispatching 15 Hourly Calls (6 Scalps + 4 Day + 5 Spot Trades with Interactive Buttons)...*")
         import market_research
         threading.Thread(
             target=market_research.dispatch_hourly_calls,
             daemon=True,
             name="hourly-calls-manual",
+        ).start()
+
+    elif cmd in ("/spot", "/spotcalls"):
+        _reply(chat_id, "💎 *Compiling and Dispatching 5 Spot Accumulation Setups (1D Macro Timeframe)...*", bot_token=_current_bot_token)
+        import market_research
+        threading.Thread(
+            target=market_research.dispatch_spot_calls,
+            kwargs={"bot_token": _current_bot_token, "chat_id": chat_id},
+            daemon=True,
+            name="spot-calls-manual",
         ).start()
 
     elif cmd in ("/research", "/call", "/thesis"):
@@ -769,8 +779,12 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
                 req_mode = "scalp"
                 if len(args) > 1:
                     target_ticker = args[1].upper().replace("USDT", "")
-            elif first_arg in ("day", "4h", "daily"):
+            elif first_arg in ("day", "4h"):
                 req_mode = "day"
+                if len(args) > 1:
+                    target_ticker = args[1].upper().replace("USDT", "")
+            elif first_arg in ("spot", "1d", "daily"):
+                req_mode = "spot"
                 if len(args) > 1:
                     target_ticker = args[1].upper().replace("USDT", "")
             else:
@@ -783,19 +797,28 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
                         req_mode = "scalp"
                     elif second_arg in ("day", "4h"):
                         req_mode = "day"
+                    elif second_arg in ("spot", "1d", "daily"):
+                        req_mode = "spot"
 
-        mode_desc = "Day & Scalp" if req_mode == "both" else ("Scalp (15m)" if req_mode == "scalp" else "Day (4h)")
+        mode_desc = "Spot (1D)" if req_mode == "spot" else ("Day & Scalp" if req_mode == "both" else ("Scalp (15m)" if req_mode == "scalp" else "Day (4h)"))
         _reply(chat_id, f"🔬 *Compiling {mode_desc} Institutional Research & Charts for {target_ticker}...*")
 
         def _do_research(t: str, mode: str, cid: str):
             tok = _current_bot_token or cfg.telegram_token
-            # 1. Scalp setup (15m)
+            # 1. Spot setup (1D)
+            if mode == "spot":
+                sig_spot = market_research.build_spot_signal(t)
+                state.set_last_researched_signal(sig_spot)
+                market_research.send_research_with_chart(sig_spot, bot_token=tok, chat_id=cid, tf_minutes=1440)
+                return
+
+            # 2. Scalp setup (15m)
             if mode in ("both", "scalp"):
                 sig_scalp = market_research.build_signal_for_timeframe(t, tf_minutes=15)
                 state.set_last_researched_signal(sig_scalp)
                 market_research.send_research_with_chart(sig_scalp, bot_token=tok, chat_id=cid, tf_minutes=15)
 
-            # 2. Day setup (4h)
+            # 3. Day setup (4h)
             if mode in ("both", "day"):
                 sig_day = market_research.build_signal_for_timeframe(t, tf_minutes=240)
                 state.set_last_researched_signal(sig_day)
@@ -917,22 +940,27 @@ def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_tri
                             pass
 
                         if cb_data.startswith("call_view_"):
-                            # format: call_view_TICKER_TF (e.g. call_view_SOL_15m)
+                            # format: call_view_TICKER_TF (e.g. call_view_SOL_15m or call_view_BTC_spot)
                             parts = cb_data.split("_")
                             if len(parts) >= 4:
                                 ticker = parts[2]
                                 tf_str = parts[3]
-                                tf_min = 240 if tf_str == "4h" else 15
-                                _reply(cb_chat_id, f"🔬 *Compiling live chart & analysis for ${ticker} ({tf_str})...*", bot_token=token)
+                                is_spot = tf_str.lower() in ("spot", "1d")
+                                tf_min = 1440 if is_spot else (240 if tf_str == "4h" else 15)
+                                badge = "💎 Spot" if is_spot else tf_str
+                                _reply(cb_chat_id, f"🔬 *Compiling live chart & analysis for ${ticker} ({badge})...*", bot_token=token)
 
-                                def _async_call_view(t: str, tf_m: int, c_id: str, b_tok: str):
+                                def _async_call_view(t: str, tf_m: int, c_id: str, b_tok: str, spot_mode: bool):
                                     import market_research
-                                    sig = market_research.build_signal_for_timeframe(t, tf_minutes=tf_m)
+                                    if spot_mode:
+                                        sig = market_research.build_spot_signal(t)
+                                    else:
+                                        sig = market_research.build_signal_for_timeframe(t, tf_minutes=tf_m)
                                     market_research.send_research_with_chart(sig, bot_token=b_tok, chat_id=c_id, tf_minutes=tf_m)
 
                                 threading.Thread(
                                     target=_async_call_view,
-                                    args=(ticker, tf_min, cb_chat_id, token),
+                                    args=(ticker, tf_min, cb_chat_id, token, is_spot),
                                     daemon=True,
                                     name=f"cb-{ticker}",
                                 ).start()
@@ -1042,7 +1070,8 @@ BOT_COMMANDS = [
     {"command": "hourlyreport", "description": "⏱️ Hourly analytics breakdown & chart"},
     {"command": "weeklyreport", "description": "📆 Weekly 7d analytics report & chart"},
     {"command": "monthlyreport", "description": "🗓️ Monthly 30d analytics report & chart"},
-    {"command": "hourlycalls", "description": "🎯 Dispatch 10 hourly manual calls (6 scalps + 4 day)"},
+    {"command": "hourlycalls", "description": "🎯 Dispatch 15 hourly manual calls (6 scalp + 4 day + 5 spot)"},
+    {"command": "spot", "description": "💎 Dispatch 5 spot accumulation setups with buttons"},
     {"command": "setcallbot", "description": "📢 Connect external bot for manual calls"},
     {"command": "callbot", "description": "View current calls bot destination"},
     {"command": "feedback", "description": "🧠 Daily feedback, worst/best assets & learning"},

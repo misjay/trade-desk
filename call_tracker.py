@@ -85,13 +85,16 @@ def check_tracked_calls_once() -> None:
             gain_pct = ((entry_mid - live_price) / entry_mid) * 100.0
             drop_pct = ((live_price - entry_mid) / entry_mid) * 100.0
 
+        is_spot = call.get("trade_type") == "spot" or tf in ("spot", "1D")
+        type_prefix = "💎 SPOT " if is_spot else ""
+
         # ── 2. Check TP1 Hit ────────────────────────────────────────────────
         if not call.get("tp1_hit"):
             tp1_triggered = (live_price >= tp1) if side == "BUY" else (live_price <= tp1)
             if tp1_triggered:
                 updates["tp1_hit"] = True
                 _send_alert(
-                    f"🎯 *TARGET 1 REACHED (TP1 HIT)* 🎯\n\n"
+                    f"🎯 *{type_prefix}TARGET 1 REACHED (TP1 HIT)* 🎯\n\n"
                     f"• *Asset*: `${ticker}` ({tf})\n"
                     f"• *Side*: `{side}`\n"
                     f"• *TP1 Target*: `{fmt_dollar(tp1)}`\n"
@@ -105,7 +108,7 @@ def check_tracked_calls_once() -> None:
             if tp2_triggered:
                 updates["tp2_hit"] = True
                 _send_alert(
-                    f"🏆 *FINAL TARGET SMASHED (TP2 HIT)* 🏆\n\n"
+                    f"🏆 *{type_prefix}FINAL TARGET SMASHED (TP2 HIT)* 🏆\n\n"
                     f"• *Asset*: `${ticker}` ({tf})\n"
                     f"• *Side*: `{side}`\n"
                     f"• *TP2 Target*: `{fmt_dollar(tp2)}`\n"
@@ -119,7 +122,7 @@ def check_tracked_calls_once() -> None:
             if sl_triggered:
                 updates["sl_hit"] = True
                 _send_alert(
-                    f"🛑 *STOP LOSS HIT / SETUP INVALIDATED* 🛑\n\n"
+                    f"🛑 *{type_prefix}STOP LOSS HIT / SETUP INVALIDATED* 🛑\n\n"
                     f"• *Asset*: `${ticker}` ({tf})\n"
                     f"• *Side*: `{side}`\n"
                     f"• *Invalidation Level*: `{fmt_dollar(sl)}`\n"
@@ -133,7 +136,7 @@ def check_tracked_calls_once() -> None:
         if current_step >= 10 and current_step > highest_step:
             updates["highest_gain_step"] = current_step
             _send_alert(
-                f"🚀 *+{current_step}% PROFIT MILESTONE!* 🚀\n\n"
+                f"🚀 *{type_prefix}+{current_step}% PROFIT MILESTONE!* 🚀\n\n"
                 f"• *Asset*: `${ticker}` ({tf} {side})\n"
                 f"• *Gain from Entry*: `+{gain_pct:.1f}%`\n"
                 f"• *Live Price*: `{fmt_dollar(live_price)}` (Entry: `{fmt_dollar(entry_mid)}`)\n\n"
@@ -145,7 +148,7 @@ def check_tracked_calls_once() -> None:
             if drop_pct >= 20.0:
                 updates["drop_alert_triggered"] = True
                 _send_alert(
-                    f"📉 *SHARP PULLBACK WARNING (-20% DROP)* 📉\n\n"
+                    f"📉 *{type_prefix}SHARP PULLBACK WARNING (-20% DROP)* 📉\n\n"
                     f"• *Asset*: `${ticker}` ({tf})\n"
                     f"• *Drawdown from Call*: `-{drop_pct:.1f}%`\n"
                     f"• *Live Price*: `{fmt_dollar(live_price)}`\n\n"

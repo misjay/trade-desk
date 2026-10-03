@@ -445,7 +445,13 @@ def generate_market_research(sig: dict) -> str:
         watch_bullets.append(f"Mid-range chop must resolve into an edge before a directional call is initiated")
 
     # ── Section 3: Verdict ───────────────────────────────────────────────────
-    if side == "BUY":
+    if trade_type.lower() == "spot":
+        verdict = (
+            f"Spot Accumulation active. Dollar-cost average into the {band_str} discount zone. "
+            f"Set structural invalidation floor at {sl_str}. "
+            f"Target {tp1_str} for first de-risk (+8% to +15% expansion), and let swing runners ride to {tp2_str}."
+        )
+    elif side == "BUY":
         verdict = (
             f"Actionable setup active. A LONG from {band_str} is favored while {sl_str} holds as the structural floor. "
             f"Do not chase if price trades above {eh_str} without an entry retest. "
@@ -465,7 +471,10 @@ def generate_market_research(sig: dict) -> str:
         )
 
     # ── Assemble Output ──────────────────────────────────────────────────────
-    header = f"📊 *Market Research: {ticker}/USDT ({trade_type} - {side})*"
+    if trade_type.lower() == "spot":
+        header = f"💎 *Market Research: {ticker}/USDT (Spot Accumulation - BUY)*"
+    else:
+        header = f"📊 *Market Research: {ticker}/USDT ({trade_type} - {side})*"
     lines = [
         header,
         "",
@@ -558,6 +567,69 @@ def build_signal_for_timeframe(ticker: str, tf_minutes: int = 15) -> dict:
     }
 
 
+def build_spot_signal(ticker: str) -> dict:
+    """
+    Build a dynamic spot accumulation setup (1D Daily timeframe, long-only)
+    using live Bybit OHLCV candles, swing support shelves, and macro expansion targets.
+    Exclusively for Winz callers (manual external exchange execution).
+    """
+    t_clean = ticker.strip().upper().replace("USDT", "")
+    from scanner import fetch_ohlcv, detect_shelves_and_edges, fetch_live_price
+
+    df = fetch_ohlcv(t_clean, tf_minutes=1440, limit=80)
+    if df is None or len(df) < 10:
+        df = fetch_ohlcv(t_clean, tf_minutes=240, limit=80)
+
+    if df is not None and len(df) >= 10:
+        struct = detect_shelves_and_edges(df)
+        live_price = struct["live_price"]
+        d_low, d_high = struct["demand_shelf"]
+
+        # Spot entry is an accumulation band around the demand shelf / recent discount
+        entry_low = round(min(d_low, live_price * 0.975), 8)
+        entry_high = round(max(d_high, live_price * 1.01), 8)
+
+        # Structural invalidation floor below major shelf (e.g. 7% below entry_low)
+        sl = round(entry_low * 0.93, 8)
+
+        # Spot Take-Profits: TP1 mid-range/first resistance (+8-15%), TP2 macro swing peak (+20-35%)
+        tp1 = round(max(struct["mid_range"], entry_high * 1.10), 8)
+        tp2 = round(max(struct["session_high"], entry_high * 1.25), 8)
+
+        risk = abs(live_price - sl)
+        reward = abs(tp1 - live_price)
+        rr = round(reward / risk, 2) if risk > 0 else 2.5
+        reason = f"Macro 1D Spot Accumulation shelf ${entry_low:,.2f}–${entry_high:,.2f}"
+        structure_str = f"Spot Accumulation discount band near demand floor"
+    else:
+        lp = fetch_live_price(t_clean) or 100.0
+        live_price = lp
+        entry_low = round(lp * 0.975, 8)
+        entry_high = round(lp * 1.01, 8)
+        sl = round(entry_low * 0.93, 8)
+        tp1 = round(entry_high * 1.12, 8)
+        tp2 = round(entry_high * 1.28, 8)
+        rr = 2.5
+        reason = f"Spot Accumulation discount band near ${lp:,.2f}"
+        structure_str = f"Spot discount shelf near ${lp:,.2f}"
+
+    return {
+        "ticker": t_clean,
+        "side": "BUY",
+        "trade_type": "spot",
+        "tf": "1D",
+        "entry_low": entry_low,
+        "entry_high": entry_high,
+        "tp1": tp1,
+        "tp2": tp2,
+        "sl": sl,
+        "rr": max(2.0, rr),
+        "structure": structure_str,
+        "reason": reason,
+        "live_price": live_price,
+    }
+
+
 # ── Chart & Research Delivery Helper ────────────────────────────────────────
 def send_research_with_chart(
     sig: dict,
@@ -579,7 +651,8 @@ def send_research_with_chart(
 
     ticker = sig.get("ticker", "BTC").upper()
     side = sig.get("side", "BUY").upper()
-    tf_str = "15m" if tf_minutes == 15 else ("4h" if tf_minutes == 240 else "1h")
+    tf_str = sig.get("tf") or ("15m" if tf_minutes == 15 else ("4h" if tf_minutes == 240 else ("1D" if tf_minutes >= 1440 else "1h")))
+    actual_tf_min = 1440 if tf_str in ("1D", "spot") else tf_minutes
 
     # Persist as last researched signal
     state.set_last_researched_signal(sig)
@@ -587,7 +660,7 @@ def send_research_with_chart(
     # 1. Fetch OHLCV & generate chart PNG
     from scanner import fetch_ohlcv
     import chart
-    df = fetch_ohlcv(ticker, tf_minutes=tf_minutes, limit=80)
+    df = fetch_ohlcv(ticker, tf_minutes=actual_tf_min, limit=80)
     png_bytes = chart.generate_chart(
         df=df,
         ticker=ticker,
@@ -711,17 +784,43 @@ def dispatch_hourly_calls(
             except Exception:
                 pass
 
+    # 3. Gather 5 Spot Accumulation Setups (1D)
+    spot_signals = []
+    used_tickers = {s["ticker"] for s in scalp_signals} | {s["ticker"] for s in day_signals}
+    for ticker in candidate_universe:
+        if len(spot_signals) >= 5:
+            break
+        if ticker in used_tickers:
+            continue
+        try:
+            sig = build_spot_signal(ticker)
+            if sig:
+                spot_signals.append(sig)
+        except Exception as exc:
+            log.debug("Error building spot signal for %s: %s", ticker, exc)
+
+    if len(spot_signals) < 5:
+        for ticker in candidate_universe:
+            if len(spot_signals) >= 5:
+                break
+            if any(s["ticker"] == ticker for s in spot_signals):
+                continue
+            try:
+                sig = build_spot_signal(ticker)
+                if sig:
+                    spot_signals.append(sig)
+            except Exception:
+                pass
+
     now_utc_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
-    # 3. Save all 10 calls for real-time tracking
-    all_calls = scalp_signals + day_signals
+    # Save all 15 calls for real-time tracking
+    all_calls = scalp_signals + day_signals + spot_signals
     state.save_tracked_calls(all_calls)
 
-    now_utc_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
-
-    # 4. Deliver Clean Digest with Interactive Buttons (No photo flood!)
+    # Deliver Clean Digest with Interactive Buttons (No photo flood!)
     index_lines = [
-        "🚨 *WINZ HOURLY TRADE DESK CALLS (10 SETUPS)*",
+        "🚨 *WINZ HOURLY TRADE DESK CALLS (15 SETUPS)*",
         f"⏱ *Timestamp:* {now_utc_str} | _For Manual / External Exchange Trading_",
         "",
         "⚡ *6 SCALP SETUPS (15m Timeframe):*",
@@ -749,6 +848,18 @@ def dispatch_hourly_calls(
         index_lines.append(f"{idx}. *${t}* `{side}` — Entry: `{el}–{eh}` | TP: `{tp1}` | SL: `{sl}` (R:R {rr:.1f})")
 
     index_lines.append("")
+    index_lines.append("💎 *5 SPOT ACCUMULATION SETUPS (Spot / 1D Timeframe):*")
+    for idx, s in enumerate(spot_signals, start=len(scalp_signals) + len(day_signals) + 1):
+        t = s["ticker"]
+        el = fmt_dollar(s["entry_low"])
+        eh = fmt_dollar(s["entry_high"])
+        tp1 = fmt_dollar(s["tp1"])
+        tp2 = fmt_dollar(s["tp2"])
+        sl = fmt_dollar(s["sl"])
+        rr = s.get("rr", 2.5)
+        index_lines.append(f"{idx}. *${t}* `BUY` — Accumulate: `{el}–{eh}` | TP1: `{tp1}` | TP2: `{tp2}` | SL: `{sl}` (R:R {rr:.1f})")
+
+    index_lines.append("")
     index_lines.append("👇 *Tap any asset below for its live chart markup, structure & institutional thesis:*")
 
     # Construct Inline Keyboard Buttons (2 buttons per row)
@@ -757,8 +868,10 @@ def dispatch_hourly_calls(
     for s in all_calls:
         t = s["ticker"]
         tf = s.get("tf", "15m")
-        btn_text = f"📊 {t} ({tf})"
-        cb_data = f"call_view_{t}_{tf}"
+        badge = "💎" if s.get("trade_type") == "spot" or tf in ("spot", "1D") else ("⚡" if tf == "15m" else "🏛")
+        btn_text = f"{badge} {t} ({tf})"
+        cb_tf = "spot" if s.get("trade_type") == "spot" or tf in ("spot", "1D") else tf
+        cb_data = f"call_view_{t}_{cb_tf}"
         current_row.append({"text": btn_text, "callback_data": cb_data})
         if len(current_row) == 2:
             inline_keyboard.append(current_row)
@@ -780,8 +893,88 @@ def dispatch_hourly_calls(
     except Exception as exc:
         log.warning("Failed to send hourly digest with buttons: %s", exc)
 
-    log.info("Hourly calls digest successfully dispatched to %s with interactive buttons.", target_chat)
+    # Deliver to Discord channel if configured
+    try:
+        import winz_discord
+        embed, view = winz_discord._build_calls_message()
+        winz_discord.broadcast_discord_message("🚨 **Winz Hourly Trade Desk Calls (15 Setups)**", embed=embed)
+    except Exception as exc:
+        log.debug("Discord broadcast error: %s", exc)
+
+    log.info("Hourly calls digest (15 setups) successfully dispatched with interactive buttons.")
     return True
+
+
+def dispatch_spot_calls(
+    bot_token: Optional[str] = None,
+    chat_id: Optional[str] = None,
+) -> bool:
+    """Compile and dispatch 5 spot accumulation setups with buttons directly."""
+    call_cfg = state.get_call_bot_config()
+    target_token = bot_token or call_cfg.get("token")
+    target_chat = chat_id or call_cfg.get("chat_id")
+    if not target_token or not target_chat:
+        return False
+
+    from config import CORE_TICKERS, EXTRA_TICKERS
+    candidate_universe = CORE_TICKERS + EXTRA_TICKERS
+    spot_signals = []
+    for ticker in candidate_universe:
+        if len(spot_signals) >= 5:
+            break
+        sig = build_spot_signal(ticker)
+        if sig:
+            spot_signals.append(sig)
+
+    state.save_tracked_calls(spot_signals)
+    now_utc_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+    lines = [
+        "💎 *WINZ SPOT ACCUMULATION DESK (5 TRADES)*",
+        f"⏱ *Timestamp:* {now_utc_str} | _For Manual / External Exchange Spot Trading_",
+        "",
+        "💎 *SPOT SWING SETUPS (1D Macro Accumulation):*",
+    ]
+    for idx, s in enumerate(spot_signals, start=1):
+        t = s["ticker"]
+        el = fmt_dollar(s["entry_low"])
+        eh = fmt_dollar(s["entry_high"])
+        tp1 = fmt_dollar(s["tp1"])
+        tp2 = fmt_dollar(s["tp2"])
+        sl = fmt_dollar(s["sl"])
+        rr = s.get("rr", 2.5)
+        lines.append(f"{idx}. *${t}* `BUY` — Accumulate: `{el}–{eh}` | TP1: `{tp1}` | TP2: `{tp2}` | SL: `{sl}` (R:R {rr:.1f})")
+
+    lines.append("")
+    lines.append("👇 *Tap any asset below for its Spot Chart & Macro Accumulation Thesis:*")
+
+    inline_keyboard = []
+    current_row = []
+    for s in spot_signals:
+        t = s["ticker"]
+        btn_text = f"💎 {t} (Spot)"
+        cb_data = f"call_view_{t}_spot"
+        current_row.append({"text": btn_text, "callback_data": cb_data})
+        if len(current_row) == 2:
+            inline_keyboard.append(current_row)
+            current_row = []
+    if current_row:
+        inline_keyboard.append(current_row)
+
+    send_url = f"https://api.telegram.org/bot{target_token}/sendMessage"
+    payload = {
+        "chat_id": target_chat,
+        "text": "\n".join(lines),
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+        "reply_markup": {"inline_keyboard": inline_keyboard},
+    }
+    try:
+        requests.post(send_url, json=payload, timeout=12)
+        return True
+    except Exception as exc:
+        log.warning("Failed to send spot digest: %s", exc)
+        return False
 
 
 # ── Twitter / X Post Converter ──────────────────────────────────────────────

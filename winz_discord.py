@@ -48,11 +48,15 @@ class CallSelectView(discord.ui.View):
             t = c["ticker"]
             side = c["side"]
             tf = c.get("tf", "15m")
-            label = f"{t} ({tf} {side})"
+            is_spot = c.get("trade_type") == "spot" or tf in ("spot", "1D")
+            emoji = "💎" if is_spot else ("⚡" if tf == "15m" else "🏛")
+            type_label = "Spot" if is_spot else tf
+            label = f"{t} ({type_label} {side})"
             el = fmt_dollar(c.get("entry_low"))
             eh = fmt_dollar(c.get("entry_high"))
             desc = f"Entry: {el}–{eh} | TP1: {fmt_dollar(c.get('tp1'))}"
-            options.append(discord.SelectOption(label=label, value=f"{t}_{tf}", description=desc[:100], emoji="📊"))
+            cb_val = f"{t}_spot" if is_spot else f"{t}_{tf}"
+            options.append(discord.SelectOption(label=label, value=cb_val, description=desc[:100], emoji=emoji))
 
         if options:
             select = discord.ui.Select(
@@ -68,21 +72,26 @@ class CallSelectView(discord.ui.View):
         await interaction.response.defer(ephemeral=False)
         selected_key = interaction.data["values"][0]
         ticker, tf_str = selected_key.split("_")
-        tf_min = 240 if tf_str == "4h" else 15
+        is_spot = tf_str.lower() in ("spot", "1d")
+        tf_min = 1440 if is_spot else (240 if tf_str == "4h" else 15)
 
         import market_research
         import chart
         from scanner import fetch_ohlcv
 
-        sig = market_research.build_signal_for_timeframe(ticker, tf_minutes=tf_min)
+        if is_spot:
+            sig = market_research.build_spot_signal(ticker)
+        else:
+            sig = market_research.build_signal_for_timeframe(ticker, tf_minutes=tf_min)
         note = market_research.generate_market_research(sig)
 
         df = fetch_ohlcv(ticker, tf_minutes=tf_min, limit=80)
+        chart_tf = "Spot" if is_spot else tf_str
         png_bytes = chart.generate_chart(
             df=df,
             ticker=ticker,
             side=sig.get("side", "BUY"),
-            tf=tf_str,
+            tf=chart_tf,
             entry_low=sig.get("entry_low"),
             entry_high=sig.get("entry_high"),
             tp1=sig.get("tp1"),
@@ -93,15 +102,16 @@ class CallSelectView(discord.ui.View):
 
         files = []
         if png_bytes and len(png_bytes) > 1000:
-            files.append(discord.File(io.BytesIO(png_bytes), filename=f"{ticker}_{tf_str}_chart.png"))
+            files.append(discord.File(io.BytesIO(png_bytes), filename=f"{ticker}_{chart_tf}_chart.png"))
 
+        title_badge = "💎 Winz Spot Accumulation" if is_spot else "🔬 Winz Research"
         embed = discord.Embed(
-            title=f"🔬 Winz Research: {ticker}/USDT ({tf_str} {sig.get('side')})",
+            title=f"{title_badge}: {ticker}/USDT ({chart_tf} {sig.get('side')})",
             description=note[:4000],
-            color=0x00FF88 if sig.get("side") == "BUY" else 0xFF3366,
+            color=0x2ECC71 if is_spot else (0x00FF88 if sig.get("side") == "BUY" else 0xFF3366),
         )
         if files:
-            embed.set_image(url=f"attachment://{ticker}_{tf_str}_chart.png")
+            embed.set_image(url=f"attachment://{ticker}_{chart_tf}_chart.png")
 
         await interaction.followup.send(embed=embed, files=files)
 
@@ -113,8 +123,9 @@ def _build_help_embed() -> discord.Embed:
         description="Winz provides automated institutional market calls, charts, and real-time trade tracking.",
         color=0x5865F2,
     )
-    embed.add_field(name="🎯 `/calls` or `!calls`", value="Display the latest 10 Hourly Calls with an interactive chart dropdown.", inline=False)
-    embed.add_field(name="🔬 `/research <COIN>`", value="Generate deep institutional thesis, levels & live chart (e.g. `/research SOL`).", inline=False)
+    embed.add_field(name="🎯 `/calls` or `!calls`", value="Display the latest 15 Hourly Calls (6 Scalps + 4 Day + 5 Spot) with an interactive chart dropdown.", inline=False)
+    embed.add_field(name="💎 `/spot` or `!spot`", value="Display the 5 Spot Accumulation setups with interactive chart dropdown.", inline=False)
+    embed.add_field(name="🔬 `/research <COIN>`", value="Generate deep institutional thesis, levels & live chart (e.g. `/research SOL` or `/research SOL spot`).", inline=False)
     embed.add_field(name="🐦 `/tweet [COIN]`", value="Convert call setup into a 280-char Twitter/X post ready to copy.", inline=False)
     embed.add_field(name="📋 `/tracked`", value="Show live status of all active tracked calls (TPs, SLs, gains).", inline=False)
     embed.add_field(name="⚡ `/setchannel`", value="Set the current channel as the destination for automated hourly calls & milestone alerts.", inline=False)
@@ -153,11 +164,32 @@ def _build_calls_message() -> tuple[discord.Embed, CallSelectView]:
         if sig and sig.get("rr", 0) >= 1.5:
             day_sigs.append(sig)
 
-    all_calls = scalp_sigs + day_sigs
+    spot_sigs = []
+    used_t = scalp_t | {s["ticker"] for s in day_sigs}
+    for t in candidate_universe:
+        if len(spot_sigs) >= 5:
+            break
+        if t in used_t:
+            continue
+        sig = market_research.build_spot_signal(t)
+        if sig:
+            spot_sigs.append(sig)
+
+    if len(spot_sigs) < 5:
+        for t in candidate_universe:
+            if len(spot_sigs) >= 5:
+                break
+            if any(s["ticker"] == t for s in spot_sigs):
+                continue
+            sig = market_research.build_spot_signal(t)
+            if sig:
+                spot_sigs.append(sig)
+
+    all_calls = scalp_sigs + day_sigs + spot_sigs
     state.save_tracked_calls(all_calls)
 
     embed = discord.Embed(
-        title="🚨 WINZ HOURLY TRADE DESK DISPATCH (10 CALLS)",
+        title="🚨 WINZ HOURLY TRADE DESK DISPATCH (15 CALLS)",
         description="**For Manual / External Exchange Trading**\nSelect any asset from the dropdown below to view its live chart markup and institutional research note.",
         color=0x00FF88,
     )
@@ -176,28 +208,80 @@ def _build_calls_message() -> tuple[discord.Embed, CallSelectView]:
         tp1, sl, rr = fmt_dollar(s["tp1"]), fmt_dollar(s["sl"]), s.get("rr", 2.0)
         day_text.append(f"**{idx}. ${t}** `{side}` — Entry: `{el}–{eh}` | TP: `{tp1}` | SL: `{sl}` (R:R {rr:.1f})")
 
+    spot_text = []
+    for idx, s in enumerate(spot_sigs, len(scalp_sigs) + len(day_sigs) + 1):
+        t = s["ticker"]
+        el, eh = fmt_dollar(s["entry_low"]), fmt_dollar(s["entry_high"])
+        tp1, tp2, sl, rr = fmt_dollar(s["tp1"]), fmt_dollar(s["tp2"]), fmt_dollar(s["sl"]), s.get("rr", 2.5)
+        spot_text.append(f"**{idx}. ${t}** `BUY` — Accumulate: `{el}–{eh}` | TP1: `{tp1}` | TP2: `{tp2}` | SL: `{sl}` (R:R {rr:.1f})")
+
     embed.add_field(name="⚡ 6 SCALP CALLS (15m Timeframe)", value="\n".join(scalp_text) if scalp_text else "None", inline=False)
     embed.add_field(name="🏛 4 DAY TRADE CALLS (4h Timeframe)", value="\n".join(day_text) if day_text else "None", inline=False)
+    embed.add_field(name="💎 5 SPOT ACCUMULATION CALLS (1D Macro Timeframe)", value="\n".join(spot_text) if spot_text else "None", inline=False)
 
     view = CallSelectView(all_calls)
     return embed, view
 
 
+def _build_spot_message() -> tuple[discord.Embed, CallSelectView]:
+    from config import CORE_TICKERS, EXTRA_TICKERS
+    import market_research
+
+    candidate_universe = CORE_TICKERS + EXTRA_TICKERS
+    spot_sigs = []
+    for t in candidate_universe:
+        if len(spot_sigs) >= 5:
+            break
+        sig = market_research.build_spot_signal(t)
+        if sig:
+            spot_sigs.append(sig)
+
+    state.save_tracked_calls(spot_sigs)
+
+    embed = discord.Embed(
+        title="💎 WINZ SPOT ACCUMULATION DESK (5 TRADES)",
+        description="**For Manual / External Exchange Spot Trading**\nSelect any asset from the dropdown below to view its Spot chart markup and institutional thesis.",
+        color=0x2ECC71,
+    )
+
+    spot_text = []
+    for idx, s in enumerate(spot_sigs, 1):
+        t = s["ticker"]
+        el, eh = fmt_dollar(s["entry_low"]), fmt_dollar(s["entry_high"])
+        tp1, tp2, sl, rr = fmt_dollar(s["tp1"]), fmt_dollar(s["tp2"]), fmt_dollar(s["sl"]), s.get("rr", 2.5)
+        spot_text.append(f"**{idx}. ${t}** `BUY` — Accumulate: `{el}–{eh}` | TP1: `{tp1}` | TP2: `{tp2}` | SL: `{sl}` (R:R {rr:.1f})")
+
+    embed.add_field(name="💎 5 SPOT SWING SETUPS (1D Macro Accumulation)", value="\n".join(spot_text) if spot_text else "None", inline=False)
+    view = CallSelectView(spot_sigs)
+    return embed, view
+
+
 def _build_research_message(ticker: str) -> tuple[discord.Embed, list[discord.File]]:
-    t_clean = ticker.upper().replace("USDT", "").replace("$", "")
+    raw = ticker.upper().replace("USDT", "").replace("$", "").strip()
+    is_spot = "SPOT" in raw or "1D" in raw
+    t_clean = raw.replace("SPOT", "").replace("1D", "").strip() or "BTC"
+
     import market_research
     import chart
     from scanner import fetch_ohlcv
 
-    sig = market_research.build_signal_for_timeframe(t_clean, tf_minutes=15)
+    if is_spot:
+        sig = market_research.build_spot_signal(t_clean)
+        tf_label = "Spot"
+        tf_min = 1440
+    else:
+        sig = market_research.build_signal_for_timeframe(t_clean, tf_minutes=15)
+        tf_label = "15m"
+        tf_min = 15
+
     note = market_research.generate_market_research(sig)
 
-    df = fetch_ohlcv(t_clean, tf_minutes=15, limit=80)
+    df = fetch_ohlcv(t_clean, tf_minutes=tf_min, limit=80)
     png_bytes = chart.generate_chart(
         df=df,
         ticker=t_clean,
         side=sig.get("side", "BUY"),
-        tf="15m",
+        tf=tf_label,
         entry_low=sig.get("entry_low"),
         entry_high=sig.get("entry_high"),
         tp1=sig.get("tp1"),
@@ -208,15 +292,16 @@ def _build_research_message(ticker: str) -> tuple[discord.Embed, list[discord.Fi
 
     files = []
     if png_bytes and len(png_bytes) > 1000:
-        files.append(discord.File(io.BytesIO(png_bytes), filename=f"{t_clean}_15m_chart.png"))
+        files.append(discord.File(io.BytesIO(png_bytes), filename=f"{t_clean}_{tf_label}_chart.png"))
 
+    title_badge = "💎 Winz Spot Accumulation" if is_spot else "📊 Market Research"
     embed = discord.Embed(
-        title=f"📊 Market Research: {t_clean}/USDT (15m {sig.get('side')})",
+        title=f"{title_badge}: {t_clean}/USDT ({tf_label} {sig.get('side')})",
         description=note[:4000],
-        color=0x00FF88 if sig.get("side") == "BUY" else 0xFF3366,
+        color=0x2ECC71 if is_spot else (0x00FF88 if sig.get("side") == "BUY" else 0xFF3366),
     )
     if files:
-        embed.set_image(url=f"attachment://{t_clean}_15m_chart.png")
+        embed.set_image(url=f"attachment://{t_clean}_{tf_label}_chart.png")
 
     return embed, files
 
@@ -246,10 +331,11 @@ def _build_tracked_embed() -> discord.Embed:
         t = c["ticker"]
         side = c["side"]
         tf = c.get("tf", "15m")
+        badge = "💎" if c.get("trade_type") == "spot" or tf in ("spot", "1D") else "•"
         lp = fetch_live_price(t) or 0.0
         tp1_stat = "✅ TP1" if c.get("tp1_hit") else f"TP1: {fmt_dollar(c.get('tp1'))}"
         sl_stat = "🛑 SL" if c.get("sl_hit") else f"SL: {fmt_dollar(c.get('sl'))}"
-        lines.append(f"• **${t}** ({tf} `{side}`) — Mark: `{fmt_dollar(lp)}` | {tp1_stat} | {sl_stat}")
+        lines.append(f"{badge} **${t}** ({tf} `{side}`) — Mark: `{fmt_dollar(lp)}` | {tp1_stat} | {sl_stat}")
 
     embed.description = "\n".join(lines)
     return embed
@@ -266,7 +352,7 @@ async def on_ready():
     except Exception as exc:
         log.warning("Could not sync Discord slash commands: %s", exc)
     log.info("Winz Discord Bot is online as %s (ID: %s)", bot.user.name, bot.user.id)
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="10 Hourly Crypto Calls | /calls"))
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="15 Hourly Crypto Calls | /calls"))
 
 
 # Slash Commands
@@ -281,10 +367,17 @@ async def slash_setchannel(interaction: discord.Interaction):
     await interaction.response.send_message(f"✅ **Winz Channel Set!** Automated hourly calls and trade milestone alerts will broadcast here: <#{cid}>.")
 
 
-@bot.tree.command(name="calls", description="Display the 10 hourly calls with interactive asset dropdown")
+@bot.tree.command(name="calls", description="Display the 15 hourly calls (6 Scalps + 4 Day + 5 Spot) with interactive asset dropdown")
 async def slash_calls(interaction: discord.Interaction):
     await interaction.response.defer()
     embed, view = _build_calls_message()
+    await interaction.followup.send(embed=embed, view=view)
+
+
+@bot.tree.command(name="spot", description="Display 5 spot accumulation setups with interactive asset dropdown")
+async def slash_spot(interaction: discord.Interaction):
+    await interaction.response.defer()
+    embed, view = _build_spot_message()
     await interaction.followup.send(embed=embed, view=view)
 
 
@@ -319,8 +412,15 @@ async def cmd_setchannel(ctx: commands.Context):
 
 @bot.command(name="calls")
 async def cmd_calls(ctx: commands.Context):
-    await ctx.send("🔍 *Compiling latest 10 market calls (6 Scalps + 4 Day Trades)...*")
+    await ctx.send("🔍 *Compiling latest 15 market calls (6 Scalps + 4 Day + 5 Spot)...*")
     embed, view = _build_calls_message()
+    await ctx.send(embed=embed, view=view)
+
+
+@bot.command(name="spot")
+async def cmd_spot(ctx: commands.Context):
+    await ctx.send("🔍 *Compiling 5 spot accumulation setups (1D macro timeframe)...*")
+    embed, view = _build_spot_message()
     await ctx.send(embed=embed, view=view)
 
 
