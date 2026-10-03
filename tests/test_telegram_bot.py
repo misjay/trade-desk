@@ -342,7 +342,8 @@ class TestTelegramBot(unittest.TestCase):
         # Verify key commands are in BOT_COMMANDS
         required = [
             "status", "positions", "tp", "derisk", "dailyreport", "hourlyreport",
-            "weeklyreport", "monthlyreport", "feedback", "research", "tweet", "feedbackbot", "setfeedbackbot",
+            "weeklyreport", "monthlyreport", "hourlycalls", "setcallbot", "callbot",
+            "feedback", "research", "tweet", "feedbackbot", "setfeedbackbot",
             "probation", "leverage", "existingleverage", "scan", "avoid", "allow",
             "avoided", "drop", "pause", "resume", "onspot", "offspot", "cancelorder",
             "cancelallorders", "close", "closeall", "help"

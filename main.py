@@ -268,6 +268,14 @@ def _setup_scheduler():
         name="Daily Learning Feedback (24h)",
         replace_existing=True,
     )
+    import market_research
+    _scheduler.add_job(
+        lambda: market_research.dispatch_hourly_calls(),
+        trigger=IntervalTrigger(hours=1),
+        id="hourly_calls_dispatch",
+        name="Hourly Calls Dispatch (10 Calls: 6 Scalp + 4 Day)",
+        replace_existing=True,
+    )
 
 
 # ── One-shot Desk Report ────────────────────────────────────────────────────

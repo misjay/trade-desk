@@ -643,6 +643,143 @@ def send_call_research_to_feedback_bot(sig: dict) -> bool:
     return send_research_with_chart(sig, tf_minutes=tf_minutes)
 
 
+# ── Hourly Calls Dispatcher (6 Scalps + 4 Day Trades) ──────────────────────
+def dispatch_hourly_calls(
+    bot_token: Optional[str] = None,
+    chat_id: Optional[str] = None,
+) -> bool:
+    """
+    Generate and dispatch 10 curated calls hourly (6 scalps + 4 day trades)
+    specifically designed for manual execution on external exchanges.
+    Delivers an initial index digest followed by each setup's chart markup and institutional note.
+    """
+    call_cfg = state.get_call_bot_config()
+    target_token = bot_token or call_cfg.get("token")
+    target_chat = chat_id or call_cfg.get("chat_id")
+
+    if not target_token or not target_chat:
+        log.warning("Hourly calls dispatch skipped: no call bot token or chat ID configured")
+        return False
+
+    from config import CORE_TICKERS, EXTRA_TICKERS
+    candidate_universe = CORE_TICKERS + EXTRA_TICKERS
+
+    log.info("Generating hourly calls (6 scalps, 4 day trades) for %s...", target_chat)
+
+    # 1. Gather 6 Scalp Setups (15m)
+    scalp_signals = []
+    for ticker in candidate_universe:
+        if len(scalp_signals) >= 6:
+            break
+        try:
+            sig = build_signal_for_timeframe(ticker, tf_minutes=15)
+            # Prioritize signals with favorable risk-reward >= 1.5
+            if sig and sig.get("rr", 0) >= 1.5:
+                scalp_signals.append(sig)
+        except Exception as exc:
+            log.debug("Error building scalp signal for %s: %s", ticker, exc)
+
+    # 2. Gather 4 Day Trade Setups (4h)
+    day_signals = []
+    # Avoid duplicate tickers if possible
+    scalp_tickers = {s["ticker"] for s in scalp_signals}
+    for ticker in candidate_universe:
+        if len(day_signals) >= 4:
+            break
+        if ticker in scalp_tickers:
+            continue
+        try:
+            sig = build_signal_for_timeframe(ticker, tf_minutes=240)
+            if sig and sig.get("rr", 0) >= 1.5:
+                day_signals.append(sig)
+        except Exception as exc:
+            log.debug("Error building day signal for %s: %s", ticker, exc)
+
+    # If day_signals still < 4, allow fallback to scalp_tickers
+    if len(day_signals) < 4:
+        for ticker in candidate_universe:
+            if len(day_signals) >= 4:
+                break
+            if any(s["ticker"] == ticker for s in day_signals):
+                continue
+            try:
+                sig = build_signal_for_timeframe(ticker, tf_minutes=240)
+                if sig:
+                    day_signals.append(sig)
+            except Exception:
+                pass
+
+    now_utc_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+    # 3. Deliver Index Summary Digest
+    index_lines = [
+        "🚨 *XIRA HOURLY TRADE DESK DISPATCH (10 CALLS)*",
+        f"⏱ *Timestamp:* {now_utc_str} | _For Manual / External Exchange Trading_",
+        "",
+        "⚡ *6 SCALP SETUPS (15m Timeframe):*",
+    ]
+    for idx, s in enumerate(scalp_signals, start=1):
+        t = s["ticker"]
+        side = s["side"]
+        el = fmt_dollar(s["entry_low"])
+        eh = fmt_dollar(s["entry_high"])
+        tp1 = fmt_dollar(s["tp1"])
+        sl = fmt_dollar(s["sl"])
+        rr = s.get("rr", 2.0)
+        index_lines.append(f"{idx}. *${t}* `{side}` — Entry: `{el}–{eh}` | TP: `{tp1}` | SL: `{sl}` (R:R {rr:.1f})")
+
+    index_lines.append("")
+    index_lines.append("🏛 *4 DAY TRADE SETUPS (4h Timeframe):*")
+    for idx, s in enumerate(day_signals, start=len(scalp_signals) + 1):
+        t = s["ticker"]
+        side = s["side"]
+        el = fmt_dollar(s["entry_low"])
+        eh = fmt_dollar(s["entry_high"])
+        tp1 = fmt_dollar(s["tp1"])
+        sl = fmt_dollar(s["sl"])
+        rr = s.get("rr", 2.0)
+        index_lines.append(f"{idx}. *${t}* `{side}` — Entry: `{el}–{eh}` | TP: `{tp1}` | SL: `{sl}` (R:R {rr:.1f})")
+
+    index_lines.append("")
+    index_lines.append("*(Detailed candlestick charts & institutional thesis following below ↓)*")
+
+    index_msg = "\n".join(index_lines)
+    send_url = f"https://api.telegram.org/bot{target_token}/sendMessage"
+    try:
+        requests.post(
+            send_url,
+            json={
+                "chat_id": target_chat,
+                "text": index_msg,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True,
+            },
+            timeout=12,
+        )
+    except Exception as exc:
+        log.warning("Failed to send hourly digest index: %s", exc)
+
+    # 4. Deliver Individual Chart Breakdowns & Notes
+    # Scalps (15m)
+    for s in scalp_signals:
+        try:
+            send_research_with_chart(s, bot_token=target_token, chat_id=target_chat, tf_minutes=15)
+            time.sleep(1.5)
+        except Exception as exc:
+            log.warning("Failed to send scalp chart for %s: %s", s.get("ticker"), exc)
+
+    # Day Trades (4h)
+    for s in day_signals:
+        try:
+            send_research_with_chart(s, bot_token=target_token, chat_id=target_chat, tf_minutes=240)
+            time.sleep(1.5)
+        except Exception as exc:
+            log.warning("Failed to send day chart for %s: %s", s.get("ticker"), exc)
+
+    log.info("Hourly calls successfully dispatched to %s.", target_chat)
+    return True
+
+
 # ── Twitter / X Post Converter ──────────────────────────────────────────────
 def _fmt_tweet_price(val: Optional[float]) -> str:
     """Compact price formatting designed for Twitter character economy."""

@@ -51,6 +51,10 @@ class Config:
     feedback_bot_token: str = field(default_factory=lambda: os.getenv("FEEDBACK_BOT_TOKEN", ""))
     feedback_chat_id: str = field(default_factory=lambda: os.getenv("FEEDBACK_CHAT_ID", ""))
 
+    # Dedicated External Calls Bot (for manual trading calls / non-automated exchanges)
+    call_bot_token: str = field(default_factory=lambda: os.getenv("CALL_BOT_TOKEN", ""))
+    call_bot_chat_id: str = field(default_factory=lambda: os.getenv("CALL_BOT_CHAT_ID", ""))
+
     # Risk: exactly 0.5% of balance per trade
     risk_per_trade: float = field(default_factory=lambda: float(os.getenv("RISK_PER_TRADE", "0.005")))
     paper_equity: float = field(default_factory=lambda: float(os.getenv("PAPER_EQUITY", "10000")))

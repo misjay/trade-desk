@@ -539,6 +539,27 @@ def set_feedback_bot_config(token: str, chat_id: str) -> Dict[str, str]:
         return s["feedback_bot"]
 
 
+def get_call_bot_config() -> Dict[str, str]:
+    with _lock:
+        s = _load_raw()
+        cfg_custom = s.get("call_bot", {})
+        token = cfg_custom.get("token") or cfg.call_bot_token or cfg.feedback_bot_token or cfg.telegram_token
+        chat_id = cfg_custom.get("chat_id") or cfg.call_bot_chat_id or cfg.feedback_chat_id or cfg.telegram_chat_id
+        return {"token": token, "chat_id": str(chat_id)}
+
+
+def set_call_bot_config(token: str, chat_id: str) -> Dict[str, str]:
+    with _lock:
+        s = _load_raw()
+        s["call_bot"] = {
+            "token": token.strip(),
+            "chat_id": str(chat_id).strip(),
+            "updated_at": _now(),
+        }
+        _save(s)
+        return s["call_bot"]
+
+
 def record_learning_event(event: dict) -> None:
     with _lock:
         s = _load_raw()
