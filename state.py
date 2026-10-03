@@ -588,3 +588,49 @@ def get_last_researched_signal() -> Optional[dict]:
     with _lock:
         return _load_raw().get("last_researched_signal")
 
+
+# ── Tracked Calls Storage (for TP1, TP2, SL, +10% gain, -20% drop tracking) ──
+def save_tracked_calls(calls: List[dict]) -> None:
+    with _lock:
+        s = _load_raw()
+        if "tracked_calls" not in s:
+            s["tracked_calls"] = {}
+        for c in calls:
+            t = c.get("ticker", "").upper()
+            tf = c.get("tf", "15m")
+            cid = f"{t}_{tf}"
+            # Preserve existing tracking flags if already present
+            existing = s["tracked_calls"].get(cid, {})
+            c["tp1_hit"] = existing.get("tp1_hit", False)
+            c["tp2_hit"] = existing.get("tp2_hit", False)
+            c["sl_hit"] = existing.get("sl_hit", False)
+            c["highest_gain_step"] = existing.get("highest_gain_step", 0) # e.g. 10, 20, 30%
+            c["drop_alert_triggered"] = existing.get("drop_alert_triggered", False)
+            c["created_at"] = existing.get("created_at", _now())
+            s["tracked_calls"][cid] = c
+        _save(s)
+
+
+def get_tracked_calls() -> Dict[str, dict]:
+    with _lock:
+        return dict(_load_raw().get("tracked_calls", {}))
+
+
+def update_tracked_call(call_id: str, updates: dict) -> None:
+    with _lock:
+        s = _load_raw()
+        if "tracked_calls" in s and call_id in s["tracked_calls"]:
+            s["tracked_calls"][call_id].update(updates)
+            _save(s)
+
+
+def clear_closed_tracked_calls() -> int:
+    with _lock:
+        s = _load_raw()
+        tc = s.get("tracked_calls", {})
+        active = {k: v for k, v in tc.items() if not (v.get("tp2_hit") or v.get("sl_hit"))}
+        removed = len(tc) - len(active)
+        s["tracked_calls"] = active
+        _save(s)
+        return removed
+

@@ -901,6 +901,43 @@ def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_tri
                 data = resp.json()
                 for update in data.get("result", []):
                     last_update_id = update["update_id"]
+                    # Handle button callbacks (InlineKeyboard taps)
+                    cb_query = update.get("callback_query")
+                    if cb_query:
+                        cb_id = cb_query.get("id")
+                        cb_data = cb_query.get("data", "")
+                        from_user = cb_query.get("from", {})
+                        cb_chat_id = str(cb_query.get("message", {}).get("chat", {}).get("id") or from_user.get("id"))
+
+                        # Acknowledge callback query to Telegram
+                        try:
+                            ack_url = f"https://api.telegram.org/bot{token}/answerCallbackQuery"
+                            requests.post(ack_url, json={"callback_query_id": cb_id}, timeout=6)
+                        except Exception:
+                            pass
+
+                        if cb_data.startswith("call_view_"):
+                            # format: call_view_TICKER_TF (e.g. call_view_SOL_15m)
+                            parts = cb_data.split("_")
+                            if len(parts) >= 4:
+                                ticker = parts[2]
+                                tf_str = parts[3]
+                                tf_min = 240 if tf_str == "4h" else 15
+                                _reply(cb_chat_id, f"🔬 *Compiling live chart & analysis for ${ticker} ({tf_str})...*", bot_token=token)
+
+                                def _async_call_view(t: str, tf_m: int, c_id: str, b_tok: str):
+                                    import market_research
+                                    sig = market_research.build_signal_for_timeframe(t, tf_minutes=tf_m)
+                                    market_research.send_research_with_chart(sig, bot_token=b_tok, chat_id=c_id, tf_minutes=tf_m)
+
+                                threading.Thread(
+                                    target=_async_call_view,
+                                    args=(ticker, tf_min, cb_chat_id, token),
+                                    daemon=True,
+                                    name=f"cb-{ticker}",
+                                ).start()
+                        continue
+
                     msg = update.get("message") or update.get("edited_message")
                     if not msg:
                         continue
@@ -933,8 +970,11 @@ def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_tri
 def _poll_updates_loop(scan_trigger_fn=None) -> None:
     log.info("Telegram interactive command listeners starting")
 
-    # Primary bot listener
+    polled_tokens = set()
+
+    # 1. Primary bot listener
     if cfg.telegram_token:
+        polled_tokens.add(cfg.telegram_token)
         t_prim = threading.Thread(
             target=_poll_single_bot,
             kwargs={
@@ -947,12 +987,13 @@ def _poll_updates_loop(scan_trigger_fn=None) -> None:
         )
         t_prim.start()
 
-    # Feedback bot listener (if distinct)
+    # 2. Feedback bot listener (if distinct)
     try:
         fb_cfg = state.get_feedback_bot_config()
         fb_tok = fb_cfg.get("token")
         fb_cid = fb_cfg.get("chat_id")
-        if fb_tok and fb_tok != cfg.telegram_token:
+        if fb_tok and fb_tok not in polled_tokens:
+            polled_tokens.add(fb_tok)
             t_fb = threading.Thread(
                 target=_poll_single_bot,
                 kwargs={
@@ -966,6 +1007,27 @@ def _poll_updates_loop(scan_trigger_fn=None) -> None:
             t_fb.start()
     except Exception as exc:
         log.warning("Could not launch feedback bot polling listener: %s", exc)
+
+    # 3. Dedicated Calls Bot listener (Winz - @thewinzbot)
+    try:
+        call_cfg = state.get_call_bot_config()
+        c_tok = call_cfg.get("token")
+        c_cid = call_cfg.get("chat_id")
+        if c_tok and c_tok not in polled_tokens:
+            polled_tokens.add(c_tok)
+            t_call = threading.Thread(
+                target=_poll_single_bot,
+                kwargs={
+                    "token": c_tok,
+                    "allowed_chat_id": None, # Allow interactive button taps & public commands on Winz
+                    "scan_trigger_fn": scan_trigger_fn,
+                },
+                daemon=True,
+                name="tg-poller-callbot",
+            )
+            t_call.start()
+    except Exception as exc:
+        log.warning("Could not launch call bot polling listener: %s", exc)
 
     while _bot_running:
         time.sleep(2)

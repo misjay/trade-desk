@@ -70,6 +70,8 @@ import scanner
 import notifier
 import engine
 import telegram_bot
+import call_tracker
+import winz_discord
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -290,6 +292,8 @@ def print_live_desk_report():
 def _shutdown(signum=None, frame=None):
     log.info("Shutting down Trade Desk...")
     telegram_bot.stop_telegram_listener()
+    call_tracker.stop_call_tracker()
+    winz_discord.stop_discord_bot()
     _scheduler.shutdown(wait=False)
     engine.stop_monitor()
     sys.exit(0)
@@ -350,6 +354,8 @@ def main():
     _start_http_server()
     engine.start_monitor()
     telegram_bot.start_telegram_listener(scan_trigger_fn=lambda: run_scan_cycle("scalp", manual=True))
+    call_tracker.start_call_tracker()
+    winz_discord.start_discord_bot()
     _setup_scheduler()
     _scheduler.start()
 

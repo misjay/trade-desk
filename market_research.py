@@ -20,8 +20,10 @@ Format Mandate (matches institutional research style):
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import logging
 import math
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -711,9 +713,15 @@ def dispatch_hourly_calls(
 
     now_utc_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
-    # 3. Deliver Index Summary Digest
+    # 3. Save all 10 calls for real-time tracking
+    all_calls = scalp_signals + day_signals
+    state.save_tracked_calls(all_calls)
+
+    now_utc_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+    # 4. Deliver Clean Digest with Interactive Buttons (No photo flood!)
     index_lines = [
-        "🚨 *XIRA HOURLY TRADE DESK DISPATCH (10 CALLS)*",
+        "🚨 *WINZ HOURLY TRADE DESK CALLS (10 SETUPS)*",
         f"⏱ *Timestamp:* {now_utc_str} | _For Manual / External Exchange Trading_",
         "",
         "⚡ *6 SCALP SETUPS (15m Timeframe):*",
@@ -741,42 +749,38 @@ def dispatch_hourly_calls(
         index_lines.append(f"{idx}. *${t}* `{side}` — Entry: `{el}–{eh}` | TP: `{tp1}` | SL: `{sl}` (R:R {rr:.1f})")
 
     index_lines.append("")
-    index_lines.append("*(Detailed candlestick charts & institutional thesis following below ↓)*")
+    index_lines.append("👇 *Tap any asset below for its live chart markup, structure & institutional thesis:*")
+
+    # Construct Inline Keyboard Buttons (2 buttons per row)
+    inline_keyboard = []
+    current_row = []
+    for s in all_calls:
+        t = s["ticker"]
+        tf = s.get("tf", "15m")
+        btn_text = f"📊 {t} ({tf})"
+        cb_data = f"call_view_{t}_{tf}"
+        current_row.append({"text": btn_text, "callback_data": cb_data})
+        if len(current_row) == 2:
+            inline_keyboard.append(current_row)
+            current_row = []
+    if current_row:
+        inline_keyboard.append(current_row)
 
     index_msg = "\n".join(index_lines)
     send_url = f"https://api.telegram.org/bot{target_token}/sendMessage"
+    payload = {
+        "chat_id": target_chat,
+        "text": index_msg,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+        "reply_markup": {"inline_keyboard": inline_keyboard},
+    }
     try:
-        requests.post(
-            send_url,
-            json={
-                "chat_id": target_chat,
-                "text": index_msg,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": True,
-            },
-            timeout=12,
-        )
+        requests.post(send_url, json=payload, timeout=12)
     except Exception as exc:
-        log.warning("Failed to send hourly digest index: %s", exc)
+        log.warning("Failed to send hourly digest with buttons: %s", exc)
 
-    # 4. Deliver Individual Chart Breakdowns & Notes
-    # Scalps (15m)
-    for s in scalp_signals:
-        try:
-            send_research_with_chart(s, bot_token=target_token, chat_id=target_chat, tf_minutes=15)
-            time.sleep(1.5)
-        except Exception as exc:
-            log.warning("Failed to send scalp chart for %s: %s", s.get("ticker"), exc)
-
-    # Day Trades (4h)
-    for s in day_signals:
-        try:
-            send_research_with_chart(s, bot_token=target_token, chat_id=target_chat, tf_minutes=240)
-            time.sleep(1.5)
-        except Exception as exc:
-            log.warning("Failed to send day chart for %s: %s", s.get("ticker"), exc)
-
-    log.info("Hourly calls successfully dispatched to %s.", target_chat)
+    log.info("Hourly calls digest successfully dispatched to %s with interactive buttons.", target_chat)
     return True
 
 
