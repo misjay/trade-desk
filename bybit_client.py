@@ -21,11 +21,13 @@ import hmac
 import json
 import logging
 import math
+import socket
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import requests
+from urllib3.util import connection as urllib3_connection
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +35,56 @@ log = logging.getLogger(__name__)
 _BYBIT_MAINNET = "https://api.bybit.com"
 _BYBIT_DEMO = "https://api-demo.bybit.com"
 _BYBIT_TESTNET = "https://api-testnet.bybit.com"
+
+# Resilient DNS fallback for Bybit domains (bypasses ISP DNS blocking)
+def _resolve_dns_public(hostname: str) -> List[str]:
+    try:
+        packet = bytearray([0xaa, 0xbb, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        for part in hostname.split("."):
+            packet.append(len(part))
+            packet.extend(part.encode("latin1"))
+        packet.append(0)
+        packet.extend([0x00, 0x01, 0x00, 0x01])
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(2.0)
+        s.sendto(packet, ("8.8.8.8", 53))
+        data, _ = s.recvfrom(512)
+        s.close()
+        ip_records = []
+        i = 12
+        while data[i] != 0:
+            i += 1 + data[i]
+        i += 5
+        while i < len(data):
+            if (data[i] & 0xc0) == 0xc0:
+                i += 2
+            else:
+                while data[i] != 0:
+                    i += 1 + data[i]
+                i += 1
+            rtype = int.from_bytes(data[i:i+2], "big")
+            rdlen = int.from_bytes(data[i+8:i+10], "big")
+            i += 10
+            if rtype == 1 and rdlen == 4:
+                ip_records.append(".".join(str(b) for b in data[i:i+4]))
+            i += rdlen
+        return ip_records
+    except Exception:
+        return []
+
+_orig_create_connection = urllib3_connection.create_connection
+def _resilient_create_connection(address, *args, **kwargs):
+    host, port = address
+    try:
+        socket.gethostbyname(host)
+    except Exception:
+        if "bybit.com" in host:
+            ips = _resolve_dns_public(host)
+            if ips:
+                address = (ips[0], port)
+    return _orig_create_connection(address, *args, **kwargs)
+
+urllib3_connection.create_connection = _resilient_create_connection
 
 
 class BybitClient:
@@ -72,8 +124,10 @@ class BybitClient:
     def base_url(self) -> str:
         if self.is_live:
             return _BYBIT_MAINNET
-        if self.demo_env in ("testnet", "demo"):
+        if self.demo_env == "testnet":
             return _BYBIT_TESTNET
+        if self.demo_env == "demo":
+            return _BYBIT_DEMO
         # For paper trading, market data is fetched from Mainnet for genuine liquidity
         return _BYBIT_MAINNET
 
@@ -103,7 +157,9 @@ class BybitClient:
     def request(self, method: str, path: str, params: Optional[dict] = None, data: Optional[dict] = None) -> Optional[dict]:
         ts = str(int(time.time() * 1000))
         hosts = [self.base_url]
-        if "testnet" in self.base_url:
+        if "demo" in self.base_url:
+            pass
+        elif "testnet" in self.base_url:
             if "bytick" in self.base_url:
                 hosts.append("https://api-testnet.bybit.com")
             else:
