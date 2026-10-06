@@ -68,6 +68,41 @@ class Config:
     min_free_margin_pct: float = field(default_factory=lambda: float(os.getenv("MIN_FREE_MARGIN_PCT", "0.30")))
     max_position_notional: float = field(default_factory=lambda: float(os.getenv("MAX_POSITION_NOTIONAL", "25000.0")))
 
+    # GitHub Best Practices: Hummingbot, Freqtrade, Passivbot parameters
+    max_directional_positions: int = field(default_factory=lambda: int(os.getenv("MAX_DIRECTIONAL_POSITIONS", "3")))
+    max_directional_ratio: float = field(default_factory=lambda: float(os.getenv("MAX_DIRECTIONAL_RATIO", "0.65")))
+    enable_market_regime_filter: bool = field(default_factory=lambda: os.getenv("ENABLE_MARKET_REGIME_FILTER", "true").lower() in ("true", "1", "yes"))
+    enable_micro_grid_entry: bool = field(default_factory=lambda: os.getenv("ENABLE_MICRO_GRID_ENTRY", "true").lower() in ("true", "1", "yes"))
+    unstuck_timeout_minutes: int = field(default_factory=lambda: int(os.getenv("UNSTUCK_TIMEOUT_MINUTES", "90")))
+
+    # Institutional Edge Parameters: ATR, Order Flow, OI, 3-Tier Scaleout
+    enable_atr_stops: bool = field(default_factory=lambda: os.getenv("ENABLE_ATR_STOPS", "true").lower() in ("true", "1", "yes"))
+    atr_multiplier: float = field(default_factory=lambda: float(os.getenv("ATR_MULTIPLIER", "1.2")))
+    enable_orderflow_imbalance: bool = field(default_factory=lambda: os.getenv("ENABLE_ORDERFLOW_IMBALANCE", "true").lower() in ("true", "1", "yes"))
+    enable_open_interest_filter: bool = field(default_factory=lambda: os.getenv("ENABLE_OPEN_INTEREST_FILTER", "true").lower() in ("true", "1", "yes"))
+    enable_three_tier_scaleout: bool = field(default_factory=lambda: os.getenv("ENABLE_THREE_TIER_SCALEOUT", "true").lower() in ("true", "1", "yes"))
+
+    # Precision Risk & Gatekeeper Parameters
+    enable_btc_momentum_gate: bool = field(default_factory=lambda: os.getenv("ENABLE_BTC_MOMENTUM_GATE", "true").lower() in ("true", "1", "yes"))
+    enable_wick_confirmation: bool = field(default_factory=lambda: os.getenv("ENABLE_WICK_CONFIRMATION", "true").lower() in ("true", "1", "yes"))
+    enable_dynamic_kelly_sizing: bool = field(default_factory=lambda: os.getenv("ENABLE_DYNAMIC_KELLY_SIZING", "true").lower() in ("true", "1", "yes"))
+    risk_a_plus: float = field(default_factory=lambda: float(os.getenv("RISK_A_PLUS", "0.0070")))
+    risk_standard: float = field(default_factory=lambda: float(os.getenv("RISK_STANDARD", "0.0045")))
+    risk_weekend_chop: float = field(default_factory=lambda: float(os.getenv("RISK_WEEKEND_CHOP", "0.0030")))
+    enable_daily_pruning: bool = field(default_factory=lambda: os.getenv("ENABLE_DAILY_PRUNING", "true").lower() in ("true", "1", "yes"))
+
+    # Advanced Precision Upgrades: Sector Baskets, Orderbook Wall Frontrunning, Multi-Step Ratchet Trail
+    enable_sector_caps: bool = field(default_factory=lambda: os.getenv("ENABLE_SECTOR_CAPS", "true").lower() in ("true", "1", "yes"))
+    max_sector_positions: int = field(default_factory=lambda: int(os.getenv("MAX_SECTOR_POSITIONS", "2")))
+    enable_wall_frontrun: bool = field(default_factory=lambda: os.getenv("ENABLE_WALL_FRONTRUN", "true").lower() in ("true", "1", "yes"))
+    enable_ratchet_trail: bool = field(default_factory=lambda: os.getenv("ENABLE_RATCHET_TRAIL", "true").lower() in ("true", "1", "yes"))
+
+    # Phase 4 Institutional Edge: Funding Carry Bias, Adaptive Maker Pegging, Climax Early Cut, HWM Dynamic Leverage
+    enable_funding_bias: bool = field(default_factory=lambda: os.getenv("ENABLE_FUNDING_BIAS", "true").lower() in ("true", "1", "yes"))
+    enable_adaptive_maker_pegging: bool = field(default_factory=lambda: os.getenv("ENABLE_ADAPTIVE_MAKER_PEGGING", "true").lower() in ("true", "1", "yes"))
+    enable_climax_early_cut: bool = field(default_factory=lambda: os.getenv("ENABLE_CLIMAX_EARLY_CUT", "true").lower() in ("true", "1", "yes"))
+    enable_hwm_drawdown_leverage: bool = field(default_factory=lambda: os.getenv("ENABLE_HWM_DRAWDOWN_LEVERAGE", "true").lower() in ("true", "1", "yes"))
+
     # Scanner settings
     scalp_tf: int = field(default_factory=lambda: int(os.getenv("SCALP_TF", "15")))
     day_tf: int = field(default_factory=lambda: int(os.getenv("DAY_TF", "4")))
@@ -143,6 +178,28 @@ MARKET_ALLOWED_TICKERS: List[str] = ["BTC", "ETH", "SOL", "XRP", "BNB"]
 
 # Hard ban: never market PEPE, TAO, ENA, HBAR, NEAR or a vertical 15m candle
 NO_MARKET_TICKERS: List[str] = ["PEPE", "TAO", "ENA", "HBAR", "NEAR"]
+
+# ── Sector & Correlation Groups ─────────────────────────────────────────────
+# Prevents over-concentrated directional exposure into a single narrative/ecosystem
+SECTOR_MAP: Dict[str, str] = {
+    # Layer 1 / Smart Contract Alternatives
+    "SOL": "L1", "SUI": "L1", "APT": "L1", "SEI": "L1", "AVAX": "L1", "NEAR": "L1", "HBAR": "L1", "DOT": "L1", "ATOM": "L1",
+    # Memecoins
+    "DOGE": "MEME", "PEPE": "MEME",
+    # DeFi / Infrastructure
+    "AAVE": "DEFI", "UNI": "DEFI", "LINK": "DEFI", "ONDO": "DEFI", "ENA": "DEFI", "INJ": "DEFI",
+    # AI / Compute
+    "TAO": "AI", "RENDER": "AI", "FET": "AI", "WLD": "AI",
+    # Layer 2s
+    "ARB": "L2", "OP": "L2", "STRK": "L2",
+    # Majors / Legacy Pow & PoS
+    "BTC": "MAJORS", "ETH": "MAJORS", "BNB": "MAJORS", "XRP": "MAJORS", "LTC": "MAJORS", "BCH": "MAJORS", "TRX": "MAJORS", "XLM": "MAJORS", "ZEC": "MAJORS",
+}
+
+
+def get_sector(ticker: str) -> str:
+    """Return narrative sector group for ticker."""
+    return SECTOR_MAP.get(ticker.upper(), "OTHER")
 
 
 # ── Exchange & Chart URL Helpers ────────────────────────────────────────────

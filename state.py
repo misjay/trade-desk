@@ -58,6 +58,7 @@ def _default_state() -> Dict[str, Any]:
         "avoid_list": [],
         "quarantine": {},
         "probation": {},
+        "high_water_mark": cfg.paper_equity,
         "custom_leverage": {},
         "spot_enabled": False,
         "created_at": _now(),
@@ -480,12 +481,53 @@ def set_custom_leverage(ticker: str, leverage: int) -> int:
         return val
 
 
+def get_high_water_mark() -> float:
+    with _lock:
+        s = _load_raw()
+        if "high_water_mark" in s:
+            return float(s["high_water_mark"])
+        return float(s.get("paper_equity", cfg.paper_equity))
+
+
+def update_high_water_mark(current_equity: float) -> float:
+    with _lock:
+        s = _load_raw()
+        hwm = float(s.get("high_water_mark", s.get("paper_equity", cfg.paper_equity)))
+        if current_equity > hwm:
+            hwm = round(current_equity, 4)
+            s["high_water_mark"] = hwm
+            _save(s)
+        elif "high_water_mark" not in s:
+            s["high_water_mark"] = hwm
+            _save(s)
+        return hwm
+
+
+def get_equity_drawdown_pct(current_equity: float) -> float:
+    hwm = get_high_water_mark()
+    if hwm <= 0:
+        return 0.0
+    dd = (hwm - current_equity) / hwm * 100.0
+    return max(0.0, dd)
+
+
 def get_effective_leverage(ticker: str, scalp: bool = True) -> int:
     custom = get_custom_leverage(ticker)
     if custom is not None:
-        return int(custom)
-    from config import get_leverage
-    return get_leverage(ticker, scalp=scalp)
+        lev = int(custom)
+    else:
+        from config import get_leverage
+        lev = get_leverage(ticker, scalp=scalp)
+
+    # Dynamic High-Water Mark Drawdown Scale:
+    # If equity drawdown from HWM > 2.0%, reduce leverage by 1x (min 2x) to protect capital
+    if cfg.enable_hwm_drawdown_leverage:
+        eq = get_equity()
+        dd = get_equity_drawdown_pct(eq)
+        if dd >= 2.0:
+            lev = max(2, lev - 1)
+
+    return lev
 
 
 def remove_working_orders(ticker: Optional[str] = None) -> int:
@@ -539,25 +581,65 @@ def set_feedback_bot_config(token: str, chat_id: str) -> Dict[str, str]:
         return s["feedback_bot"]
 
 
-def get_call_bot_config() -> Dict[str, str]:
+def get_call_bot_config() -> Dict[str, Any]:
     with _lock:
         s = _load_raw()
         cfg_custom = s.get("call_bot", {})
         token = cfg_custom.get("token") or cfg.call_bot_token or cfg.feedback_bot_token or cfg.telegram_token
         chat_id = cfg_custom.get("chat_id") or cfg.call_bot_chat_id or cfg.feedback_chat_id or cfg.telegram_chat_id
-        return {"token": token, "chat_id": str(chat_id)}
+        extra_chats = list(cfg_custom.get("extra_chats", []))
+        all_chats = []
+        if chat_id:
+            all_chats.append(str(chat_id))
+        for ec in extra_chats:
+            if str(ec) not in all_chats:
+                all_chats.append(str(ec))
+        return {
+            "token": token,
+            "chat_id": str(chat_id) if chat_id else "",
+            "all_chats": all_chats,
+        }
 
 
-def set_call_bot_config(token: str, chat_id: str) -> Dict[str, str]:
+def set_call_bot_config(token: str, chat_id: str) -> Dict[str, Any]:
     with _lock:
         s = _load_raw()
+        cid_str = str(chat_id).strip()
+        extras = list(s.get("call_bot", {}).get("extra_chats", []))
+        if cid_str and cid_str not in extras:
+            extras.append(cid_str)
         s["call_bot"] = {
             "token": token.strip(),
-            "chat_id": str(chat_id).strip(),
+            "chat_id": cid_str,
+            "extra_chats": extras,
             "updated_at": _now(),
         }
         _save(s)
         return s["call_bot"]
+
+
+def add_call_bot_chat(chat_id: str) -> List[str]:
+    """Add a group or channel chat_id to the call broadcast list."""
+    with _lock:
+        s = _load_raw()
+        cid_str = str(chat_id).strip()
+        if "call_bot" not in s:
+            s["call_bot"] = {
+                "token": cfg.call_bot_token or cfg.telegram_token,
+                "chat_id": cid_str,
+                "extra_chats": [cid_str],
+                "updated_at": _now(),
+            }
+        else:
+            extras = s["call_bot"].setdefault("extra_chats", [])
+            if cid_str not in extras:
+                extras.append(cid_str)
+            # If it's a negative chat_id (group/channel), promote it to primary chat_id
+            if cid_str.startswith("-"):
+                s["call_bot"]["chat_id"] = cid_str
+            s["call_bot"]["updated_at"] = _now()
+        _save(s)
+        return list(s["call_bot"].get("extra_chats", []))
 
 
 def record_learning_event(event: dict) -> None:

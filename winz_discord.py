@@ -20,8 +20,14 @@ import os
 import threading
 from typing import Optional
 
-import discord
-from discord.ext import commands
+try:
+    import discord
+    from discord.ext import commands
+    HAS_DISCORD = True
+except ImportError:
+    discord = None
+    commands = None
+    HAS_DISCORD = False
 
 from config import cfg, CORE_TICKERS, EXTRA_TICKERS
 from scanner import fmt_dollar
@@ -30,10 +36,14 @@ import state
 log = logging.getLogger("winz_discord")
 
 # Discord intents setup (default unprivileged intents so bot connects instantly)
-intents = discord.Intents.default()
-intents.message_content = False
+if HAS_DISCORD:
+    intents = discord.Intents.default()
+    intents.message_content = False
+    bot = commands.Bot(command_prefix=["!", "/"], intents=intents, help_command=None)
+else:
+    intents = None
+    bot = None
 
-bot = commands.Bot(command_prefix=["!", "/"], intents=intents, help_command=None)
 _discord_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
@@ -197,23 +207,33 @@ def _build_calls_message() -> tuple[discord.Embed, CallSelectView]:
     scalp_text = []
     for idx, s in enumerate(scalp_sigs, 1):
         t, side = s["ticker"], s["side"]
+        conv = s.get("conviction", 90.0)
         el, eh = fmt_dollar(s["entry_low"]), fmt_dollar(s["entry_high"])
         tp1, sl, rr = fmt_dollar(s["tp1"]), fmt_dollar(s["sl"]), s.get("rr", 2.0)
-        scalp_text.append(f"**{idx}. ${t}** `{side}` — Entry: `{el}–{eh}` | TP: `{tp1}` | SL: `{sl}` (R:R {rr:.1f})")
+        tp1_pct = s.get("tp1_pct", 2.4)
+        sl_pct = s.get("sl_pct", 1.2)
+        scalp_text.append(f"**{idx}. `[{conv:.0f}% Conviction]` ${t}** `{side}` — Entry: `{el}–{eh}` | TP: `+{tp1_pct:.1f}%` ({tp1}) | SL: `-{sl_pct:.1f}%` ({sl}) (R:R {rr:.1f})")
 
     day_text = []
     for idx, s in enumerate(day_sigs, len(scalp_sigs) + 1):
         t, side = s["ticker"], s["side"]
+        conv = s.get("conviction", 92.0)
         el, eh = fmt_dollar(s["entry_low"]), fmt_dollar(s["entry_high"])
         tp1, sl, rr = fmt_dollar(s["tp1"]), fmt_dollar(s["sl"]), s.get("rr", 2.0)
-        day_text.append(f"**{idx}. ${t}** `{side}` — Entry: `{el}–{eh}` | TP: `{tp1}` | SL: `{sl}` (R:R {rr:.1f})")
+        tp1_pct = s.get("tp1_pct", 6.5)
+        sl_pct = s.get("sl_pct", 2.8)
+        day_text.append(f"**{idx}. `[{conv:.0f}% Conviction]` ${t}** `{side}` — Entry: `{el}–{eh}` | TP: `+{tp1_pct:.1f}%` ({tp1}) | SL: `-{sl_pct:.1f}%` ({sl}) (R:R {rr:.1f})")
 
     spot_text = []
     for idx, s in enumerate(spot_sigs, len(scalp_sigs) + len(day_sigs) + 1):
         t = s["ticker"]
+        conv = s.get("conviction", 94.0)
         el, eh = fmt_dollar(s["entry_low"]), fmt_dollar(s["entry_high"])
         tp1, tp2, sl, rr = fmt_dollar(s["tp1"]), fmt_dollar(s["tp2"]), fmt_dollar(s["sl"]), s.get("rr", 2.5)
-        spot_text.append(f"**{idx}. ${t}** `BUY` — Accumulate: `{el}–{eh}` | TP1: `{tp1}` | TP2: `{tp2}` | SL: `{sl}` (R:R {rr:.1f})")
+        tp1_pct = s.get("tp1_pct", 14.0)
+        tp2_pct = s.get("tp2_pct", 32.0)
+        sl_pct = s.get("sl_pct", 7.0)
+        spot_text.append(f"**{idx}. `[{conv:.0f}% Conviction]` ${t}** `BUY` — Accumulate: `{el}–{eh}` | TP1: `+{tp1_pct:.1f}%` ({tp1}) | TP2: `+{tp2_pct:.1f}%` ({tp2}) | SL: `-{sl_pct:.1f}%` ({sl}) (R:R {rr:.1f})")
 
     embed.add_field(name="⚡ 6 SCALP CALLS (15m Timeframe)", value="\n".join(scalp_text) if scalp_text else "None", inline=False)
     embed.add_field(name="🏛 4 DAY TRADE CALLS (4h Timeframe)", value="\n".join(day_text) if day_text else "None", inline=False)
@@ -247,9 +267,13 @@ def _build_spot_message() -> tuple[discord.Embed, CallSelectView]:
     spot_text = []
     for idx, s in enumerate(spot_sigs, 1):
         t = s["ticker"]
+        conv = s.get("conviction", 94.0)
         el, eh = fmt_dollar(s["entry_low"]), fmt_dollar(s["entry_high"])
         tp1, tp2, sl, rr = fmt_dollar(s["tp1"]), fmt_dollar(s["tp2"]), fmt_dollar(s["sl"]), s.get("rr", 2.5)
-        spot_text.append(f"**{idx}. ${t}** `BUY` — Accumulate: `{el}–{eh}` | TP1: `{tp1}` | TP2: `{tp2}` | SL: `{sl}` (R:R {rr:.1f})")
+        tp1_pct = s.get("tp1_pct", 14.0)
+        tp2_pct = s.get("tp2_pct", 32.0)
+        sl_pct = s.get("sl_pct", 7.0)
+        spot_text.append(f"**{idx}. `[{conv:.0f}% Conviction]` ${t}** `BUY` — Accumulate: `{el}–{eh}` | TP1: `+{tp1_pct:.1f}%` ({tp1}) | TP2: `+{tp2_pct:.1f}%` ({tp2}) | SL: `-{sl_pct:.1f}%` ({sl}) (R:R {rr:.1f})")
 
     embed.add_field(name="💎 5 SPOT SWING SETUPS (1D Macro Accumulation)", value="\n".join(spot_text) if spot_text else "None", inline=False)
     view = CallSelectView(spot_sigs)
@@ -398,6 +422,32 @@ async def slash_tracked(interaction: discord.Interaction):
     await interaction.response.send_message(embed=_build_tracked_embed())
 
 
+@bot.tree.command(name="news", description="Fetch live breaking crypto news and macro sentiment")
+async def slash_news(interaction: discord.Interaction, ticker: str = "BTC"):
+    await interaction.response.defer()
+    import news_sentiment
+    report = news_sentiment.format_sentiment_report(ticker.upper())
+    embed = discord.Embed(
+        title=f"🗞️ Live Crypto News & Sentiment — ${ticker.upper()}",
+        description=report,
+        color=0xF1C40F,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="sentiment", description="Check Crypto Fear & Greed Index and institutional sentiment")
+async def slash_sentiment(interaction: discord.Interaction, ticker: str = "BTC"):
+    await interaction.response.defer()
+    import news_sentiment
+    report = news_sentiment.format_sentiment_report(ticker.upper())
+    embed = discord.Embed(
+        title=f"🌡️ Institutional Sentiment & Fear/Greed Index — ${ticker.upper()}",
+        description=report,
+        color=0x3498DB,
+    )
+    await interaction.followup.send(embed=embed)
+
+
 # Prefix Commands
 @bot.command(name="help")
 async def cmd_help(ctx: commands.Context):
@@ -439,6 +489,30 @@ async def cmd_tweet(ctx: commands.Context, ticker: str = ""):
 @bot.command(name="tracked")
 async def cmd_tracked(ctx: commands.Context):
     await ctx.send(embed=_build_tracked_embed())
+
+
+@bot.command(name="news")
+async def cmd_news(ctx: commands.Context, ticker: str = "BTC"):
+    import news_sentiment
+    report = news_sentiment.format_sentiment_report(ticker.upper())
+    embed = discord.Embed(
+        title=f"🗞️ Live Crypto News & Sentiment — ${ticker.upper()}",
+        description=report,
+        color=0xF1C40F,
+    )
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="sentiment")
+async def cmd_sentiment(ctx: commands.Context, ticker: str = "BTC"):
+    import news_sentiment
+    report = news_sentiment.format_sentiment_report(ticker.upper())
+    embed = discord.Embed(
+        title=f"🌡️ Institutional Sentiment & Fear/Greed Index — ${ticker.upper()}",
+        description=report,
+        color=0x3498DB,
+    )
+    await ctx.send(embed=embed)
 
 
 # ── External Message Broadcaster (Called by tracker and schedulers) ────────

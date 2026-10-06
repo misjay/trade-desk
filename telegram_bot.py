@@ -86,45 +86,77 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
 
     import engine
 
+    # Check which bot received this command
+    call_cfg = state.get_call_bot_config()
+    is_winz_bot = (bot_token and bot_token == call_cfg.get("token"))
+
+    # Auto-register this chat into Winz calls distribution list if interacted on Winz bot
+    if is_winz_bot:
+        state.add_call_bot_chat(chat_id)
+
     if cmd in ("/start", "/help"):
-        msg = (
-            "🤖 *Xira Autonomous Trade Desk Control*\n\n"
-            "• `/status` — Balance, equity, open positions & win stats\n"
-            "• `/positions` — Detailed active positions with live PnL & targets\n"
-            "• `/tp` — 🎯 Close all open trades currently in profit\n"
-            "• `/derisk` — 🛡️ Close 100% of winning trades & trim 50% of losers\n"
-            "• `/hourlyreport` — ⏱️ Hourly analytics breakdown & chart\n"
-            "• `/dailyreport` — 📅 Daily (24h) performance & chart\n"
-            "• `/weeklyreport` — 📆 Weekly (7d) performance & chart\n"
-            "• `/monthlyreport` — 🗓️ Monthly (30d) performance & chart\n"
-            "• `/feedback` — 🧠 Daily intelligence feedback: most lost/profit assets & learning\n"
-            "• `/hourlycalls` — 🎯 Dispatch 10 hourly manual calls (6 scalps + 4 day trades with charts)\n"
-            "• `/setcallbot <TOKEN> <CHAT_ID>` — 📢 Connect external bot for manual calls\n"
-            "• `/callbot` — 📋 View current calls bot destination\n"
-            "• `/research <COIN>` — 🔬 Institutional research note & chart (e.g. `research (day and scalp) BTC`)\n"
-            "• `/tweet [COIN]` — 🐦 Convert research into 280-char Twitter/X post\n"
-            "• `/setfeedbackbot <TOKEN> <CHAT_ID>` — 🤖 Connect another bot for daily feedback\n"
-            "• `/feedbackbot` — 📋 View current feedback bot destination\n"
-            "• `/probation` — 🧪 View 24h quarantined & 50% probation assets\n"
-            "• `/leverage <COIN> <VAL>` — ⚡ Set leverage (e.g. `/leverage BTC 10`)\n"
-            "• `/existingleverage` — 📊 Show leverage used for each asset\n"
-            "• `/avoid <COINS>` — 🚫 Blacklist assets (e.g. `/avoid DOGE PEPE`)\n"
-            "• `/allow <COINS>` — 🟢 Restore assets (e.g. `/allow DOGE`)\n"
-            "• `/avoided` — 📋 Show all currently avoided assets\n"
-            "• `/drop <COIN>` — ✂️ Close position & immediately add to avoid list\n"
-            "• `/scan` — Trigger an immediate market scalp scan\n"
-            "• `/pause` — Pause opening new orders\n"
-            "• `/resume` — Resume automatic order execution\n"
-            "• `/onspot` — 🟢 Enable Spot order execution\n"
-            "• `/offspot` — 🔴 Disable Spot orders (Perps only)\n"
-            "• `/cancelorder <COINS>` — 🚫 Cancel resting limit orders (e.g. `/cancelorder BTC`)\n"
-            "• `/cancelallorders` — 🧹 Cancel ALL resting limit orders on Bybit\n"
-            "• `/close <TICKER>` — Market close position for ticker (e.g. `/close HYPE`)\n"
-            "• `/closeall` — 🚨 Emergency market close all open positions\n"
-            "• `/help` — Show this command list\n\n"
-            "Web Dashboard: `http://localhost:8765`"
-        )
-        _reply(chat_id, msg)
+        if is_winz_bot:
+            msg = (
+                "🤖 *Winz Manual Trade Desk (1v1 & Group Hub)*\n\n"
+                "Welcome to *Winz*! You are now subscribed to automated hourly manual trading signals, charts, and real-time trade alerts.\n\n"
+                "🎯 *Trade Calls & Setups:*\n"
+                "• `/hourlycalls` — 🚨 Receive the 15 hourly trade calls (6 Scalps + 4 Day + 5 Spot)\n"
+                "• `/spot` — 💎 View the 5 Spot Accumulation setups with interactive chart buttons\n"
+                "• `/calls` — Show active tracked trade setups\n\n"
+                "🔬 *Deep Institutional Research & Charts:*\n"
+                "• `/research <COIN>` — Full structural order block thesis & chart (e.g. `/research SOL`)\n"
+                "• `/research <COIN> spot` — Spot accumulation research & macro chart\n"
+                "• `/tweet [COIN]` — 🐦 Formatted 280-char post ready to copy to Twitter/X\n\n"
+                "🗞️ *Macro Fundamentals & Sentiment:*\n"
+                "• `/news [COIN]` — Live breaking crypto news & NLP catalyst scoring\n"
+                "• `/sentiment [COIN]` — Crypto Fear & Greed Index + institutional tone\n\n"
+                "📢 *Group & Channel Setup:*\n"
+                "• Add @thewinzbot as Admin in your Telegram Group/Channel and type `/setchannel` to broadcast all signals there automatically.\n\n"
+                "_Need a quick chart? Simply tap any button on the hourly digest or type `/research BTC`._"
+            )
+        else:
+            msg = (
+                "🤖 *Xira Autonomous Trade Desk Control*\n\n"
+                "• `/status` — Balance, equity, open positions & win stats\n"
+                "• `/positions` — Detailed active positions with live PnL & targets\n"
+                "• `/tp` — 🎯 Close all open trades currently in profit\n"
+                "• `/derisk` — 🛡️ Close 100% of winning trades & trim 50% of losers\n"
+                "• `/hourlyreport` — ⏱️ Hourly analytics breakdown & chart\n"
+                "• `/dailyreport` — 📅 Daily (24h) performance & chart\n"
+                "• `/weeklyreport` — 📆 Weekly (7d) performance & chart\n"
+                "• `/monthlyreport` — 🗓️ Monthly (30d) performance & chart\n"
+                "• `/feedback` — 🧠 Daily intelligence feedback: most lost/profit assets & learning\n"
+                "• `/hourlycalls` — 🎯 Dispatch 15 hourly manual calls (6 scalps + 4 day + 5 spot)\n"
+                "• `/spot` — 💎 Dispatch 5 spot accumulation setups\n"
+                "• `/news` / `/sentiment` — 🗞️ Breaking news & Crypto Fear & Greed Index\n"
+                "• `/setchannel` — 📢 Register group/channel for automated trade signals\n"
+                "• `/setcallbot <TOKEN> <CHAT_ID>` — 📢 Connect external bot for manual calls\n"
+                "• `/callbot` — 📋 View current calls bot destination\n"
+                "• `/research <COIN>` — 🔬 Institutional research note & chart (e.g. `/research BTC`)\n"
+                "• `/tweet [COIN]` — 🐦 Convert research into 280-char Twitter/X post\n"
+                "• `/setfeedbackbot <TOKEN> <CHAT_ID>` — 🤖 Connect another bot for daily feedback\n"
+                "• `/feedbackbot` — 📋 View current feedback bot destination\n"
+                "• `/probation` — 🧪 View 24h quarantined & 50% probation assets\n"
+                "• `/leverage <COIN> <VAL>` — ⚡ Set leverage (e.g. `/leverage BTC 10`)\n"
+                "• `/existingleverage` — 📊 Show leverage used for each asset\n"
+                "• `/avoid <COINS>` — 🚫 Blacklist assets (e.g. `/avoid DOGE PEPE`)\n"
+                "• `/allow <COINS>` — 🟢 Restore assets (e.g. `/allow DOGE`)\n"
+                "• `/avoided` — 📋 Show all currently avoided assets\n"
+                "• `/drop <COIN>` — ✂️ Close position & immediately add to avoid list\n"
+                "• `/scan` — Trigger an immediate market scalp scan\n"
+                "• `/pause` — Pause opening new orders\n"
+                "• `/resume` — Resume automatic order execution\n"
+                "• `/onspot` — 🟢 Enable Spot order execution\n"
+                "• `/offspot` — 🔴 Disable Spot orders (Perps only)\n"
+                "• `/cancelorder <COINS>` — 🚫 Cancel resting limit orders\n"
+                "• `/cancelallorders` — 🧹 Cancel ALL resting limit orders on Bybit\n"
+                "• `/close <TICKER>` — Market close position for ticker\n"
+                "• `/closeall` — 🚨 Emergency market close all open positions\n"
+                "• `/help` — Show this command list\n\n"
+                "Web Dashboard: `http://localhost:8765`"
+            )
+        _reply(chat_id, msg, bot_token=bot_token)
+        return
 
     elif cmd in ("/status", "/balance"):
         bal = engine.client.get_wallet_balance("USDT")
@@ -732,16 +764,40 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
         except Exception as exc:
             _reply(chat_id, f"⚠️ Config saved, but connection error: `{exc}`.")
 
+    elif cmd in ("/setchannel", "/setgroup", "/addchannel", "/addgroup"):
+        # Auto-register the current chat (group or channel) as a destination for calls & alerts
+        state.add_call_bot_chat(chat_id)
+        chat_type_str = "Channel" if str(chat_id).startswith("-100") else "Group / Chat"
+        _reply(
+            chat_id,
+            f"✅ *{chat_type_str} Registered for Winz Calls & Alerts!*\n\n"
+            f"• *Chat ID*: `{chat_id}`\n"
+            f"• *Status*: Active destination for 15 hourly calls (6 scalps + 4 day + 5 spot) and live milestone alerts (TP1, TP2, SL, +10% gain, -20% drop).\n\n"
+            f"_Tip: Make sure @thewinzbot is promoted to Administrator with 'Post Messages' rights._",
+            bot_token=_current_bot_token,
+        )
+
+    elif cmd in ("/news", "/sentiment", "/fng"):
+        target_ticker = args[0].upper().replace("USDT", "") if args else "BTC"
+        _reply(chat_id, f"🗞 *Gathering Institutional Sentiment & Live Breaking News for ${target_ticker}...*", bot_token=_current_bot_token)
+        import news_sentiment
+        def _send_news_async(t: str, cid: str, tok: Optional[str]):
+            report = news_sentiment.format_sentiment_report(t)
+            _reply(cid, report, bot_token=tok)
+        threading.Thread(target=_send_news_async, args=(target_ticker, chat_id, _current_bot_token), daemon=True).start()
+
     elif cmd == "/callbot":
         c_cfg = state.get_call_bot_config()
         masked_tok = (c_cfg['token'][:8] + "..." + c_cfg['token'][-4:]) if len(c_cfg['token']) > 15 else "Primary Bot Token"
+        all_chats_str = ", ".join(f"`{c}`" for c in c_cfg.get("all_chats", [])) or f"`{c_cfg['chat_id']}`"
         _reply(
             chat_id,
-            f"📢 *Current Hourly Calls Destination:*\n\n"
+            f"📢 *Current Winz Calls Destinations:*\n\n"
             f"• *Bot Token*: `{masked_tok}`\n"
-            f"• *Destination Chat ID*: `{c_cfg['chat_id']}`\n\n"
-            f"To change:\n`/setcallbot <BOT_TOKEN> <CHAT_ID>`\n"
-            f"To dispatch 10 calls now:\n`/hourlycalls`"
+            f"• *Configured Chats/Channels*: {all_chats_str}\n\n"
+            f"To register this group/channel directly:\nType `/setchannel` in the group/channel\n\n"
+            f"To change master destination:\n`/setcallbot <BOT_TOKEN> <CHAT_ID>`\n"
+            f"To dispatch 15 calls now:\n`/hourlycalls`"
         )
 
     elif cmd in ("/hourlycalls", "/sendcalls"):
@@ -1072,6 +1128,9 @@ BOT_COMMANDS = [
     {"command": "monthlyreport", "description": "🗓️ Monthly 30d analytics report & chart"},
     {"command": "hourlycalls", "description": "🎯 Dispatch 15 hourly manual calls (6 scalp + 4 day + 5 spot)"},
     {"command": "spot", "description": "💎 Dispatch 5 spot accumulation setups with buttons"},
+    {"command": "news", "description": "🗞️ Live breaking crypto news & macro sentiment"},
+    {"command": "sentiment", "description": "🌡️ Crypto Fear & Greed Index + tone analysis"},
+    {"command": "setchannel", "description": "📢 Register current group/channel for Winz calls"},
     {"command": "setcallbot", "description": "📢 Connect external bot for manual calls"},
     {"command": "callbot", "description": "View current calls bot destination"},
     {"command": "feedback", "description": "🧠 Daily feedback, worst/best assets & learning"},
@@ -1112,6 +1171,13 @@ def register_bot_commands() -> bool:
         fb_tok = fb_cfg.get("token")
         if fb_tok and fb_tok not in tokens:
             tokens.append(fb_tok)
+    except Exception:
+        pass
+    try:
+        call_cfg = state.get_call_bot_config()
+        c_tok = call_cfg.get("token")
+        if c_tok and c_tok not in tokens:
+            tokens.append(c_tok)
     except Exception:
         pass
 

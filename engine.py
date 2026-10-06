@@ -22,6 +22,7 @@ Enforces:
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 import uuid
@@ -40,6 +41,7 @@ from config import (
     MAX_SLIPPAGE_PCT,
     MAX_FUNDING_RATE,
     VERTICAL_CANDLE_BODY_PCT,
+    get_sector,
 )
 import notifier
 from notifier import (
@@ -71,6 +73,112 @@ def reload_client() -> None:
         mode=cfg.trade_mode,
         demo_env=cfg.effective_demo_env,
     )
+
+
+def fmt_dollar(val: Optional[float]) -> str:
+    """Format dollar amount cleanly for alerts."""
+    if val is None or math.isnan(val):
+        return "—"
+    if val >= 10000:
+        return f"${val:,.0f}"
+    if val >= 1000:
+        return f"${val:,.1f}"
+    if val >= 10:
+        return f"${val:.2f}"
+    if val >= 0.1:
+        return f"${val:.4f}"
+    return f"${val:.6f}"
+
+
+# ── Hummingbot Inventory Skew & Portfolio Balance ──────────────────────────
+def check_portfolio_inventory_skew(target_side: str) -> Tuple[bool, str]:
+    """
+    Hummingbot Avellaneda-Stoikov Inventory Skew & Portfolio Balance Rule.
+    Prevents holding a one-sided correlated directional basket (e.g. 5 short altcoins simultaneously).
+    Rules:
+      1. Directional Count Cap: Max cfg.max_directional_positions (default 3) in the same direction
+         if 0 opposing positions exist.
+      2. Net Notional Ratio: Directional notional must not exceed cfg.max_directional_ratio (65%)
+         of total portfolio notional when 2 or more total positions are open.
+    """
+    open_pos = state.get_open_positions()
+    if not open_pos:
+        return True, "Inventory balanced (no open positions)"
+
+    long_positions = [p for p in open_pos.values() if p.get("side", "").upper() == "BUY"]
+    short_positions = [p for p in open_pos.values() if p.get("side", "").upper() == "SELL"]
+
+    target_side_upper = target_side.upper()
+
+    # Rule 1: Directional Count Skew (e.g. max 3 shorts if 0 longs)
+    if target_side_upper == "SELL":
+        if len(short_positions) >= cfg.max_directional_positions and len(long_positions) == 0:
+            return False, (
+                f"Hummingbot inventory skew: Portfolio holds {len(short_positions)} active SHORTs "
+                f"and 0 LONGs (cap={cfg.max_directional_positions}). Additional short blocked to prevent basket correlation."
+            )
+    elif target_side_upper == "BUY":
+        if len(long_positions) >= cfg.max_directional_positions and len(short_positions) == 0:
+            return False, (
+                f"Hummingbot inventory skew: Portfolio holds {len(long_positions)} active LONGs "
+                f"and 0 SHORTs (cap={cfg.max_directional_positions}). Additional long blocked to prevent basket correlation."
+            )
+
+    # Rule 2: Directional Net Notional Ratio (when >= 2 positions open)
+    if len(open_pos) >= 2:
+        long_notional = sum(float(p.get("qty", 0.0)) * float(p.get("entry_price", 0.0)) for p in long_positions)
+        short_notional = sum(float(p.get("qty", 0.0)) * float(p.get("entry_price", 0.0)) for p in short_positions)
+        total_notional = long_notional + short_notional
+
+        if total_notional > 0:
+            ratio_short = short_notional / total_notional
+            ratio_long = long_notional / total_notional
+
+            if target_side_upper == "SELL" and ratio_short >= cfg.max_directional_ratio:
+                return False, (
+                    f"Hummingbot inventory skew: Net short notional is {ratio_short*100:.1f}% "
+                    f"of portfolio (>= {cfg.max_directional_ratio*100:.0f}% cap). Additional short rejected."
+                )
+            elif target_side_upper == "BUY" and ratio_long >= cfg.max_directional_ratio:
+                return False, (
+                    f"Hummingbot inventory skew: Net long notional is {ratio_long*100:.1f}% "
+                    f"of portfolio (>= {cfg.max_directional_ratio*100:.0f}% cap). Additional long rejected."
+                )
+
+    return True, "Inventory skew acceptable"
+
+
+def check_sector_basket_exposure(ticker: str) -> Tuple[bool, str]:
+    """
+    Narrative & Ecosystem Sector Basket Concentration Cap:
+    Prevents holding too many correlated assets from the same niche
+    (e.g., SOL + SUI + APT + AVAX all crashing simultaneously during an L1 rotation).
+    """
+    if not cfg.enable_sector_caps:
+        return True, "Sector caps disabled"
+
+    sector = get_sector(ticker)
+    if sector in ("OTHER", "MAJORS"):
+        # Majors and uncategorized assets follow standard portfolio caps
+        return True, "Majors/unrestricted sector"
+
+    open_pos = state.get_open_positions()
+    sector_positions = [
+        p for p in open_pos.values()
+        if get_sector(p.get("ticker", "")) == sector
+    ]
+
+    # Special rule: Memecoins (DOGE, PEPE) strictly capped at 1 position
+    cap = 1 if sector == "MEME" else cfg.max_sector_positions
+
+    if len(sector_positions) >= cap:
+        held_tickers = [p.get("ticker") for p in sector_positions]
+        return False, (
+            f"Sector concentration cap: Basket '{sector}' already has {len(sector_positions)} "
+            f"active positions ({', '.join(held_tickers)}, cap={cap}). New {ticker} order rejected."
+        )
+
+    return True, f"Sector {sector} capacity available"
 
 
 # ── Balance & Risk Sizing (0.5% balance risk) ───────────────────────────────
@@ -134,13 +242,16 @@ def compute_position_size(
     max_safe_margin = equity * 0.80  # don't tie up more than 80% equity in one trade
 
     if not client.is_paper:
-        avail_bal = client.get_wallet_balance("USDT").get("available", 0.0)
+        wb = client.get_wallet_balance("USDT")
+        avail_bal = wb.get("available", 0.0)
+        if avail_bal <= 0.0 and not client.is_live:
+            avail_bal = equity
         min_buffer = equity * cfg.min_free_margin_pct
-        if avail_bal < min_buffer:
+        if avail_bal < min_buffer and client.is_live:
             return 0.0, 0.0, f"Available margin ${avail_bal:,.2f} below {int(cfg.min_free_margin_pct*100)}% buffer (${min_buffer:,.2f})"
         if avail_bal > 0:
             max_safe_margin = min(max_safe_margin, avail_bal * 0.50)
-        elif avail_bal == 0.0:
+        elif avail_bal == 0.0 and client.is_live:
             return 0.0, 0.0, "Available margin exhausted by existing open positions"
 
     if required_margin > max_safe_margin:
@@ -281,6 +392,7 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
     entry_high = float(sig["entry_high"])
     tp1 = float(sig["tp1"]) if sig.get("tp1") is not None else None
     tp2 = float(sig["tp2"]) if sig.get("tp2") is not None else None
+    tp3 = float(sig["tp3"]) if sig.get("tp3") is not None else None
     sl = float(sig["sl"]) if sig.get("sl") is not None else None
 
     if sl is None:
@@ -306,6 +418,12 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
         log.info("Max concurrent positions reached (%d/%d), rejecting %s", len(open_pos), cfg.max_concurrent_positions, ticker)
         return {"status": "REJECTED", "reason": f"Max concurrent positions cap reached ({len(open_pos)}/{cfg.max_concurrent_positions})"}
 
+    # Hummingbot Inventory Skew & Directional Balance Rule
+    skew_ok, skew_reason = check_portfolio_inventory_skew(side)
+    if not skew_ok:
+        log.info("Execution rejected for %s %s: %s", ticker, side, skew_reason)
+        return {"status": "REJECTED", "reason": skew_reason}
+
     valid, reason = validate_execution_conditions(
         ticker=ticker,
         side=side,
@@ -317,14 +435,32 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
         log.info("Validation failed for %s %s: %s", ticker, side, reason)
         return {"status": "INVALID", "reason": reason}
 
-    # Sizing (0.5% balance risk)
+    # Dynamic Kelly Risk Sizing (conviction & weekend volatility regime adjustment)
+    effective_risk_pct = cfg.risk_per_trade
+    conviction = sig.get("conviction", 80)
+    now_utc = datetime.now(timezone.utc)
+    is_weekend = now_utc.weekday() in (5, 6)  # Saturday or Sunday
+
+    if cfg.enable_dynamic_kelly_sizing:
+        if is_weekend:
+            # Scale down to preserve capital during low liquidity chop
+            effective_risk_pct = cfg.risk_weekend_chop
+            log.info("Weekend chop regime: Applied defensive sizing risk=%.2f%% for %s", effective_risk_pct * 100, ticker)
+        elif conviction >= 92:
+            # Scale up on A+ setups (multi-confluence, OI flush reversal, order book absorption)
+            effective_risk_pct = cfg.risk_a_plus
+            log.info("A+ Setup detected (conviction=%d): Applied Kelly scaled risk=%.2f%% for %s", conviction, effective_risk_pct * 100, ticker)
+        else:
+            effective_risk_pct = cfg.risk_standard
+
+    # Sizing calculation
     perp_qty, spot_qty, size_note = compute_position_size(
         ticker=ticker,
         entry_price=entry_mid,
         sl=sl,
         equity=equity,
         leverage=lev,
-        risk_pct=cfg.risk_per_trade,
+        risk_pct=effective_risk_pct,
     )
     if perp_qty <= 0:
         log.warning("Position sizing returned 0 for %s: %s", ticker, size_note)
@@ -357,6 +493,10 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
 
     perp_order_id = None
     spot_order_id = None
+    placed_order_ids: List[str] = []
+    is_micro_grid = False
+    partial_tp_placed = False
+    partial_tp_order_id = None
 
     # ── 1. Execute PERP Block ────────────────────────────────────────────────
     use_market_order = False
@@ -382,51 +522,112 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
                     log.info("Executing MARKET order for Tier A %s %s: mark $%.4f is inside band with slip %.3f%%",
                              ticker, side, current_mark, slip_pct)
 
-        perp_order_type = "Market" if use_market_order else "Limit"
-        perp_tif = "IOC" if use_market_order else "GTC"
-        perp_order_price = None if use_market_order else perp_limit_price
-
-        # Position-level TP targets TP2 (runner), SL targets perp_sl
         target_tp = perp_tp2 if perp_tp2 else perp_tp1
-        resp = client.place_order(
-            category="linear",
-            symbol=perp_sym,
-            side=side,
-            order_type=perp_order_type,
-            qty=perp_qty,
-            price=perp_order_price,
-            time_in_force=perp_tif,
-            stop_loss=perp_sl,
-            take_profit=target_tp,
-        )
-        partial_tp_placed = False
-        partial_tp_order_id = None
-        if resp:
-            perp_order_id = resp.get("orderId")
-            # If market order executed (instant fill), brief pause to allow Bybit position update before reduceOnly order
-            if use_market_order and perp_tp1 and perp_tp2:
-                time.sleep(0.4)
-                half_qty = client.quantize_qty(perp_sym, perp_qty * 0.5, category="linear")
-                tp_side = "Sell" if side.upper() == "BUY" else "Buy"
-                if half_qty > 0:
-                    tp_resp = client.place_order(
-                        category="linear",
-                        symbol=perp_sym,
-                        side=tp_side,
-                        order_type="Limit",
-                        qty=half_qty,
-                        price=perp_tp1,
-                        time_in_force="GTC",
-                        reduce_only=True,
-                    )
-                    if tp_resp:
-                        partial_tp_placed = True
-                        partial_tp_order_id = tp_resp.get("orderId")
-                        log.info("Placed 50%% Partial TP reduceOnly order on Bybit for %s @$%.4f (qty=%.4f ID=%s)",
-                                 ticker, perp_tp1, half_qty, partial_tp_order_id)
+
+        if use_market_order:
+            resp = client.place_order(
+                category="linear",
+                symbol=perp_sym,
+                side=side,
+                order_type="Market",
+                qty=perp_qty,
+                price=None,
+                time_in_force="IOC",
+                stop_loss=perp_sl,
+                take_profit=target_tp,
+            )
+            if resp:
+                perp_order_id = resp.get("orderId")
+                if perp_order_id:
+                    placed_order_ids.append(perp_order_id)
+                # If market order executed (instant fill), brief pause to allow Bybit position update before reduceOnly order
+                if perp_tp1 and perp_tp2:
+                    time.sleep(0.4)
+                    half_qty = client.quantize_qty(perp_sym, perp_qty * 0.5, category="linear")
+                    tp_side = "Sell" if side.upper() == "BUY" else "Buy"
+                    if half_qty > 0:
+                        tp_resp = client.place_order(
+                            category="linear",
+                            symbol=perp_sym,
+                            side=tp_side,
+                            order_type="Limit",
+                            qty=half_qty,
+                            price=perp_tp1,
+                            time_in_force="GTC",
+                            reduce_only=True,
+                        )
+                        if tp_resp:
+                            partial_tp_placed = True
+                            partial_tp_order_id = tp_resp.get("orderId")
+                            log.info("Placed 50%% Partial TP reduceOnly order on Bybit for %s @$%.4f (qty=%.4f ID=%s)",
+                                     ticker, perp_tp1, half_qty, partial_tp_order_id)
+        else:
+            # Passivbot Micro-Grid Staggered Limit Placement across entry band
+            p_near = entry_high if side.upper() == "BUY" else entry_low
+            p_deep = entry_low if side.upper() == "BUY" else entry_high
+
+            if ticker == "PEPE":
+                p_near *= 1000.0
+                p_deep *= 1000.0
+
+            q_near = client.quantize_qty(perp_sym, perp_qty * 0.5, category="linear")
+            q_deep = client.quantize_qty(perp_sym, perp_qty - q_near, category="linear")
+            info_perp = client.get_instrument_info(perp_sym, category="linear")
+            min_q = info_perp.get("min_qty", 0.0)
+
+            if cfg.enable_micro_grid_entry and q_near >= min_q and q_deep >= min_q and abs(p_near - p_deep) > 0:
+                is_micro_grid = True
+                log.info("Passivbot Micro-Grid: Placing 2 staggered Post-Only limits for %s %s: 50%% @$%.4f (qty=%.4f), 50%% @$%.4f (qty=%.4f)",
+                         ticker, side, p_near, q_near, p_deep, q_deep)
+                resp1 = client.place_order(
+                    category="linear",
+                    symbol=perp_sym,
+                    side=side,
+                    order_type="Limit",
+                    qty=q_near,
+                    price=p_near,
+                    time_in_force="PostOnly",
+                    stop_loss=perp_sl,
+                    take_profit=target_tp,
+                )
+                if resp1 and resp1.get("orderId"):
+                    placed_order_ids.append(resp1.get("orderId"))
+
+                resp2 = client.place_order(
+                    category="linear",
+                    symbol=perp_sym,
+                    side=side,
+                    order_type="Limit",
+                    qty=q_deep,
+                    price=p_deep,
+                    time_in_force="PostOnly",
+                    stop_loss=perp_sl,
+                    take_profit=target_tp,
+                )
+                if resp2 and resp2.get("orderId"):
+                    placed_order_ids.append(resp2.get("orderId"))
+
+                perp_order_id = placed_order_ids[0] if placed_order_ids else None
+            else:
+                resp = client.place_order(
+                    category="linear",
+                    symbol=perp_sym,
+                    side=side,
+                    order_type="Limit",
+                    qty=perp_qty,
+                    price=perp_limit_price,
+                    time_in_force="PostOnly",
+                    stop_loss=perp_sl,
+                    take_profit=target_tp,
+                )
+                if resp and resp.get("orderId"):
+                    perp_order_id = resp.get("orderId")
+                    placed_order_ids.append(perp_order_id)
     else:
         # Paper simulation: simulate resting limit order / instant fill at shelf mid
         perp_order_id = f"sim_perp_{uuid.uuid4().hex[:8]}"
+        placed_order_ids = [perp_order_id, f"sim_perp_g2_{uuid.uuid4().hex[:8]}"]
+        is_micro_grid = cfg.enable_micro_grid_entry
         partial_tp_placed = False
         partial_tp_order_id = None
 
@@ -441,9 +642,12 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
         "qty": perp_qty,
         "tp1": tp1,
         "tp2": tp2,
+        "tp3": tp3,
         "sl": sl,
         "leverage": lev,
         "order_id": perp_order_id,
+        "order_ids": placed_order_ids,
+        "micro_grid": is_micro_grid,
         "partial_tp_placed": partial_tp_placed,
         "partial_tp_order_id": partial_tp_order_id,
         "status": "WORKING" if (not client.is_paper and not use_market_order) else "OPEN",
@@ -515,6 +719,7 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
             "qty": spot_qty,
             "tp1": tp1,
             "tp2": tp2,
+            "tp3": tp3,
             "sl": sl,
             "leverage": 1,
             "order_id": spot_order_id,
@@ -790,31 +995,57 @@ def _sync_with_bybit() -> None:
             matched_pos = new_pos
             matched_id = pos_id
 
-        # Check TP1 Trailing SL condition (adjust Bybit SL to Break-Even)
-        # Check Early Break-Even condition (at 50% distance to TP1 / +1R progress)
+        # Check Early Break-Even / Multi-Step Ratchet Trail condition
         tp1 = matched_pos.get("tp1")
-        if tp1 and not matched_pos.get("be_trailed") and not matched_pos.get("tp1_hit"):
-            early_be = False
-            if b_side == "BUY":
-                be_trigger = b_entry + (tp1 - b_entry) * 0.50
-                if b_mark >= be_trigger:
-                    early_be = True
-            elif b_side == "SELL":
-                be_trigger = b_entry - (b_entry - tp1) * 0.50
-                if b_mark <= be_trigger:
-                    early_be = True
+        b_sl_orig = float(matched_pos.get("sl", b_entry))
+        risk_dist = abs(b_entry - b_sl_orig) if abs(b_entry - b_sl_orig) > 0 else (b_entry * 0.01)
 
-            if early_be:
+        if cfg.enable_ratchet_trail and not matched_pos.get("tp2_hit"):
+            curr_r = (b_mark - b_entry) / risk_dist if b_side == "BUY" else (b_entry - b_mark) / risk_dist
+
+            # Level 3 Ratchet: at +1.75R progress, lock in +0.75R guaranteed profit on Bybit
+            if curr_r >= 1.75 and not matched_pos.get("ratchet_l3"):
+                lock_p = round(b_entry + (risk_dist * 0.75) if b_side == "BUY" else b_entry - (risk_dist * 0.75), 8)
+                log.info("Ratchet Level 3 (+1.75R) reached on Bybit for %s %s! Locking +0.75R @%.4f", ticker, b_side, lock_p)
+                state.update_open_position(matched_id, {"ratchet_l3": True, "be_trailed": True, "sl": lock_p})
+                matched_pos["ratchet_l3"] = True
+                matched_pos["sl"] = lock_p
+                be_sl = lock_p * 1000.0 if ticker == "PEPE" else lock_p
+                client.set_trading_stop(sym, stop_loss=be_sl)
+                notifier.send_text(
+                    f"🔒 *Profit Lock Ratchet Active: {ticker}*\n\n"
+                    f"• *Current Gain*: +{curr_r:.2f}R (`{fmt_dollar(b_mark)}`)\n"
+                    f"• *Action*: Exchange Stop Loss shifted to **+{0.75:.2f}R** profit (`{fmt_dollar(lock_p)}`)\n"
+                    f"• *Status*: Trade guaranteed to close in green."
+                )
+            # Level 2 Ratchet: at +1.0R progress, move to Break-Even on Bybit
+            elif curr_r >= 1.0 and not matched_pos.get("be_trailed"):
                 log.info("Early +1R reached for %s %s! Trailing SL to Break-Even @%.4f", ticker, b_side, b_entry)
-                state.update_open_position(matched_id, {"be_trailed": True})
+                state.update_open_position(matched_id, {"be_trailed": True, "sl": b_entry})
                 matched_pos["be_trailed"] = True
+                matched_pos["sl"] = b_entry
                 be_sl = b_entry * 1000.0 if ticker == "PEPE" else b_entry
                 client.set_trading_stop(sym, stop_loss=be_sl)
                 notifier.send_text(
                     f"🛡️ *Capital Protection Active: {ticker}*\n\n"
-                    f"• *Progress*: +1R (50% progress to TP1) reached at `{fmt_dollar(b_mark)}`\n"
+                    f"• *Progress*: +{curr_r:.2f}R reached at `{fmt_dollar(b_mark)}`\n"
                     f"• *Action*: Exchange Stop Loss shifted to Break-Even (`{fmt_dollar(b_entry)}`)\n"
                     f"• *Downside Risk*: **$0.00** (Risk-free trade)"
+                )
+            # Level 1 Ratchet: at +0.70R progress, cut max loss by 50% (-0.5R)
+            elif curr_r >= 0.70 and not matched_pos.get("ratchet_l1") and not matched_pos.get("be_trailed"):
+                half_sl = round(b_entry - (risk_dist * 0.50) if b_side == "BUY" else b_entry + (risk_dist * 0.50), 8)
+                log.info("Ratchet Level 1 (+0.70R) reached on Bybit for %s %s! Reduced risk to -0.5R @%.4f", ticker, b_side, half_sl)
+                state.update_open_position(matched_id, {"ratchet_l1": True, "sl": half_sl})
+                matched_pos["ratchet_l1"] = True
+                matched_pos["sl"] = half_sl
+                half_sl_val = half_sl * 1000.0 if ticker == "PEPE" else half_sl
+                client.set_trading_stop(sym, stop_loss=half_sl_val)
+                notifier.send_text(
+                    f"⚡ *Progressive Risk Reduction: {ticker}*\n\n"
+                    f"• *Progress*: +{curr_r:.2f}R reached at `{fmt_dollar(b_mark)}`\n"
+                    f"• *Action*: Exchange Stop Loss tightened to -0.5R (`{fmt_dollar(half_sl)}`)\n"
+                    f"• *Downside Risk*: Cut in half (50% max drawdown reduction)"
                 )
 
         # Check TP1 Trailing SL condition (adjust Bybit SL to Break-Even)
@@ -834,6 +1065,32 @@ def _sync_with_bybit() -> None:
                 client.set_trading_stop(sym, stop_loss=be_sl)
                 notifier.notify_tp1_be(matched_pos, b_mark)
 
+        # Passivbot / Freqtrade Unstucking / Time-Decay Derisking:
+        # If position has been open > cfg.unstuck_timeout_minutes without reaching TP1:
+        if not matched_pos.get("be_trailed") and not matched_pos.get("tp1_hit") and not matched_pos.get("unstuck"):
+            opened_at_str = matched_pos.get("opened_at")
+            if opened_at_str:
+                try:
+                    open_dt = datetime.fromisoformat(opened_at_str.replace("Z", "+00:00"))
+                    age_mins = (datetime.now(timezone.utc) - open_dt).total_seconds() / 60.0
+                    if age_mins >= cfg.unstuck_timeout_minutes:
+                        is_profitable = (b_side == "BUY" and b_mark >= b_entry) or (b_side == "SELL" and b_mark <= b_entry)
+                        if is_profitable:
+                            log.info("Passivbot Unstucking: %s %s open %.1f mins with stalled momentum. Trailing SL to BE.", ticker, b_side, age_mins)
+                            state.update_open_position(matched_id, {"be_trailed": True, "unstuck": True})
+                            matched_pos["be_trailed"] = True
+                            matched_pos["unstuck"] = True
+                            be_sl = b_entry * 1000.0 if ticker == "PEPE" else b_entry
+                            client.set_trading_stop(sym, stop_loss=be_sl)
+                            notifier.send_text(
+                                f"⚡ *Passivbot Unstucking Routine Active: {ticker}*\n\n"
+                                f"• *Duration*: Position active for {int(age_mins)} mins without reaching TP1.\n"
+                                f"• *Action*: Exchange Stop Loss shifted to Break-Even (`{fmt_dollar(b_entry)}`).\n"
+                                f"• *Risk*: Adverse reversal drawdown eliminated."
+                            )
+                except Exception as exc:
+                    log.debug("Error checking unstuck for %s: %s", ticker, exc)
+
     # 4. Working orders & spot check
     open_linear_orders = client.get_open_orders(category="linear")
     linear_order_ids = {o.get("orderId") for o in open_linear_orders if o.get("orderId")}
@@ -841,14 +1098,39 @@ def _sync_with_bybit() -> None:
     spot_order_ids = {o.get("orderId") for o in open_spot_orders if o.get("orderId")}
 
     # Cancel any resting orders older than 20 minutes (TTL) to prevent capital lockup
+    # Or adaptively re-peg maker orders inside shelf if price starts moving away
     now_ms = int(time.time() * 1000)
     for o in open_linear_orders:
         created_time = int(o.get("createdTime", 0) or 0)
-        if created_time > 0 and (now_ms - created_time) > (20 * 60 * 1000):
-            oid = o.get("orderId")
-            sym = o.get("symbol")
-            log.info("Cancelling expired linear resting order: %s %s ID=%s", sym, o.get("side"), oid)
+        oid = o.get("orderId")
+        sym = o.get("symbol")
+        side = o.get("side")
+        order_price = float(o.get("price", 0.0) or 0.0)
+        age_ms = now_ms - created_time
+
+        if created_time > 0 and age_ms > (20 * 60 * 1000):
+            log.info("Cancelling expired linear resting order: %s %s ID=%s", sym, side, oid)
             client.cancel_order("linear", sym, oid)
+        elif cfg.enable_adaptive_maker_pegging and created_time > 0 and (3 * 60 * 1000) <= age_ms <= (15 * 60 * 1000):
+            # Check if live mark is drifting away while order is unfilled
+            tick = client.get_ticker(sym, category="linear")
+            if tick and order_price > 0:
+                mark = float(tick.get("mark_price", 0.0) or 0.0)
+                # If BUY and mark is drifting 0.20% higher than resting bid:
+                if side.upper() == "BUY" and (mark - order_price) / order_price >= 0.0020:
+                    pegged_p = client.quantize_price(sym, order_price * 1.0008, category="linear")
+                    if pegged_p < mark:
+                        log.info("Adaptive Maker Pegging: Nudging %s BUY limit from $%.4f to $%.4f (mark=$%.4f)", sym, order_price, pegged_p, mark)
+                        client.cancel_order("linear", sym, oid)
+                        # Re-quote pegged limit order
+                        client.place_order(category="linear", symbol=sym, side="BUY", order_type="Limit", qty=float(o.get("qty")), price=pegged_p, time_in_force="PostOnly")
+                # If SELL and mark is drifting 0.20% lower than resting ask:
+                elif side.upper() == "SELL" and (order_price - mark) / order_price >= 0.0020:
+                    pegged_p = client.quantize_price(sym, order_price * 0.9992, category="linear")
+                    if pegged_p > mark:
+                        log.info("Adaptive Maker Pegging: Nudging %s SELL limit from $%.4f to $%.4f (mark=$%.4f)", sym, order_price, pegged_p, mark)
+                        client.cancel_order("linear", sym, oid)
+                        client.place_order(category="linear", symbol=sym, side="SELL", order_type="Limit", qty=float(o.get("qty")), price=pegged_p, time_in_force="PostOnly")
 
     for o in open_spot_orders:
         created_time = int(o.get("createdTime", 0) or 0)
@@ -864,7 +1146,8 @@ def _sync_with_bybit() -> None:
             sym = bybit_linear_symbol(p["ticker"])
             if sym not in bybit_syms:
                 order_id = p.get("order_id")
-                if order_id and order_id in linear_order_ids:
+                order_ids = p.get("order_ids", [])
+                if (order_id and order_id in linear_order_ids) or any(oid in linear_order_ids for oid in order_ids):
                     continue
                 log.info("PERP position %s is neither active nor resting on Bybit. Removing.", p["ticker"])
                 state.remove_open_position(pid)
@@ -907,32 +1190,192 @@ def _monitor_paper_positions() -> None:
         tp2 = pos.get("tp2")
         sl = pos.get("sl")
 
+        # Check Early Break-Even condition (+1R / 50% progress to TP1)
+        entry_p = float(pos.get("entry_price", 0.0))
+        orig_sl = float(pos.get("sl", entry_p))
+        risk_dist = abs(entry_p - orig_sl) if abs(entry_p - orig_sl) > 0 else (entry_p * 0.01)
+
+        # Multi-Step Dynamic Ratchet Trail (+0.75R to cut loss 50%, +1.0R to Break-Even, +1.75R to lock profit)
+        if cfg.enable_ratchet_trail and not pos.get("tp2_hit"):
+            curr_r = (live - entry_p) / risk_dist if side == "BUY" else (entry_p - live) / risk_dist
+            current_sl = float(pos.get("sl", orig_sl))
+
+            # Level 3 Ratchet: at +1.75R progress, lock in +0.75R guaranteed profit
+            if curr_r >= 1.75 and not pos.get("ratchet_l3"):
+                lock_price = round(entry_p + (risk_dist * 0.75) if side == "BUY" else entry_p - (risk_dist * 0.75), 8)
+                log.info("Ratchet Level 3 (+1.75R) hit for %s %s: Lock +0.75R profit @%.4f", ticker, side, lock_price)
+                state.update_open_position(pos_id, {"ratchet_l3": True, "sl": lock_price, "be_trailed": True})
+                pos["ratchet_l3"] = True
+                pos["sl"] = lock_price
+                notifier.send_text(
+                    f"🔒 *Profit Lock Ratchet Active: {ticker}*\n\n"
+                    f"• *Current Gain*: +{curr_r:.2f}R (`{fmt_dollar(live)}`)\n"
+                    f"• *Action*: Trailed Stop Loss to **+{0.75:.2f}R** profit (`{fmt_dollar(lock_price)}`)\n"
+                    f"• *Status*: Trade cannot finish with less than +0.75R gain."
+                )
+            # Level 2 Ratchet: at +1.0R progress, move to Break-Even
+            elif curr_r >= 1.0 and not pos.get("be_trailed"):
+                log.info("Ratchet Level 2 (+1.0R) reached for paper %s %s! Trailing SL to BE @%.4f", ticker, side, entry_p)
+                state.update_open_position(pos_id, {"be_trailed": True, "sl": entry_p})
+                pos["be_trailed"] = True
+                pos["sl"] = entry_p
+                notifier.send_text(
+                    f"🛡️ *Capital Protection Active: {ticker}*\n\n"
+                    f"• *Progress*: +{curr_r:.2f}R reached at `{fmt_dollar(live)}`\n"
+                    f"• *Action*: Stop Loss shifted to Break-Even (`{fmt_dollar(entry_p)}`)\n"
+                    f"• *Downside Risk*: **$0.00** (Risk-free trade)"
+                )
+            # Level 1 Ratchet: at +0.70R progress, cut max loss by 50% (-0.5R)
+            elif curr_r >= 0.70 and not pos.get("ratchet_l1") and not pos.get("be_trailed"):
+                half_sl = round(entry_p - (risk_dist * 0.50) if side == "BUY" else entry_p + (risk_dist * 0.50), 8)
+                log.info("Ratchet Level 1 (+0.70R) reached for %s %s! Reduced risk to -0.5R @%.4f", ticker, side, half_sl)
+                state.update_open_position(pos_id, {"ratchet_l1": True, "sl": half_sl})
+                pos["ratchet_l1"] = True
+                pos["sl"] = half_sl
+                notifier.send_text(
+                    f"⚡ *Progressive Risk Reduction: {ticker}*\n\n"
+                    f"• *Progress*: +{curr_r:.2f}R reached at `{fmt_dollar(live)}`\n"
+                    f"• *Action*: Stop Loss tightened to -0.5R (`{fmt_dollar(half_sl)}`)\n"
+                    f"• *Downside Risk*: Cut in half (50% max drawdown reduction)"
+                )
+
+        # Passivbot Unstucking: If open > cfg.unstuck_timeout_minutes and profitable/flat, trail SL to BE
+        if not pos.get("be_trailed") and not pos.get("tp1_hit") and not pos.get("unstuck"):
+            opened_at_str = pos.get("opened_at")
+            if opened_at_str:
+                try:
+                    open_dt = datetime.fromisoformat(opened_at_str.replace("Z", "+00:00"))
+                    age_mins = (datetime.now(timezone.utc) - open_dt).total_seconds() / 60.0
+                    if age_mins >= cfg.unstuck_timeout_minutes:
+                        is_profitable = (side == "BUY" and live >= entry_p) or (side == "SELL" and live <= entry_p)
+                        if is_profitable:
+                            log.info("Passivbot Unstucking (Paper): %s %s open %.1f mins. Trailed SL to BE.", ticker, side, age_mins)
+                            state.update_open_position(pos_id, {"be_trailed": True, "unstuck": True, "sl": entry_p})
+                            pos["be_trailed"] = True
+                            pos["unstuck"] = True
+                            pos["sl"] = entry_p
+                            notifier.send_text(
+                                f"⚡ *Passivbot Unstucking Routine Active: {ticker}*\n\n"
+                                f"• *Duration*: Position active for {int(age_mins)} mins without hitting TP1.\n"
+                                f"• *Action*: Trailed Stop Loss to Break-Even (`{fmt_dollar(entry_p)}`).\n"
+                                f"• *Risk*: Adverse reversal drawdown eliminated."
+                            )
+                except Exception as exc:
+                    log.debug("Error checking paper unstuck for %s: %s", ticker, exc)
+
+        # Volume Climax & Liquidation Flush Early Stop (Emergency Cut):
+        # If price slices past entry towards SL with extreme selling/buying volume (>3x avg), exit early
+        # to save 50%-65% of the designated risk capital instead of waiting for the full -1.0R SL.
+        if cfg.enable_climax_early_cut and not pos.get("be_trailed"):
+            is_adverse_break = (side == "BUY" and live < entry_p) or (side == "SELL" and live > entry_p)
+            if is_adverse_break:
+                curr_loss_r = (entry_p - live) / risk_dist if side == "BUY" else (live - entry_p) / risk_dist
+                # If currently at -0.40R to -0.85R loss, check if 15m volume spiked aggressively
+                if 0.40 <= curr_loss_r < 0.95:
+                    df_check = scanner.fetch_ohlcv(ticker, tf_minutes=15, limit=6)
+                    if df_check is not None and len(df_check) >= 4:
+                        v_latest = float(df_check["volume"].iloc[-1])
+                        v_avg = float(df_check["volume"].iloc[-4:-1].mean())
+                        if v_avg > 0 and (v_latest / v_avg) >= 2.8:
+                            log.warning("Volume Climax Early Cut triggered for %s %s: volume spike %.1fx, loss=-%.2fR", ticker, side, v_latest / v_avg, curr_loss_r)
+                            closed = state.close_position(pos_id, live, f"CLIMAX_EARLY_CUT (-{curr_loss_r:.2f}R)")
+                            if closed:
+                                notifier.send_text(
+                                    f"🚨 *Volume Climax Early Cut Active: {ticker}*\n\n"
+                                    f"• *Side*: {side} | *Exit*: `{fmt_dollar(live)}`\n"
+                                    f"• *Volume Spike*: **{v_latest/v_avg:.1f}x** normal 15m volume against shelf\n"
+                                    f"• *Capital Saved*: Closed at **-{curr_loss_r:.2f}R** instead of full -1.0R SL!\n"
+                                    f"• *Saved Risk*: ~{int((1.0 - curr_loss_r)*100)}% of risk budget preserved."
+                                )
+                                notifier.notify_trade_closed(closed)
+                            continue
+
+        tp3 = pos.get("tp3")
+
         if side == "BUY":
             if sl is not None and live <= sl:
                 closed = state.close_position(pos_id, live, "SL_HIT")
                 if closed:
                     notifier.notify_trade_closed(closed)
-            elif tp2 is not None and live >= tp2:
-                closed = state.close_position(pos_id, live, "TP2_HIT")
+            elif tp3 is not None and live >= tp3 and pos.get("tp2_hit"):
+                closed = state.close_position(pos_id, live, "TP3_RUNNER_HIT")
                 if closed:
                     notifier.notify_trade_closed(closed)
+            elif tp2 is not None and live >= tp2 and not pos.get("tp2_hit"):
+                tp1_lock = tp1 if tp1 else entry_p
+                state.update_open_position(pos_id, {
+                    "tp2_hit": True,
+                    "runner_active": True,
+                    "sl": tp1_lock,
+                    "runner_peak": live,
+                })
+                pos["tp2_hit"] = True
+                pos["runner_active"] = True
+                pos["sl"] = tp1_lock
+                pos["runner_peak"] = live
+                notifier.send_text(
+                    f"🚀 *TP2 Target Hit (+2.5R): {ticker}*\n\n"
+                    f"• *Price*: `{fmt_dollar(live)}`\n"
+                    f"• *Action*: Banked second tranche (35% size).\n"
+                    f"• *Stop Loss Trailed*: Locked at TP1 (`{fmt_dollar(tp1_lock)}`) — Guaranteed profit secured!\n"
+                    f"• *30% Runner*: Dynamic trailing stop active targeting TP3 expansion (`{fmt_dollar(tp3)}`)."
+                )
             elif tp1 is not None and live >= tp1 and not pos.get("tp1_hit"):
-                state.update_open_position(pos_id, {"tp1_hit": True, "sl": pos["entry_price"]})
+                state.update_open_position(pos_id, {"tp1_hit": True, "be_trailed": True, "sl": entry_p})
                 pos["tp1_hit"] = True
+                pos["be_trailed"] = True
+                pos["sl"] = entry_p
                 notifier.notify_tp1_be(pos, live)
+            elif pos.get("runner_active"):
+                peak = pos.get("runner_peak", live)
+                if live > peak:
+                    pos["runner_peak"] = live
+                    trail_dist = abs(entry_p - float(pos.get("sl", entry_p))) * 0.5
+                    new_sl = max(float(pos.get("sl", entry_p)), live - trail_dist)
+                    state.update_open_position(pos_id, {"runner_peak": live, "sl": new_sl})
+                    pos["sl"] = new_sl
         else:  # SELL
             if sl is not None and live >= sl:
                 closed = state.close_position(pos_id, live, "SL_HIT")
                 if closed:
                     notifier.notify_trade_closed(closed)
-            elif tp2 is not None and live <= tp2:
-                closed = state.close_position(pos_id, live, "TP2_HIT")
+            elif tp3 is not None and live <= tp3 and pos.get("tp2_hit"):
+                closed = state.close_position(pos_id, live, "TP3_RUNNER_HIT")
                 if closed:
                     notifier.notify_trade_closed(closed)
+            elif tp2 is not None and live <= tp2 and not pos.get("tp2_hit"):
+                tp1_lock = tp1 if tp1 else entry_p
+                state.update_open_position(pos_id, {
+                    "tp2_hit": True,
+                    "runner_active": True,
+                    "sl": tp1_lock,
+                    "runner_trough": live,
+                })
+                pos["tp2_hit"] = True
+                pos["runner_active"] = True
+                pos["sl"] = tp1_lock
+                pos["runner_trough"] = live
+                notifier.send_text(
+                    f"🚀 *TP2 Target Hit (+2.5R): {ticker}*\n\n"
+                    f"• *Price*: `{fmt_dollar(live)}`\n"
+                    f"• *Action*: Banked second tranche (35% size).\n"
+                    f"• *Stop Loss Trailed*: Locked at TP1 (`{fmt_dollar(tp1_lock)}`) — Guaranteed profit secured!\n"
+                    f"• *30% Runner*: Dynamic trailing stop active targeting TP3 expansion (`{fmt_dollar(tp3)}`)."
+                )
             elif tp1 is not None and live <= tp1 and not pos.get("tp1_hit"):
-                state.update_open_position(pos_id, {"tp1_hit": True, "sl": pos["entry_price"]})
+                state.update_open_position(pos_id, {"tp1_hit": True, "be_trailed": True, "sl": entry_p})
                 pos["tp1_hit"] = True
+                pos["be_trailed"] = True
+                pos["sl"] = entry_p
                 notifier.notify_tp1_be(pos, live)
+            elif pos.get("runner_active"):
+                trough = pos.get("runner_trough", live)
+                if live < trough:
+                    pos["runner_trough"] = live
+                    trail_dist = abs(float(pos.get("sl", entry_p)) - entry_p) * 0.5
+                    new_sl = min(float(pos.get("sl", entry_p)), live + trail_dist)
+                    state.update_open_position(pos_id, {"runner_trough": live, "sl": new_sl})
+                    pos["sl"] = new_sl
 
 
 def _monitor_loop() -> None:

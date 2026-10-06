@@ -28,21 +28,25 @@ _tracker_running = False
 
 def _send_alert(msg: str) -> None:
     """Send alert to Telegram calls destination and Discord if configured."""
-    # 1. Telegram dispatch
     call_cfg = state.get_call_bot_config()
     tok = call_cfg.get("token") or cfg.call_bot_token or cfg.telegram_token
-    cid = call_cfg.get("chat_id") or cfg.call_bot_chat_id or cfg.telegram_chat_id
-    if tok and cid:
+    chats = call_cfg.get("all_chats")
+    if not chats:
+        cid = call_cfg.get("chat_id") or cfg.call_bot_chat_id or cfg.telegram_chat_id
+        chats = [cid] if cid else []
+
+    if tok and chats:
         url = f"https://api.telegram.org/bot{tok}/sendMessage"
-        try:
-            requests.post(url, json={
-                "chat_id": cid,
-                "text": msg,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": True,
-            }, timeout=8)
-        except Exception as exc:
-            log.warning("Telegram call tracker alert failed: %s", exc)
+        for target_chat in chats:
+            try:
+                requests.post(url, json={
+                    "chat_id": target_chat,
+                    "text": msg,
+                    "parse_mode": "Markdown",
+                    "disable_web_page_preview": True,
+                }, timeout=8)
+            except Exception as exc:
+                log.warning("Telegram call tracker alert failed for chat %s: %s", target_chat, exc)
 
     # 2. Discord dispatch (via winz_discord if running)
     try:
