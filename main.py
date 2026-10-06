@@ -225,9 +225,24 @@ def run_scan_cycle(trade_type: str = "scalp", manual: bool = False):
             state.save_signal(sig)
             continue
 
+        # Hummingbot Inventory Skew & Net Directional Exposure Balancing
+        skew_ok, skew_reason = engine.check_portfolio_inventory_skew(side)
+        if not skew_ok:
+            log.info("Inventory skew cap reached: Skipping automated order for %s %s (%s)", ticker, side, skew_reason)
+            state.save_signal(sig)
+            continue
+
+        # Narrative & Ecosystem Sector Basket Exposure Cap
+        sector_ok, sector_reason = engine.check_sector_basket_exposure(ticker)
+        if not sector_ok:
+            log.info("Sector basket cap reached: Skipping automated order for %s (%s)", ticker, sector_reason)
+            state.save_signal(sig)
+            continue
+
         # Execute order on Bybit (Demo or Live) since no active position exists and not paused
         res = engine.execute_signal(sig)
-        executed_count += 1
+        if res.get("status") == "SUCCESS":
+            executed_count += 1
         log.info("Execution result for %s: %s", ticker, res)
 
         # Save to state store after execution
@@ -278,6 +293,52 @@ def _setup_scheduler():
         name="Hourly Calls Dispatch (10 Calls: 6 Scalp + 4 Day)",
         replace_existing=True,
     )
+    from apscheduler.triggers.cron import CronTrigger
+    _scheduler.add_job(
+        lambda: notifier.send_daily_recap(),
+        trigger=CronTrigger(hour=11, minute=59, timezone="UTC"),
+        id="daily_recap_1159",
+        name="Daily Recap (11:59 AM UTC)",
+        replace_existing=True,
+    )
+    if cfg.enable_daily_pruning:
+        _scheduler.add_job(
+            run_daily_pruning_job,
+            trigger=IntervalTrigger(hours=24),
+            id="daily_pruning_matrix",
+            name="Daily Ticker Pruning & Quarantine Matrix (24h)",
+            replace_existing=True,
+        )
+
+
+def run_daily_pruning_job():
+    """
+    Automated Daily Ticker Pruning:
+    Runs backtester across core & active universe over the past 150 candles (~37 hours of 15m data).
+    If any ticker has Profit Factor < 0.90 with >= 2 trades, automatically quarantines the ticker
+    to avoid trading bleeding assets and alerts the desk via Telegram.
+    """
+    log.info("Running daily ticker pruning and performance audit...")
+    try:
+        from backtester import XiraBacktester
+        bt = XiraBacktester()
+        res = bt.run_all(limit=150)
+        underperformers = res.get("underperformers", [])
+        if underperformers:
+            log.warning("Daily Pruning Matrix identified underperforming assets: %s", underperformers)
+            for t in underperformers:
+                state.quarantine_asset(t, hours=24.0, reason="Daily Pruner: Profit Factor < 0.90")
+            notifier.send_text(
+                f"🛡 *Automated Daily Pruner Alert*\n"
+                f"Backtest matrix quarantined underperforming assets for 24h:\n"
+                f"• *Quarantined*: {', '.join(underperformers)}\n"
+                f"• *Cash Cows*: {', '.join(res.get('cash_cows', [])[:5])}\n"
+                f"Bot will avoid taking new positions on these names until structural edge returns."
+            )
+        else:
+            log.info("Daily Pruning Matrix: All assets performing within risk parameters.")
+    except Exception as exc:
+        log.error("Daily pruning job failed: %s", exc)
 
 
 # ── One-shot Desk Report ────────────────────────────────────────────────────
@@ -359,7 +420,19 @@ def main():
     _setup_scheduler()
     _scheduler.start()
 
-    # Initial scan
+    # Dispatch initial batch of Winz hourly calls and spot setups immediately on launch
+    def _delayed_initial_calls():
+        time.sleep(3)
+        try:
+            import market_research
+            log.info("Dispatching initial batch of Winz hourly calls & spot trades...")
+            market_research.dispatch_hourly_calls()
+        except Exception as exc:
+            log.warning("Initial calls dispatch failed: %s", exc)
+
+    threading.Thread(target=_delayed_initial_calls, daemon=True, name="init-calls").start()
+
+    # Initial scan for automated execution
     run_scan_cycle("scalp")
 
     log.info("Xira Trade Desk Bot is running. Press Ctrl+C to terminate.")
