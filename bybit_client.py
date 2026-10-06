@@ -72,10 +72,8 @@ class BybitClient:
     def base_url(self) -> str:
         if self.is_live:
             return _BYBIT_MAINNET
-        if self.demo_env == "testnet":
+        if self.demo_env in ("testnet", "demo"):
             return _BYBIT_TESTNET
-        if self.demo_env == "demo":
-            return _BYBIT_DEMO
         # For paper trading, market data is fetched from Mainnet for genuine liquidity
         return _BYBIT_MAINNET
 
@@ -104,33 +102,51 @@ class BybitClient:
     # ── HTTP Requests ─────────────────────────────────────────────────────────
     def request(self, method: str, path: str, params: Optional[dict] = None, data: Optional[dict] = None) -> Optional[dict]:
         ts = str(int(time.time() * 1000))
-        url = f"{self.base_url}{path}"
-        payload_str = ""
-
-        if method.upper() == "GET":
-            query_str = urlencode(params or {})
-            payload_str = query_str
-            if query_str:
-                url = f"{url}?{query_str}"
-            headers = self._headers(ts, payload_str)
-            try:
-                r = self.session.get(url, headers=headers, timeout=10)
-                r.raise_for_status()
-                return r.json()
-            except Exception as exc:
-                log.error("Bybit GET %s failed: %s", path, exc)
-                return None
+        hosts = [self.base_url]
+        if "testnet" in self.base_url:
+            if "bytick" in self.base_url:
+                hosts.append("https://api-testnet.bybit.com")
+            else:
+                hosts.append("https://api-testnet.bytick.com")
         else:
-            body = data if data is not None else (params or {})
-            payload_str = json.dumps(body, separators=(",", ":"))
-            headers = self._headers(ts, payload_str)
-            try:
-                r = self.session.post(url, data=payload_str, headers=headers, timeout=10)
-                r.raise_for_status()
-                return r.json()
-            except Exception as exc:
-                log.error("Bybit POST %s failed: %s", path, exc)
-                return None
+            if "bytick" in self.base_url:
+                hosts.append("https://api.bybit.com")
+            else:
+                hosts.append("https://api.bytick.com")
+
+        last_exc = None
+        for host in hosts:
+            url = f"{host}{path}"
+            payload_str = ""
+
+            if method.upper() == "GET":
+                query_str = urlencode(params or {})
+                payload_str = query_str
+                if query_str:
+                    url = f"{url}?{query_str}"
+                headers = self._headers(ts, payload_str)
+                try:
+                    r = self.session.get(url, headers=headers, timeout=5)
+                    r.raise_for_status()
+                    return r.json()
+                except Exception as exc:
+                    last_exc = exc
+                    continue
+            else:
+                body = data if data is not None else (params or {})
+                payload_str = json.dumps(body, separators=(",", ":"))
+                headers = self._headers(ts, payload_str)
+                try:
+                    r = self.session.post(url, data=payload_str, headers=headers, timeout=5)
+                    r.raise_for_status()
+                    return r.json()
+                except Exception as exc:
+                    last_exc = exc
+                    continue
+
+        if last_exc:
+            log.error("Bybit %s %s failed on all hosts: %s", method.upper(), path, last_exc)
+        return None
 
     # ── Market Data ───────────────────────────────────────────────────────────
     def get_ticker(self, symbol: str, category: str = "linear") -> Optional[dict]:
@@ -211,6 +227,124 @@ class BybitClient:
         effective_price = accum_cost / accum_qty
         slip_pct = abs(effective_price - mid) / mid * 100
         return (effective_price, slip_pct)
+
+    def compute_depth_imbalance(self, orderbook: dict, depth_levels: int = 25) -> Dict[str, Any]:
+        """
+        Compute order book depth imbalance (bid vs ask liquidity pressure).
+        ratio = bid_notional / (bid_notional + ask_notional)
+        ratio >= 0.58: Institutional Bid Wall / Absorption at Support (Long Confluence)
+        ratio <= 0.42: Heavy Ask Pressure / Wall at Resistance (Short Confluence)
+        """
+        if not orderbook:
+            return {"ratio": 0.5, "state": "BALANCED", "bid_notional": 0.0, "ask_notional": 0.0}
+
+        bids = orderbook.get("bids", [])[:depth_levels]
+        asks = orderbook.get("asks", [])[:depth_levels]
+
+        bid_notional = sum(p * s for p, s in bids)
+        ask_notional = sum(p * s for p, s in asks)
+        total = bid_notional + ask_notional
+
+        if total <= 0:
+            return {"ratio": 0.5, "state": "BALANCED", "bid_notional": 0.0, "ask_notional": 0.0}
+
+        ratio = bid_notional / total
+        if ratio >= 0.58:
+            state_str = "BID_HEAVY"
+        elif ratio <= 0.42:
+            state_str = "ASK_HEAVY"
+        else:
+            state_str = "BALANCED"
+
+        return {
+            "ratio": round(ratio, 4),
+            "state": state_str,
+            "bid_notional": round(bid_notional, 2),
+            "ask_notional": round(ask_notional, 2),
+        }
+
+    def find_liquidity_wall(self, orderbook: dict, side: str, target_price: float, tolerance_pct: float = 0.015) -> Optional[float]:
+        """
+        Locate significant limit walls in the order book near a target TP price.
+        If a massive cluster (>= 3x average level size) sits right at/near the target,
+        return a front-run price just inside the wall to ensure clean execution before rejection.
+        - side == 'BUY': We are LONG, selling into ASKS at TP. Front-run by placing slightly BELOW the ask wall.
+        - side == 'SELL': We are SHORT, buying into BIDS at TP. Front-run by placing slightly ABOVE the bid wall.
+        """
+        if not orderbook:
+            return None
+
+        # Look in asks if taking profit on a LONG, bids if taking profit on a SHORT
+        levels = orderbook.get("asks", []) if side.upper() == "BUY" else orderbook.get("bids", [])
+        if not levels or len(levels) < 3:
+            return None
+
+        # Calculate average level size
+        avg_notional = sum(p * s for p, s in levels) / len(levels)
+        if avg_notional <= 0:
+            return None
+
+        best_wall_price = None
+        for price, size in levels:
+            notional = price * size
+            # Check if within tolerance band of target_price
+            dist_pct = abs(price - target_price) / target_price if target_price > 0 else 1.0
+            if dist_pct <= tolerance_pct and notional >= (avg_notional * 2.5):
+                # Detected heavy liquidity wall!
+                if side.upper() == "BUY" and price <= target_price:
+                    # Place 0.05% below the ask wall
+                    best_wall_price = price * 0.9995
+                elif side.upper() == "SELL" and price >= target_price:
+                    # Place 0.05% above the bid wall
+                    best_wall_price = price * 1.0005
+                break
+
+        return best_wall_price
+
+    def get_open_interest_delta(self, symbol: str) -> Dict[str, Any]:
+        """
+        Fetch Bybit Open Interest and compute 15m delta:
+        Returns: {
+          "oi_current": float,
+          "oi_prev": float,
+          "delta_pct": float,
+          "is_liquidation_flush": bool,
+          "is_fakeout_risk": bool
+        }
+        """
+        res = self.request("GET", "/v5/market/open-interest", {
+            "category": "linear",
+            "symbol": symbol,
+            "intervalTime": "15min",
+            "limit": 3,
+        })
+        if not res or res.get("retCode") != 0:
+            return {"delta_pct": 0.0, "is_liquidation_flush": False, "is_fakeout_risk": False}
+
+        oi_list = res.get("result", {}).get("list", [])
+        if len(oi_list) < 2:
+            return {"delta_pct": 0.0, "is_liquidation_flush": False, "is_fakeout_risk": False}
+
+        try:
+            curr_oi = float(oi_list[0].get("openInterest", 0.0) or 0.0)
+            prev_oi = float(oi_list[1].get("openInterest", 0.0) or 0.0)
+            if prev_oi <= 0:
+                return {"delta_pct": 0.0, "is_liquidation_flush": False, "is_fakeout_risk": False}
+
+            delta_pct = (curr_oi - prev_oi) / prev_oi * 100.0
+            is_flush = (delta_pct <= -1.5)
+            is_fakeout = (delta_pct <= -1.0)
+
+            return {
+                "oi_current": curr_oi,
+                "oi_prev": prev_oi,
+                "delta_pct": round(delta_pct, 2),
+                "is_liquidation_flush": is_flush,
+                "is_fakeout_risk": is_fakeout,
+            }
+        except Exception as exc:
+            log.debug("Error parsing OI for %s: %s", symbol, exc)
+            return {"delta_pct": 0.0, "is_liquidation_flush": False, "is_fakeout_risk": False}
 
     def get_klines(self, symbol: str, interval: str = "15", limit: int = 100, category: str = "linear") -> List[dict]:
         """Fetch historical klines. Bybit returns descending, reversed to ascending."""
