@@ -124,8 +124,8 @@ def check_portfolio_inventory_skew(target_side: str) -> Tuple[bool, str]:
                 f"and 0 SHORTs (cap={cfg.max_directional_positions}). Additional long blocked to prevent basket correlation."
             )
 
-    # Rule 2: Directional Net Notional Ratio (when >= 2 positions open)
-    if len(open_pos) >= 2:
+    # Rule 2: Directional Net Notional Ratio (when both long and short positions exist)
+    if len(long_positions) > 0 and len(short_positions) > 0:
         long_notional = sum(float(p.get("qty", 0.0)) * float(p.get("entry_price", 0.0)) for p in long_positions)
         short_notional = sum(float(p.get("qty", 0.0)) * float(p.get("entry_price", 0.0)) for p in short_positions)
         total_notional = long_notional + short_notional

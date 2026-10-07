@@ -699,6 +699,8 @@ class BybitClient:
         params: Dict[str, Any] = {"category": category, "openOnly": 0}
         if symbol:
             params["symbol"] = symbol
+        elif category == "linear":
+            params["settleCoin"] = "USDT"
         res = self.request("GET", "/v5/order/realtime", params)
         if not res or res.get("retCode") != 0:
             return []

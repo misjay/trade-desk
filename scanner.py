@@ -459,10 +459,16 @@ def analyze_ticker(ticker: str, trade_type: str = "scalp") -> dict:
 
         risk = entry_high - sl
         if risk > 0:
-            tp1 = round(max(struct["mid_range"], entry_high + (risk * 1.5)), 8)
-            tp2_target = max(sup_high, struct["session_high"])
-            tp2 = round(max(tp2_target, tp1 + (risk * 1.0)), 8)
-            tp3 = round(max(struct["session_high"], tp2 + (risk * 1.5)), 8)
+            if trade_type == "scalp":
+                # Fast scalp targets: 1.5R to 2.5R quick capture within 15-45 minutes
+                tp1 = round(entry_high + (risk * 1.5), 8)
+                tp2 = round(entry_high + (risk * 2.5), 8)
+                tp3 = round(min(struct["session_high"], entry_high + (risk * 3.5)), 8)
+            else:
+                tp1 = round(max(struct["mid_range"], entry_high + (risk * 1.5)), 8)
+                tp2_target = max(sup_high, struct["session_high"])
+                tp2 = round(max(tp2_target, tp1 + (risk * 1.0)), 8)
+                tp3 = round(max(struct["session_high"], tp2 + (risk * 1.5)), 8)
 
             # Precision Edge: Order Book Liquidity Wall Front-Running
             if cfg.enable_wall_frontrun and ob:
@@ -596,10 +602,16 @@ def analyze_ticker(ticker: str, trade_type: str = "scalp") -> dict:
 
         risk = sl - entry_low
         if risk > 0:
-            tp1 = round(min(struct["mid_range"], entry_low - (risk * 1.5)), 8)
-            tp2_target = min(dem_low, struct["session_low"])
-            tp2 = round(min(tp2_target, tp1 - (risk * 1.0)), 8)
-            tp3 = round(min(struct["session_low"], tp2 - (risk * 1.5)), 8)
+            if trade_type == "scalp":
+                # Fast scalp targets: 1.5R to 2.5R quick capture within 15-45 minutes
+                tp1 = round(entry_low - (risk * 1.5), 8)
+                tp2 = round(entry_low - (risk * 2.5), 8)
+                tp3 = round(max(struct["session_low"], entry_low - (risk * 3.5)), 8)
+            else:
+                tp1 = round(min(struct["mid_range"], entry_low - (risk * 1.5)), 8)
+                tp2_target = min(dem_low, struct["session_low"])
+                tp2 = round(min(tp2_target, tp1 - (risk * 1.0)), 8)
+                tp3 = round(min(struct["session_low"], tp2 - (risk * 1.5)), 8)
 
             # Precision Edge: Order Book Liquidity Wall Front-Running
             if cfg.enable_wall_frontrun and ob:
