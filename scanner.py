@@ -443,7 +443,8 @@ def analyze_ticker(ticker: str, trade_type: str = "scalp") -> dict:
                     )
 
         # Freqtrade Regime Filter: Block counter-trend Long in macro bear market
-        if cfg.enable_market_regime_filter and (ticker_regime == "STRONG_BEAR" or btc_regime == "STRONG_BEAR"):
+        is_bear_locked = (ticker_regime == "STRONG_BEAR") or (trade_type == "day" and btc_regime == "STRONG_BEAR")
+        if cfg.enable_market_regime_filter and is_bear_locked:
             log.info("Regime filter blocked BUY on %s: Market in STRONG_BEAR (ticker=%s, btc=%s)", ticker, ticker_regime, btc_regime)
             return _make_wait(
                 ticker, live, tf_str,
@@ -586,7 +587,8 @@ def analyze_ticker(ticker: str, trade_type: str = "scalp") -> dict:
                     )
 
         # Freqtrade Regime Filter: Block counter-trend Short in macro bull market
-        if cfg.enable_market_regime_filter and (ticker_regime == "STRONG_BULL" or btc_regime == "STRONG_BULL"):
+        is_bull_locked = (ticker_regime == "STRONG_BULL") or (trade_type == "day" and btc_regime == "STRONG_BULL")
+        if cfg.enable_market_regime_filter and is_bull_locked:
             log.info("Regime filter blocked SELL on %s: Market in STRONG_BULL (ticker=%s, btc=%s)", ticker, ticker_regime, btc_regime)
             return _make_wait(
                 ticker, live, tf_str,
