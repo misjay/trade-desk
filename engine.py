@@ -1017,9 +1017,8 @@ def _sync_with_bybit() -> None:
         # Watchdog: Ensure every active position always has a hard exchange Stop Loss on Bybit
         if b_sl is None and not matched_pos.get("sl_attached"):
             def_sl = float(matched_pos.get("sl") or 0.0)
-            if not def_sl:
-                # Default to 1.0% defensive stop from entry
-                def_sl = round(b_entry * 0.99 if b_side == "BUY" else b_entry * 1.01, 4)
+            if not def_sl or (b_side == "BUY" and def_sl >= b_mark) or (b_side == "SELL" and def_sl <= b_mark):
+                def_sl = round(b_mark * 0.992 if b_side == "BUY" else b_mark * 1.008, 4)
                 state.update_open_position(matched_id, {"sl": def_sl})
                 matched_pos["sl"] = def_sl
             be_sl = def_sl * 1000.0 if ticker == "PEPE" else def_sl
