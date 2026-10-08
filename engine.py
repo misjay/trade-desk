@@ -418,6 +418,20 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
         log.info("Max concurrent positions reached (%d/%d), rejecting %s", len(open_pos), cfg.max_concurrent_positions, ticker)
         return {"status": "REJECTED", "reason": f"Max concurrent positions cap reached ({len(open_pos)}/{cfg.max_concurrent_positions})"}
 
+    # Per-Ticker Duplicate & Stacking Guard: Never open a duplicate position on the same ticker
+    for p in open_pos.values():
+        if p.get("ticker") == ticker and p.get("status") in ("OPEN", "WORKING"):
+            log.info("Execution rejected for %s %s: Ticker already has active %s position (ID=%s)",
+                     ticker, side, p.get("status"), p.get("id"))
+            return {"status": "REJECTED", "reason": f"Active {p.get('status')} position already exists for {ticker}"}
+
+    perp_sym_check = bybit_linear_symbol(ticker)
+    for bp in client.get_active_positions():
+        if bp.get("symbol") == perp_sym_check and float(bp.get("size", 0) or 0) > 0:
+            log.info("Execution rejected for %s %s: Bybit already has live %s position of size %s",
+                     ticker, side, bp.get("side"), bp.get("size"))
+            return {"status": "REJECTED", "reason": f"Live Bybit position already open for {perp_sym_check}"}
+
     # Hummingbot Inventory Skew & Directional Balance Rule
     skew_ok, skew_reason = check_portfolio_inventory_skew(side)
     if not skew_ok:
@@ -997,8 +1011,21 @@ def _sync_with_bybit() -> None:
 
         # Check Early Break-Even / Multi-Step Ratchet Trail condition
         tp1 = matched_pos.get("tp1")
-        b_sl_orig = float(matched_pos.get("sl", b_entry))
+        b_sl_orig = float(matched_pos.get("sl") or b_entry)
         risk_dist = abs(b_entry - b_sl_orig) if abs(b_entry - b_sl_orig) > 0 else (b_entry * 0.01)
+
+        # Watchdog: Ensure every active position always has a hard exchange Stop Loss on Bybit
+        if b_sl is None and not matched_pos.get("sl_attached"):
+            def_sl = float(matched_pos.get("sl") or 0.0)
+            if not def_sl:
+                # Default to 1.0% defensive stop from entry
+                def_sl = round(b_entry * 0.99 if b_side == "BUY" else b_entry * 1.01, 4)
+                state.update_open_position(matched_id, {"sl": def_sl})
+                matched_pos["sl"] = def_sl
+            be_sl = def_sl * 1000.0 if ticker == "PEPE" else def_sl
+            log.warning("Watchdog: Attaching missing Stop Loss on Bybit for %s %s @%.4f", ticker, b_side, be_sl)
+            if client.set_trading_stop(sym, stop_loss=be_sl):
+                matched_pos["sl_attached"] = True
 
         if cfg.enable_ratchet_trail and not matched_pos.get("tp2_hit"):
             curr_r = (b_mark - b_entry) / risk_dist if b_side == "BUY" else (b_entry - b_mark) / risk_dist
