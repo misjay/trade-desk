@@ -42,6 +42,7 @@ from config import (
     MAX_FUNDING_RATE,
     VERTICAL_CANDLE_BODY_PCT,
     get_sector,
+    is_volatile_ticker,
 )
 import notifier
 from notifier import (
@@ -49,6 +50,7 @@ from notifier import (
     notify_order_placed,
     notify_entry_filled,
     notify_tp1_be,
+    notify_tp2_lock,
     notify_trade_closed,
 )
 import state
@@ -557,24 +559,60 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
                 # If market order executed (instant fill), brief pause to allow Bybit position update before reduceOnly order
                 if perp_tp1 and perp_tp2:
                     time.sleep(0.4)
-                    half_qty = client.quantize_qty(perp_sym, perp_qty * 0.5, category="linear")
                     tp_side = "Sell" if side.upper() == "BUY" else "Buy"
-                    if half_qty > 0:
-                        tp_resp = client.place_order(
-                            category="linear",
-                            symbol=perp_sym,
-                            side=tp_side,
-                            order_type="Limit",
-                            qty=half_qty,
-                            price=perp_tp1,
-                            time_in_force="GTC",
-                            reduce_only=True,
-                        )
-                        if tp_resp:
+                    is_volatile = is_volatile_ticker(ticker) or cfg.enable_three_tier_scaleout
+                    if is_volatile:
+                        # 3-Tier Model: 33% @ TP1, 33% @ TP2, 34% dynamic runner
+                        q_tp1 = client.quantize_qty(perp_sym, perp_qty * 0.33, category="linear")
+                        q_tp2 = client.quantize_qty(perp_sym, perp_qty * 0.33, category="linear")
+                        t1_resp = None
+                        t2_resp = None
+                        if q_tp1 > 0:
+                            t1_resp = client.place_order(
+                                category="linear",
+                                symbol=perp_sym,
+                                side=tp_side,
+                                order_type="Limit",
+                                qty=q_tp1,
+                                price=perp_tp1,
+                                time_in_force="GTC",
+                                reduce_only=True,
+                            )
+                        if q_tp2 > 0 and perp_tp2:
+                            t2_resp = client.place_order(
+                                category="linear",
+                                symbol=perp_sym,
+                                side=tp_side,
+                                order_type="Limit",
+                                qty=q_tp2,
+                                price=perp_tp2,
+                                time_in_force="GTC",
+                                reduce_only=True,
+                            )
+                        if t1_resp or t2_resp:
                             partial_tp_placed = True
-                            partial_tp_order_id = tp_resp.get("orderId")
-                            log.info("Placed 50%% Partial TP reduceOnly order on Bybit for %s @$%.4f (qty=%.4f ID=%s)",
-                                     ticker, perp_tp1, half_qty, partial_tp_order_id)
+                            partial_tp_order_id = t1_resp.get("orderId") if t1_resp else (t2_resp.get("orderId") if t2_resp else None)
+                            log.info("Placed 3-Tier Partial TPs on Bybit for volatile %s: Tier 1 (33%% @ $%.4f, ID=%s), Tier 2 (33%% @ $%.4f, ID=%s), Runner=34%%",
+                                     ticker, perp_tp1, t1_resp.get("orderId") if t1_resp else "N/A",
+                                     perp_tp2, t2_resp.get("orderId") if t2_resp else "N/A")
+                    else:
+                        half_qty = client.quantize_qty(perp_sym, perp_qty * 0.5, category="linear")
+                        if half_qty > 0:
+                            tp_resp = client.place_order(
+                                category="linear",
+                                symbol=perp_sym,
+                                side=tp_side,
+                                order_type="Limit",
+                                qty=half_qty,
+                                price=perp_tp1,
+                                time_in_force="GTC",
+                                reduce_only=True,
+                            )
+                            if tp_resp:
+                                partial_tp_placed = True
+                                partial_tp_order_id = tp_resp.get("orderId")
+                                log.info("Placed 50%% Partial TP reduceOnly order on Bybit for %s @$%.4f (qty=%.4f ID=%s)",
+                                         ticker, perp_tp1, half_qty, partial_tp_order_id)
         else:
             # Passivbot Micro-Grid Staggered Limit Placement across entry band
             p_near = entry_high if side.upper() == "BUY" else entry_low
@@ -964,27 +1002,71 @@ def _sync_with_bybit() -> None:
                 log.info("Limit order for %s filled on Bybit! Now OPEN.", ticker)
                 notifier.notify_entry_filled(matched_pos)
                 if matched_pos.get("tp1") and not matched_pos.get("partial_tp_placed"):
-                    half_qty = client.quantize_qty(sym, b_qty * 0.5, category="linear")
                     tp_side = "Sell" if b_side == "BUY" else "Buy"
                     p_tp1 = matched_pos["tp1"] * 1000.0 if ticker == "PEPE" else matched_pos["tp1"]
-                    if half_qty > 0:
-                        tp_res = client.place_order(
-                            category="linear",
-                            symbol=sym,
-                            side=tp_side,
-                            order_type="Limit",
-                            qty=half_qty,
-                            price=p_tp1,
-                            time_in_force="GTC",
-                            reduce_only=True,
-                        )
-                        if tp_res:
+                    p_tp2 = matched_pos.get("tp2")
+                    if p_tp2 and ticker == "PEPE":
+                        p_tp2 = p_tp2 * 1000.0
+
+                    is_volatile = is_volatile_ticker(ticker) or cfg.enable_three_tier_scaleout
+                    if is_volatile:
+                        # 3-Tier Model: 33% @ TP1, 33% @ TP2, 34% runner
+                        q_tp1 = client.quantize_qty(sym, b_qty * 0.33, category="linear")
+                        q_tp2 = client.quantize_qty(sym, b_qty * 0.33, category="linear")
+                        t1_res = None
+                        t2_res = None
+                        if q_tp1 > 0:
+                            t1_res = client.place_order(
+                                category="linear",
+                                symbol=sym,
+                                side=tp_side,
+                                order_type="Limit",
+                                qty=q_tp1,
+                                price=p_tp1,
+                                time_in_force="GTC",
+                                reduce_only=True,
+                            )
+                        if q_tp2 > 0 and p_tp2:
+                            t2_res = client.place_order(
+                                category="linear",
+                                symbol=sym,
+                                side=tp_side,
+                                order_type="Limit",
+                                qty=q_tp2,
+                                price=p_tp2,
+                                time_in_force="GTC",
+                                reduce_only=True,
+                            )
+                        if t1_res or t2_res:
                             state.update_open_position(matched_id, {
                                 "partial_tp_placed": True,
-                                "partial_tp_order_id": tp_res.get("orderId"),
+                                "partial_tp_order_id": t1_res.get("orderId") if t1_res else (t2_res.get("orderId") if t2_res else None),
+                                "tp1_order_id": t1_res.get("orderId") if t1_res else None,
+                                "tp2_order_id": t2_res.get("orderId") if t2_res else None,
                             })
-                            log.info("Placed 50%% Partial TP limit order on Bybit for filled %s @$%.4f (qty=%.4f ID=%s)",
-                                     ticker, p_tp1, half_qty, tp_res.get("orderId"))
+                            log.info("Placed 3-Tier Partial TPs on Bybit for filled volatile %s: Tier 1 (33%% @ $%.4f, ID=%s), Tier 2 (33%% @ $%.4f, ID=%s), Runner=34%%",
+                                     ticker, p_tp1, t1_res.get("orderId") if t1_res else "N/A",
+                                     p_tp2 if p_tp2 else 0.0, t2_res.get("orderId") if t2_res else "N/A")
+                    else:
+                        half_qty = client.quantize_qty(sym, b_qty * 0.5, category="linear")
+                        if half_qty > 0:
+                            tp_res = client.place_order(
+                                category="linear",
+                                symbol=sym,
+                                side=tp_side,
+                                order_type="Limit",
+                                qty=half_qty,
+                                price=p_tp1,
+                                time_in_force="GTC",
+                                reduce_only=True,
+                            )
+                            if tp_res:
+                                state.update_open_position(matched_id, {
+                                    "partial_tp_placed": True,
+                                    "partial_tp_order_id": tp_res.get("orderId"),
+                                })
+                                log.info("Placed 50%% Partial TP limit order on Bybit for filled %s @$%.4f (qty=%.4f ID=%s)",
+                                         ticker, p_tp1, half_qty, tp_res.get("orderId"))
         else:
             # Active on Bybit but missing locally
             pos_id = f"{ticker}_{b_side}_perp_{uuid.uuid4().hex[:8]}"
@@ -1078,6 +1160,37 @@ def _sync_with_bybit() -> None:
                     f"• *Downside Risk*: Cut in half (50% max drawdown reduction)"
                 )
 
+        tp2 = matched_pos.get("tp2")
+
+        # Check TP2 Hit condition on Bybit (Lock in TP1 profit + activate runner)
+        if tp2 and not matched_pos.get("tp2_hit"):
+            hit_tp2 = False
+            if b_side == "BUY" and b_mark >= tp2:
+                hit_tp2 = True
+            elif b_side == "SELL" and b_mark <= tp2:
+                hit_tp2 = True
+
+            if hit_tp2:
+                tp1_lock = tp1 if tp1 else b_entry
+                log.info("TP2 reached on Bybit for %s %s! Locking SL to TP1 @%.4f and activating runner", ticker, b_side, tp1_lock)
+                state.update_open_position(matched_id, {
+                    "tp2_hit": True,
+                    "tp1_hit": True,
+                    "be_trailed": True,
+                    "runner_active": True,
+                    "sl": tp1_lock,
+                    "runner_peak": b_mark if b_side == "BUY" else None,
+                    "runner_trough": b_mark if b_side == "SELL" else None,
+                })
+                matched_pos["tp2_hit"] = True
+                matched_pos["tp1_hit"] = True
+                matched_pos["be_trailed"] = True
+                matched_pos["runner_active"] = True
+                matched_pos["sl"] = tp1_lock
+                lock_sl_val = tp1_lock * 1000.0 if ticker == "PEPE" else tp1_lock
+                client.set_trading_stop(sym, stop_loss=lock_sl_val)
+                notifier.notify_tp2_lock(matched_pos, b_mark, tp1_lock)
+
         # Check TP1 Trailing SL condition (adjust Bybit SL to Break-Even)
         if tp1 and not matched_pos.get("tp1_hit"):
             hit = False
@@ -1094,6 +1207,31 @@ def _sync_with_bybit() -> None:
                 be_sl = b_entry * 1000.0 if ticker == "PEPE" else b_entry
                 client.set_trading_stop(sym, stop_loss=be_sl)
                 notifier.notify_tp1_be(matched_pos, b_mark)
+
+        # Dynamic Trailing Stop for Active Runner on Bybit
+        if matched_pos.get("runner_active"):
+            if b_side == "BUY":
+                peak = matched_pos.get("runner_peak", b_mark)
+                if b_mark > peak:
+                    matched_pos["runner_peak"] = b_mark
+                    trail_dist = abs(b_entry - float(matched_pos.get("sl", b_entry))) * 0.5
+                    new_sl = max(float(matched_pos.get("sl", b_entry)), b_mark - trail_dist)
+                    if new_sl > float(matched_pos.get("sl", b_entry)):
+                        matched_pos["sl"] = new_sl
+                        state.update_open_position(matched_id, {"runner_peak": b_mark, "sl": new_sl})
+                        sl_send = new_sl * 1000.0 if ticker == "PEPE" else new_sl
+                        client.set_trading_stop(sym, stop_loss=sl_send)
+            elif b_side == "SELL":
+                trough = matched_pos.get("runner_trough", b_mark)
+                if b_mark < trough:
+                    matched_pos["runner_trough"] = b_mark
+                    trail_dist = abs(float(matched_pos.get("sl", b_entry)) - b_entry) * 0.5
+                    new_sl = min(float(matched_pos.get("sl", b_entry)), b_mark + trail_dist)
+                    if new_sl < float(matched_pos.get("sl", b_entry)):
+                        matched_pos["sl"] = new_sl
+                        state.update_open_position(matched_id, {"runner_trough": b_mark, "sl": new_sl})
+                        sl_send = new_sl * 1000.0 if ticker == "PEPE" else new_sl
+                        client.set_trading_stop(sym, stop_loss=sl_send)
 
         # Passivbot / Freqtrade Unstucking / Time-Decay Derisking:
         # If position has been open > cfg.unstuck_timeout_minutes without reaching TP1:

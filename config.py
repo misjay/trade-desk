@@ -176,8 +176,17 @@ ALL_TICKERS: List[str] = CORE_TICKERS + EXTRA_TICKERS
 # Market order allowed ONLY on Tier A if mark inside Entry and slip < 0.15%
 MARKET_ALLOWED_TICKERS: List[str] = ["BTC", "ETH", "SOL", "XRP", "BNB"]
 
-# Hard ban: never market PEPE, TAO, ENA, HBAR, NEAR or a vertical 15m candle
 NO_MARKET_TICKERS: List[str] = ["PEPE", "TAO", "ENA", "HBAR", "NEAR"]
+
+# Volatile high-beta assets prioritized for 3-tier fast profit lock (33% @ TP1, 33% @ TP2, 34% runner)
+VOLATILE_TICKERS: List[str] = [
+    "DOGE", "ENA", "HYPE", "SUI", "ONDO", "PEPE", "WLD", "SEI", "TAO", "AVAX", "NEAR"
+]
+
+
+def is_volatile_ticker(ticker: str) -> bool:
+    """Check if ticker belongs to the volatile / high-beta cohort."""
+    return ticker.upper() in VOLATILE_TICKERS
 
 # ── Sector & Correlation Groups ─────────────────────────────────────────────
 # Prevents over-concentrated directional exposure into a single narrative/ecosystem

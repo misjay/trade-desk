@@ -961,6 +961,9 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
 
 def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_trigger_fn=None) -> None:
     last_update_id = 0
+    call_cfg = state.get_call_bot_config()
+    c_tok = call_cfg.get("token")
+
     try:
         init_url = f"https://api.telegram.org/bot{token}/getUpdates"
         init_r = requests.get(init_url, timeout=10)
@@ -980,7 +983,26 @@ def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_tri
                 data = resp.json()
                 for update in data.get("result", []):
                     last_update_id = update["update_id"]
-                    # Handle button callbacks (InlineKeyboard taps)
+
+                    # 1. Handle bot membership updates (my_chat_member) when added to a group/channel
+                    my_cm = update.get("my_chat_member")
+                    if my_cm:
+                        new_status = my_cm.get("new_chat_member", {}).get("status")
+                        if new_status in ("member", "administrator"):
+                            g_chat_id = str(my_cm.get("chat", {}).get("id"))
+                            if token == c_tok:
+                                state.add_call_bot_chat(g_chat_id)
+                                log.info("Winz bot added to group/channel %s (status=%s). Auto-registered destination.", g_chat_id, new_status)
+                                _reply(
+                                    g_chat_id,
+                                    f"🚨 *Winz 2-Hour A+ Quality Desk Connected!*\n\n"
+                                    f"• *Chat ID*: `{g_chat_id}`\n"
+                                    f"• *Status*: Active destination for top A+ trade calls & live alerts.\n\n"
+                                    f"_Tip: Ensure @thewinzbot is promoted to Admin with Post Messages rights._",
+                                    bot_token=token,
+                                )
+
+                    # 2. Handle button callbacks (InlineKeyboard taps)
                     cb_query = update.get("callback_query")
                     if cb_query:
                         cb_id = cb_query.get("id")
@@ -996,7 +1018,6 @@ def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_tri
                             pass
 
                         if cb_data.startswith("call_view_"):
-                            # format: call_view_TICKER_TF (e.g. call_view_SOL_15m or call_view_BTC_spot)
                             parts = cb_data.split("_")
                             if len(parts) >= 4:
                                 ticker = parts[2]
@@ -1022,7 +1043,8 @@ def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_tri
                                 ).start()
                         continue
 
-                    msg = update.get("message") or update.get("edited_message")
+                    # 3. Handle messages & channel posts
+                    msg = update.get("message") or update.get("edited_message") or update.get("channel_post") or update.get("edited_channel_post")
                     if not msg:
                         continue
 
@@ -1033,9 +1055,12 @@ def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_tri
                         log.warning("Ignoring message from unauthorized chat_id: %s on bot %s", chat_id, token[:10])
                         continue
 
+                    # Auto-register group if command or message received on Winz bot
+                    if token == c_tok and (chat_id.startswith("-") or chat_id.startswith("-100")):
+                        state.add_call_bot_chat(chat_id)
+
                     raw_text = text.strip()
                     lower_text = raw_text.lower()
-                    # Trigger on slash commands OR natural language research/tweet requests
                     is_cmd = (
                         raw_text.startswith("/")
                         or "convert to twitter" in lower_text

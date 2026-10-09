@@ -800,116 +800,100 @@ def send_call_research_to_feedback_bot(sig: dict) -> bool:
     return send_research_with_chart(sig, tf_minutes=tf_minutes)
 
 
-# ── Hourly Calls Dispatcher (6 Scalps + 4 Day Trades) ──────────────────────
+def get_top_a_plus_signals(limit: int = 3) -> List[Dict]:
+    """
+    Gather candidate setups across core and extra universes,
+    filter for conviction >= 90.0% and R:R >= 1.8, sort by (conviction, R:R) descending,
+    and return up to `limit` top A+ quality setups.
+    Fallback to highest R:R setups if fewer than `limit` setups hit >= 90% conviction.
+    """
+    from config import CORE_TICKERS, EXTRA_TICKERS
+    candidate_universe = CORE_TICKERS + EXTRA_TICKERS
+
+    candidates = []
+    for ticker in candidate_universe:
+        try:
+            # Check 15m scalp setup
+            sig_15m = build_signal_for_timeframe(ticker, tf_minutes=15)
+            if sig_15m and sig_15m.get("conviction", 0) >= 90.0 and sig_15m.get("rr", 0) >= 1.8:
+                candidates.append(sig_15m)
+
+            # Check 4h day setup
+            sig_4h = build_signal_for_timeframe(ticker, tf_minutes=240)
+            if sig_4h and sig_4h.get("conviction", 0) >= 90.0 and sig_4h.get("rr", 0) >= 1.8:
+                candidates.append(sig_4h)
+        except Exception as exc:
+            log.debug("Error building candidate signal for %s: %s", ticker, exc)
+
+    candidates.sort(key=lambda x: (x.get("conviction", 0), x.get("rr", 0)), reverse=True)
+
+    top_signals = []
+    seen_tickers = set()
+    for c in candidates:
+        if c["ticker"] not in seen_tickers:
+            top_signals.append(c)
+            seen_tickers.add(c["ticker"])
+        if len(top_signals) >= limit:
+            break
+
+    if len(top_signals) < limit:
+        all_avail = []
+        for ticker in candidate_universe:
+            if ticker in seen_tickers:
+                continue
+            try:
+                sig = build_signal_for_timeframe(ticker, tf_minutes=15)
+                if sig and sig.get("rr", 0) >= 1.5:
+                    all_avail.append(sig)
+            except Exception:
+                pass
+        all_avail.sort(key=lambda x: x.get("rr", 0), reverse=True)
+        for c in all_avail:
+            top_signals.append(c)
+            seen_tickers.add(c["ticker"])
+            if len(top_signals) >= limit:
+                break
+
+    return top_signals
+
+
+# ── Hourly / 2-Hour Calls Dispatcher (Max 3 Top A+ Quality Signals) ─────────
 def dispatch_hourly_calls(
     bot_token: Optional[str] = None,
     chat_id: Optional[str] = None,
 ) -> bool:
     """
-    Generate and dispatch 10 curated calls hourly (6 scalps + 4 day trades)
-    specifically designed for manual execution on external exchanges.
-    Delivers an initial index digest followed by each setup's chart markup and institutional note.
+    Generate and dispatch a maximum of 3 top-tier A+ quality signals every 2 hours
+    (filtered strictly for highest conviction >= 90% and favorable Risk:Reward).
+    Delivers a clean index digest with interactive buttons to view live charts & research notes.
     """
     call_cfg = state.get_call_bot_config()
     target_token = bot_token or call_cfg.get("token")
     target_chat = chat_id or call_cfg.get("chat_id")
 
     if not target_token or not target_chat:
-        log.warning("Hourly calls dispatch skipped: no call bot token or chat ID configured")
+        log.warning("2-Hour calls dispatch skipped: no call bot token or chat ID configured")
         return False
 
-    from config import CORE_TICKERS, EXTRA_TICKERS
-    candidate_universe = CORE_TICKERS + EXTRA_TICKERS
+    log.info("Generating top A+ quality signals (max 3) for %s...", target_chat)
 
-    log.info("Generating hourly calls (6 scalps, 4 day trades) for %s...", target_chat)
-
-    # 1. Gather 6 Scalp Setups (15m)
-    scalp_signals = []
-    for ticker in candidate_universe:
-        if len(scalp_signals) >= 6:
-            break
-        try:
-            sig = build_signal_for_timeframe(ticker, tf_minutes=15)
-            # Prioritize signals with favorable risk-reward >= 1.5
-            if sig and sig.get("rr", 0) >= 1.5:
-                scalp_signals.append(sig)
-        except Exception as exc:
-            log.debug("Error building scalp signal for %s: %s", ticker, exc)
-
-    # 2. Gather 4 Day Trade Setups (4h)
-    day_signals = []
-    # Avoid duplicate tickers if possible
-    scalp_tickers = {s["ticker"] for s in scalp_signals}
-    for ticker in candidate_universe:
-        if len(day_signals) >= 4:
-            break
-        if ticker in scalp_tickers:
-            continue
-        try:
-            sig = build_signal_for_timeframe(ticker, tf_minutes=240)
-            if sig and sig.get("rr", 0) >= 1.5:
-                day_signals.append(sig)
-        except Exception as exc:
-            log.debug("Error building day signal for %s: %s", ticker, exc)
-
-    # If day_signals still < 4, allow fallback to scalp_tickers
-    if len(day_signals) < 4:
-        for ticker in candidate_universe:
-            if len(day_signals) >= 4:
-                break
-            if any(s["ticker"] == ticker for s in day_signals):
-                continue
-            try:
-                sig = build_signal_for_timeframe(ticker, tf_minutes=240)
-                if sig:
-                    day_signals.append(sig)
-            except Exception:
-                pass
-
-    # 3. Gather 5 Spot Accumulation Setups (1D)
-    spot_signals = []
-    used_tickers = {s["ticker"] for s in scalp_signals} | {s["ticker"] for s in day_signals}
-    for ticker in candidate_universe:
-        if len(spot_signals) >= 5:
-            break
-        if ticker in used_tickers:
-            continue
-        try:
-            sig = build_spot_signal(ticker)
-            if sig:
-                spot_signals.append(sig)
-        except Exception as exc:
-            log.debug("Error building spot signal for %s: %s", ticker, exc)
-
-    if len(spot_signals) < 5:
-        for ticker in candidate_universe:
-            if len(spot_signals) >= 5:
-                break
-            if any(s["ticker"] == ticker for s in spot_signals):
-                continue
-            try:
-                sig = build_spot_signal(ticker)
-                if sig:
-                    spot_signals.append(sig)
-            except Exception:
-                pass
-
+    top_signals = get_top_a_plus_signals(limit=3)
     now_utc_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
-    # Save all 15 calls for real-time tracking
-    all_calls = scalp_signals + day_signals + spot_signals
-    state.save_tracked_calls(all_calls)
+    # Save tracked calls for real-time tracking
+    state.save_tracked_calls(top_signals)
 
     # Deliver Clean Digest with Interactive Buttons (No photo flood!)
     index_lines = [
-        "🚨 *WINZ HOURLY TRADE DESK CALLS (15 SETUPS)*",
+        "🚨 *WINZ 2-HOUR A+ QUALITY DESK (MAX 3 SETUPS)*",
         f"⏱ *Timestamp:* {now_utc_str} | _For Manual / External Exchange Trading_",
         "",
-        "⚡ *6 SCALP SETUPS (15m Timeframe):*",
+        "🎯 *TOP A+ QUALITY SETUPS (≥90% Conviction, R:R ≥ 1.8):*",
     ]
-    for idx, s in enumerate(scalp_signals, start=1):
+    for idx, s in enumerate(top_signals, start=1):
         t = s["ticker"]
         side = s["side"]
+        tf = s.get("tf", "15m")
         conv = s.get("conviction", 90.0)
         el = fmt_dollar(s["entry_low"])
         eh = fmt_dollar(s["entry_high"])
@@ -918,38 +902,7 @@ def dispatch_hourly_calls(
         sl = fmt_dollar(s["sl"])
         sl_pct = s.get("sl_pct", 1.2)
         rr = s.get("rr", 2.0)
-        index_lines.append(f"{idx}. `[{conv:.0f}% Conviction]` *${t}* `{side}` — Entry: `{el}–{eh}` | TP: `+{tp1_pct:.1f}%` ({tp1}) | SL: `-{sl_pct:.1f}%` ({sl}) (R:R {rr:.1f})")
-
-    index_lines.append("")
-    index_lines.append("🏛 *4 DAY TRADE SETUPS (4h Timeframe):*")
-    for idx, s in enumerate(day_signals, start=len(scalp_signals) + 1):
-        t = s["ticker"]
-        side = s["side"]
-        conv = s.get("conviction", 92.0)
-        el = fmt_dollar(s["entry_low"])
-        eh = fmt_dollar(s["entry_high"])
-        tp1 = fmt_dollar(s["tp1"])
-        tp1_pct = s.get("tp1_pct", 6.5)
-        sl = fmt_dollar(s["sl"])
-        sl_pct = s.get("sl_pct", 2.8)
-        rr = s.get("rr", 2.0)
-        index_lines.append(f"{idx}. `[{conv:.0f}% Conviction]` *${t}* `{side}` — Entry: `{el}–{eh}` | TP: `+{tp1_pct:.1f}%` ({tp1}) | SL: `-{sl_pct:.1f}%` ({sl}) (R:R {rr:.1f})")
-
-    index_lines.append("")
-    index_lines.append("💎 *5 SPOT ACCUMULATION SETUPS (Spot / 1D Timeframe):*")
-    for idx, s in enumerate(spot_signals, start=len(scalp_signals) + len(day_signals) + 1):
-        t = s["ticker"]
-        conv = s.get("conviction", 94.0)
-        el = fmt_dollar(s["entry_low"])
-        eh = fmt_dollar(s["entry_high"])
-        tp1 = fmt_dollar(s["tp1"])
-        tp1_pct = s.get("tp1_pct", 14.0)
-        tp2 = fmt_dollar(s["tp2"])
-        tp2_pct = s.get("tp2_pct", 32.0)
-        sl = fmt_dollar(s["sl"])
-        sl_pct = s.get("sl_pct", 7.0)
-        rr = s.get("rr", 2.5)
-        index_lines.append(f"{idx}. `[{conv:.0f}% Conviction]` *${t}* `BUY` — Accumulate: `{el}–{eh}` | TP1: `+{tp1_pct:.1f}%` ({tp1}) | TP2: `+{tp2_pct:.1f}%` ({tp2}) | SL: `-{sl_pct:.1f}%` ({sl}) (R:R {rr:.1f})")
+        index_lines.append(f"{idx}. `[{conv:.0f}% Conviction]` *${t}* `{side}` ({tf}) — Entry: `{el}–{eh}` | TP: `+{tp1_pct:.1f}%` ({tp1}) | SL: `-{sl_pct:.1f}%` ({sl}) (R:R {rr:.1f})")
 
     index_lines.append("")
     index_lines.append("👇 *Tap any asset below for its live chart markup, structure & institutional thesis:*")
@@ -957,7 +910,7 @@ def dispatch_hourly_calls(
     # Construct Inline Keyboard Buttons (2 buttons per row)
     inline_keyboard = []
     current_row = []
-    for s in all_calls:
+    for s in top_signals:
         t = s["ticker"]
         tf = s.get("tf", "15m")
         badge = "💎" if s.get("trade_type") == "spot" or tf in ("spot", "1D") else ("⚡" if tf == "15m" else "🏛")
@@ -988,17 +941,17 @@ def dispatch_hourly_calls(
         try:
             requests.post(send_url, json=payload, timeout=12)
         except Exception as exc:
-            log.warning("Failed to send hourly digest with buttons to chat %s: %s", c, exc)
+            log.warning("Failed to send 2-hour digest with buttons to chat %s: %s", c, exc)
 
     # Deliver to Discord channel if configured
     try:
         import winz_discord
-        embed, view = winz_discord._build_calls_message()
-        winz_discord.broadcast_discord_message("🚨 **Winz Hourly Trade Desk Calls (15 Setups)**", embed=embed)
+        embed, view = winz_discord._build_calls_message(top_signals)
+        winz_discord.broadcast_discord_message("🚨 **Winz 2-Hour A+ Quality Desk (Max 3 Setups)**", embed=embed)
     except Exception as exc:
         log.debug("Discord broadcast error: %s", exc)
 
-    log.info("Hourly calls digest (15 setups) successfully dispatched with interactive buttons.")
+    log.info("2-Hour calls digest (max %d setups) successfully dispatched with interactive buttons.", len(top_signals))
     return True
 
 

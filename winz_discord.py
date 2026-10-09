@@ -18,6 +18,7 @@ import io
 import logging
 import os
 import threading
+import time
 from typing import Optional
 
 try:
@@ -150,94 +151,33 @@ def _set_channel_id(cid: str) -> str:
     return str(cid)
 
 
-def _build_calls_message() -> tuple[discord.Embed, CallSelectView]:
-    from config import CORE_TICKERS, EXTRA_TICKERS
+def _build_calls_message(signals: Optional[list] = None) -> tuple[discord.Embed, CallSelectView]:
     import market_research
 
-    candidate_universe = CORE_TICKERS + EXTRA_TICKERS
-    scalp_sigs = []
-    for t in candidate_universe:
-        if len(scalp_sigs) >= 6:
-            break
-        sig = market_research.build_signal_for_timeframe(t, tf_minutes=15)
-        if sig and sig.get("rr", 0) >= 1.5:
-            scalp_sigs.append(sig)
+    if signals is None:
+        signals = market_research.get_top_a_plus_signals(limit=3)
 
-    day_sigs = []
-    scalp_t = {s["ticker"] for s in scalp_sigs}
-    for t in candidate_universe:
-        if len(day_sigs) >= 4:
-            break
-        if t in scalp_t:
-            continue
-        sig = market_research.build_signal_for_timeframe(t, tf_minutes=240)
-        if sig and sig.get("rr", 0) >= 1.5:
-            day_sigs.append(sig)
-
-    spot_sigs = []
-    used_t = scalp_t | {s["ticker"] for s in day_sigs}
-    for t in candidate_universe:
-        if len(spot_sigs) >= 5:
-            break
-        if t in used_t:
-            continue
-        sig = market_research.build_spot_signal(t)
-        if sig:
-            spot_sigs.append(sig)
-
-    if len(spot_sigs) < 5:
-        for t in candidate_universe:
-            if len(spot_sigs) >= 5:
-                break
-            if any(s["ticker"] == t for s in spot_sigs):
-                continue
-            sig = market_research.build_spot_signal(t)
-            if sig:
-                spot_sigs.append(sig)
-
-    all_calls = scalp_sigs + day_sigs + spot_sigs
+    all_calls = signals
     state.save_tracked_calls(all_calls)
 
     embed = discord.Embed(
-        title="🚨 WINZ HOURLY TRADE DESK DISPATCH (15 CALLS)",
+        title="🚨 WINZ 2-HOUR A+ QUALITY DESK (MAX 3 SETUPS)",
         description="**For Manual / External Exchange Trading**\nSelect any asset from the dropdown below to view its live chart markup and institutional research note.",
         color=0x00FF88,
     )
 
-    scalp_text = []
-    for idx, s in enumerate(scalp_sigs, 1):
+    lines = []
+    for idx, s in enumerate(all_calls, 1):
         t, side = s["ticker"], s["side"]
+        tf = s.get("tf", "15m")
         conv = s.get("conviction", 90.0)
         el, eh = fmt_dollar(s["entry_low"]), fmt_dollar(s["entry_high"])
         tp1, sl, rr = fmt_dollar(s["tp1"]), fmt_dollar(s["sl"]), s.get("rr", 2.0)
         tp1_pct = s.get("tp1_pct", 2.4)
         sl_pct = s.get("sl_pct", 1.2)
-        scalp_text.append(f"**{idx}. `[{conv:.0f}% Conviction]` ${t}** `{side}` — Entry: `{el}–{eh}` | TP: `+{tp1_pct:.1f}%` ({tp1}) | SL: `-{sl_pct:.1f}%` ({sl}) (R:R {rr:.1f})")
+        lines.append(f"**{idx}. `[{conv:.0f}% Conviction]` ${t}** `{side}` ({tf}) — Entry: `{el}–{eh}` | TP: `+{tp1_pct:.1f}%` ({tp1}) | SL: `-{sl_pct:.1f}%` ({sl}) (R:R {rr:.1f})")
 
-    day_text = []
-    for idx, s in enumerate(day_sigs, len(scalp_sigs) + 1):
-        t, side = s["ticker"], s["side"]
-        conv = s.get("conviction", 92.0)
-        el, eh = fmt_dollar(s["entry_low"]), fmt_dollar(s["entry_high"])
-        tp1, sl, rr = fmt_dollar(s["tp1"]), fmt_dollar(s["sl"]), s.get("rr", 2.0)
-        tp1_pct = s.get("tp1_pct", 6.5)
-        sl_pct = s.get("sl_pct", 2.8)
-        day_text.append(f"**{idx}. `[{conv:.0f}% Conviction]` ${t}** `{side}` — Entry: `{el}–{eh}` | TP: `+{tp1_pct:.1f}%` ({tp1}) | SL: `-{sl_pct:.1f}%` ({sl}) (R:R {rr:.1f})")
-
-    spot_text = []
-    for idx, s in enumerate(spot_sigs, len(scalp_sigs) + len(day_sigs) + 1):
-        t = s["ticker"]
-        conv = s.get("conviction", 94.0)
-        el, eh = fmt_dollar(s["entry_low"]), fmt_dollar(s["entry_high"])
-        tp1, tp2, sl, rr = fmt_dollar(s["tp1"]), fmt_dollar(s["tp2"]), fmt_dollar(s["sl"]), s.get("rr", 2.5)
-        tp1_pct = s.get("tp1_pct", 14.0)
-        tp2_pct = s.get("tp2_pct", 32.0)
-        sl_pct = s.get("sl_pct", 7.0)
-        spot_text.append(f"**{idx}. `[{conv:.0f}% Conviction]` ${t}** `BUY` — Accumulate: `{el}–{eh}` | TP1: `+{tp1_pct:.1f}%` ({tp1}) | TP2: `+{tp2_pct:.1f}%` ({tp2}) | SL: `-{sl_pct:.1f}%` ({sl}) (R:R {rr:.1f})")
-
-    embed.add_field(name="⚡ 6 SCALP CALLS (15m Timeframe)", value="\n".join(scalp_text) if scalp_text else "None", inline=False)
-    embed.add_field(name="🏛 4 DAY TRADE CALLS (4h Timeframe)", value="\n".join(day_text) if day_text else "None", inline=False)
-    embed.add_field(name="💎 5 SPOT ACCUMULATION CALLS (1D Macro Timeframe)", value="\n".join(spot_text) if spot_text else "None", inline=False)
+    embed.add_field(name="🎯 TOP A+ QUALITY SETUPS (≥90% Conviction, R:R ≥ 1.8)", value="\n".join(lines) if lines else "None", inline=False)
 
     view = CallSelectView(all_calls)
     return embed, view
@@ -546,10 +486,12 @@ def start_discord_bot() -> None:
     def _run():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(bot.start(token))
-        except Exception as exc:
-            log.error("Discord bot runner error: %s", exc)
+        while True:
+            try:
+                loop.run_until_complete(bot.start(token))
+            except Exception as exc:
+                log.error("Discord bot runner error: %s. Retrying in 10s...", exc)
+                time.sleep(10)
 
     t = threading.Thread(target=_run, daemon=True, name="discord-bot")
     t.start()

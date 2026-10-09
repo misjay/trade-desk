@@ -1,15 +1,26 @@
 [Unit]
 Description=Xira Autonomous Trade Desk Service (Bybit 24/7)
-After=network.target
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/opt/xira
-ExecStart=/opt/xira/.venv/bin/python main.py
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/xira
+EnvironmentFile=/home/ubuntu/xira/.env
+ExecStart=/home/ubuntu/xira/.venv/bin/python main.py
 Restart=always
 RestartSec=10
-EnvironmentFile=/opt/xira/.env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xira
+
+# Resource and isolation settings
+NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
+

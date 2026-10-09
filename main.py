@@ -288,9 +288,9 @@ def _setup_scheduler():
     import market_research
     _scheduler.add_job(
         lambda: market_research.dispatch_hourly_calls(),
-        trigger=IntervalTrigger(hours=1),
+        trigger=IntervalTrigger(hours=2),
         id="hourly_calls_dispatch",
-        name="Hourly Calls Dispatch (10 Calls: 6 Scalp + 4 Day)",
+        name="2-Hour A+ Calls Dispatch (Max 3 Quality Signals)",
         replace_existing=True,
     )
     from apscheduler.triggers.cron import CronTrigger

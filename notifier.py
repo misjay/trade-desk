@@ -255,6 +255,16 @@ def notify_tp1_be(pos: dict, mark_price: float) -> None:
     send_text(msg)
 
 
+def notify_tp2_lock(pos: dict, mark_price: float, locked_sl: float) -> None:
+    t = pos.get("ticker", "UNKNOWN")
+    side = pos.get("side", "")
+    mkt = pos.get("market", "perp").upper()
+    mark_str = fmt_dollar(mark_price)
+    lock_str = fmt_dollar(locked_sl)
+    msg = f"TP2_HIT: {t} {side} {mkt} reached {mark_str} | Trailing SL locked at TP1 ({lock_str}) | Runner (34%) active targeting macro extension!"
+    send_text(msg)
+
+
 def notify_trade_closed(closed: dict) -> None:
     t = closed.get("ticker", "UNKNOWN")
     side = closed.get("side", "")
