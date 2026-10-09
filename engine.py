@@ -1018,11 +1018,15 @@ def _sync_with_bybit() -> None:
         if b_sl is None and not matched_pos.get("sl_attached"):
             def_sl = float(matched_pos.get("sl") or 0.0)
             if not def_sl or (b_side == "BUY" and def_sl >= b_mark) or (b_side == "SELL" and def_sl <= b_mark):
-                def_sl = round(b_mark * 0.992 if b_side == "BUY" else b_mark * 1.008, 4)
+                if ticker == "PEPE":
+                    def_sl = round(b_mark * 0.992 if b_side == "BUY" else b_mark * 1.008, 9)
+                else:
+                    def_sl = round(b_mark * 0.992 if b_side == "BUY" else b_mark * 1.008, 4)
                 state.update_open_position(matched_id, {"sl": def_sl})
                 matched_pos["sl"] = def_sl
             be_sl = def_sl * 1000.0 if ticker == "PEPE" else def_sl
-            log.warning("Watchdog: Attaching missing Stop Loss on Bybit for %s %s @%.4f", ticker, b_side, be_sl)
+            be_sl = client.quantize_price(sym, be_sl, category="linear")
+            log.warning("Watchdog: Attaching missing Stop Loss on Bybit for %s %s @%s", ticker, b_side, be_sl)
             if client.set_trading_stop(sym, stop_loss=be_sl):
                 matched_pos["sl_attached"] = True
 
