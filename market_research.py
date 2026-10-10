@@ -800,72 +800,104 @@ def send_call_research_to_feedback_bot(sig: dict) -> bool:
     return send_research_with_chart(sig, tf_minutes=tf_minutes)
 
 
-def get_top_a_plus_signals(limit: int = 3) -> List[Dict]:
+_last_instant_alerts: Dict[str, float] = {}
+
+
+def get_scheduled_2h_calls() -> List[Dict]:
     """
-    Gather candidate setups across core and extra universes,
-    filter for conviction >= 90.0% and R:R >= 1.8, sort by (conviction, R:R) descending,
-    and return up to `limit` top A+ quality setups.
-    Fallback to highest R:R setups if fewer than `limit` setups hit >= 90% conviction.
+    Gather 4 Standard Scalp Trades (15m) and 3 High-Signal Day Trades (4h),
+    filtered for conviction >= 90.0% and R:R >= 1.8 across Core 24 and Extras.
     """
     from config import CORE_TICKERS, EXTRA_TICKERS
     candidate_universe = CORE_TICKERS + EXTRA_TICKERS
 
-    candidates = []
+    scalp_candidates = []
+    day_candidates = []
+
     for ticker in candidate_universe:
         try:
-            # Check 15m scalp setup
             sig_15m = build_signal_for_timeframe(ticker, tf_minutes=15)
             if sig_15m and sig_15m.get("conviction", 0) >= 90.0 and sig_15m.get("rr", 0) >= 1.8:
-                candidates.append(sig_15m)
+                scalp_candidates.append(sig_15m)
 
-            # Check 4h day setup
             sig_4h = build_signal_for_timeframe(ticker, tf_minutes=240)
             if sig_4h and sig_4h.get("conviction", 0) >= 90.0 and sig_4h.get("rr", 0) >= 1.8:
-                candidates.append(sig_4h)
+                day_candidates.append(sig_4h)
         except Exception as exc:
-            log.debug("Error building candidate signal for %s: %s", ticker, exc)
+            log.debug("Error building candidate for %s: %s", ticker, exc)
 
-    candidates.sort(key=lambda x: (x.get("conviction", 0), x.get("rr", 0)), reverse=True)
+    scalp_candidates.sort(key=lambda x: (x.get("conviction", 0), x.get("rr", 0)), reverse=True)
+    day_candidates.sort(key=lambda x: (x.get("conviction", 0), x.get("rr", 0)), reverse=True)
 
-    top_signals = []
-    seen_tickers = set()
-    for c in candidates:
-        if c["ticker"] not in seen_tickers:
-            top_signals.append(c)
-            seen_tickers.add(c["ticker"])
-        if len(top_signals) >= limit:
+    top_scalps = []
+    seen = set()
+    for c in scalp_candidates:
+        if c["ticker"] not in seen:
+            top_scalps.append(c)
+            seen.add(c["ticker"])
+        if len(top_scalps) >= 4:
             break
 
-    if len(top_signals) < limit:
-        all_avail = []
+    if len(top_scalps) < 4:
+        all_scalp_avail = []
         for ticker in candidate_universe:
-            if ticker in seen_tickers:
+            if ticker in seen:
                 continue
             try:
                 sig = build_signal_for_timeframe(ticker, tf_minutes=15)
-                if sig and sig.get("rr", 0) >= 1.5:
-                    all_avail.append(sig)
+                if sig:
+                    all_scalp_avail.append(sig)
             except Exception:
                 pass
-        all_avail.sort(key=lambda x: x.get("rr", 0), reverse=True)
-        for c in all_avail:
-            top_signals.append(c)
-            seen_tickers.add(c["ticker"])
-            if len(top_signals) >= limit:
+        all_scalp_avail.sort(key=lambda x: x.get("rr", 0), reverse=True)
+        for c in all_scalp_avail:
+            top_scalps.append(c)
+            seen.add(c["ticker"])
+            if len(top_scalps) >= 4:
                 break
 
-    return top_signals
+    top_days = []
+    for c in day_candidates:
+        if c["ticker"] not in seen:
+            top_days.append(c)
+            seen.add(c["ticker"])
+        if len(top_days) >= 3:
+            break
+
+    if len(top_days) < 3:
+        all_day_avail = []
+        for ticker in candidate_universe:
+            if ticker in seen:
+                continue
+            try:
+                sig = build_signal_for_timeframe(ticker, tf_minutes=240)
+                if sig:
+                    all_day_avail.append(sig)
+            except Exception:
+                pass
+        all_day_avail.sort(key=lambda x: x.get("rr", 0), reverse=True)
+        for c in all_day_avail:
+            top_days.append(c)
+            seen.add(c["ticker"])
+            if len(top_days) >= 3:
+                break
+
+    return top_scalps + top_days
 
 
-# ── Hourly / 2-Hour Calls Dispatcher (Max 3 Top A+ Quality Signals) ─────────
+def get_top_a_plus_signals(limit: int = 3) -> List[Dict]:
+    """Alias for backwards compatibility."""
+    return get_scheduled_2h_calls()[:limit]
+
+
+# ── Hourly / 2-Hour Calls Dispatcher (4 Scalps + 3 Day Trades) ─────────────
 def dispatch_hourly_calls(
     bot_token: Optional[str] = None,
     chat_id: Optional[str] = None,
 ) -> bool:
     """
-    Generate and dispatch a maximum of 3 top-tier A+ quality signals every 2 hours
-    (filtered strictly for highest conviction >= 90% and favorable Risk:Reward).
-    Delivers a clean index digest with interactive buttons to view live charts & research notes.
+    Every 2 hours: Dispatches 4 Standard Scalp Trades + 3 High-Signal Day Trades (7 setups total).
+    Delivers a clean index digest with interactive buttons for live charts & research.
     """
     call_cfg = state.get_call_bot_config()
     target_token = bot_token or call_cfg.get("token")
@@ -875,25 +907,27 @@ def dispatch_hourly_calls(
         log.warning("2-Hour calls dispatch skipped: no call bot token or chat ID configured")
         return False
 
-    log.info("Generating top A+ quality signals (max 3) for %s...", target_chat)
+    log.info("Generating 2-hour trade desk calls (4 Scalps + 3 Day Trades) for %s...", target_chat)
 
-    top_signals = get_top_a_plus_signals(limit=3)
+    all_calls = get_scheduled_2h_calls()
+    scalp_signals = [s for s in all_calls if s.get("tf") in ("15m", "15")]
+    day_signals = [s for s in all_calls if s.get("tf") not in ("15m", "15")]
+
     now_utc_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
     # Save tracked calls for real-time tracking
-    state.save_tracked_calls(top_signals)
+    state.save_tracked_calls(all_calls)
 
     # Deliver Clean Digest with Interactive Buttons (No photo flood!)
     index_lines = [
-        "🚨 *WINZ 2-HOUR A+ QUALITY DESK (MAX 3 SETUPS)*",
+        "🚨 *WINZ 2-HOUR TRADE DESK (4 SCALPS + 3 DAY TRADES)*",
         f"⏱ *Timestamp:* {now_utc_str} | _For Manual / External Exchange Trading_",
         "",
-        "🎯 *TOP A+ QUALITY SETUPS (≥90% Conviction, R:R ≥ 1.8):*",
+        "⚡ *4 SCALP SETUPS (15m Timeframe):*",
     ]
-    for idx, s in enumerate(top_signals, start=1):
+    for idx, s in enumerate(scalp_signals, start=1):
         t = s["ticker"]
         side = s["side"]
-        tf = s.get("tf", "15m")
         conv = s.get("conviction", 90.0)
         el = fmt_dollar(s["entry_low"])
         eh = fmt_dollar(s["entry_high"])
@@ -902,7 +936,22 @@ def dispatch_hourly_calls(
         sl = fmt_dollar(s["sl"])
         sl_pct = s.get("sl_pct", 1.2)
         rr = s.get("rr", 2.0)
-        index_lines.append(f"{idx}. `[{conv:.0f}% Conviction]` *${t}* `{side}` ({tf}) — Entry: `{el}–{eh}` | TP: `+{tp1_pct:.1f}%` ({tp1}) | SL: `-{sl_pct:.1f}%` ({sl}) (R:R {rr:.1f})")
+        index_lines.append(f"{idx}. `[{conv:.0f}% Conviction]` *${t}* `{side}` — Entry: `{el}–{eh}` | TP: `+{tp1_pct:.1f}%` ({tp1}) | SL: `-{sl_pct:.1f}%` ({sl}) (R:R {rr:.1f})")
+
+    index_lines.append("")
+    index_lines.append("🏛 *3 DAY TRADE SETUPS (4h Timeframe):*")
+    for idx, s in enumerate(day_signals, start=len(scalp_signals) + 1):
+        t = s["ticker"]
+        side = s["side"]
+        conv = s.get("conviction", 92.0)
+        el = fmt_dollar(s["entry_low"])
+        eh = fmt_dollar(s["entry_high"])
+        tp1 = fmt_dollar(s["tp1"])
+        tp1_pct = s.get("tp1_pct", 6.5)
+        sl = fmt_dollar(s["sl"])
+        sl_pct = s.get("sl_pct", 2.8)
+        rr = s.get("rr", 2.0)
+        index_lines.append(f"{idx}. `[{conv:.0f}% Conviction]` *${t}* `{side}` — Entry: `{el}–{eh}` | TP: `+{tp1_pct:.1f}%` ({tp1}) | SL: `-{sl_pct:.1f}%` ({sl}) (R:R {rr:.1f})")
 
     index_lines.append("")
     index_lines.append("👇 *Tap any asset below for its live chart markup, structure & institutional thesis:*")
@@ -910,10 +959,10 @@ def dispatch_hourly_calls(
     # Construct Inline Keyboard Buttons (2 buttons per row)
     inline_keyboard = []
     current_row = []
-    for s in top_signals:
+    for s in all_calls:
         t = s["ticker"]
         tf = s.get("tf", "15m")
-        badge = "💎" if s.get("trade_type") == "spot" or tf in ("spot", "1D") else ("⚡" if tf == "15m" else "🏛")
+        badge = "⚡" if tf == "15m" else "🏛"
         btn_text = f"{badge} {t} ({tf})"
         cb_tf = "spot" if s.get("trade_type") == "spot" or tf in ("spot", "1D") else tf
         cb_data = f"call_view_{t}_{cb_tf}"
@@ -946,12 +995,103 @@ def dispatch_hourly_calls(
     # Deliver to Discord channel if configured
     try:
         import winz_discord
-        embed, view = winz_discord._build_calls_message(top_signals)
-        winz_discord.broadcast_discord_message("🚨 **Winz 2-Hour A+ Quality Desk (Max 3 Setups)**", embed=embed)
+        embed, view = winz_discord._build_calls_message(all_calls)
+        winz_discord.broadcast_discord_message("🚨 **Winz 2-Hour Trade Desk (4 Scalps + 3 Day Trades)**", embed=embed)
     except Exception as exc:
         log.debug("Discord broadcast error: %s", exc)
 
-    log.info("2-Hour calls digest (max %d setups) successfully dispatched with interactive buttons.", len(top_signals))
+    log.info("2-Hour calls digest (7 setups: 4 scalps + 3 day trades) successfully dispatched with interactive buttons.")
+    return True
+
+
+_last_global_instant_alert_time: float = 0.0
+
+
+def dispatch_instant_high_conviction_call(sig: dict) -> bool:
+    """
+    Automated Real-Time Trend Alert Bot:
+    Strictly caps automatic trend alerts to 1 trade per 4 hours (the single best setup in the market).
+    Dispatches a standalone alert to Winz Telegram chats and Discord with interactive chart buttons.
+    """
+    global _last_global_instant_alert_time
+    call_cfg = state.get_call_bot_config()
+    target_token = call_cfg.get("token")
+    target_chat = call_cfg.get("chat_id")
+
+    if not target_token or not target_chat:
+        return False
+
+    ticker = sig.get("ticker", "").upper()
+    side = sig.get("side", "").upper()
+    conv = sig.get("conviction", 0)
+    rr = sig.get("rr", 0)
+
+    # Only allow top A+ quality setups (Conviction >= 92.0%, R:R >= 2.0)
+    if side not in ("BUY", "SELL") or conv < 92.0 or rr < 2.0:
+        return False
+
+    # Enforce strict 4-hour global cooldown (14,400 seconds) across the entire market
+    now = time.time()
+    if now - _last_global_instant_alert_time < 14400:
+        return False
+    _last_global_instant_alert_time = now
+    _last_instant_alerts[ticker] = now
+
+    now_utc_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    tf = sig.get("tf", "15m")
+    el = fmt_dollar(sig.get("entry_low"))
+    eh = fmt_dollar(sig.get("entry_high"))
+    tp1 = fmt_dollar(sig.get("tp1"))
+    tp1_pct = sig.get("tp1_pct", 2.5)
+    tp2 = fmt_dollar(sig.get("tp2"))
+    tp2_pct = sig.get("tp2_pct", 5.0)
+    sl = fmt_dollar(sig.get("sl"))
+    sl_pct = sig.get("sl_pct", 1.2)
+    reason = sig.get("reason", "Strong institutional momentum expansion")
+
+    lines = [
+        f"⚡ *WINZ REAL-TIME TREND ALERT: ${ticker} `{side}` ({tf})*",
+        f"⏱ *Timestamp:* {now_utc_str} | 🔥 *Conviction:* `[{conv:.0f}% A+]`",
+        "",
+        f"🎯 *Top Market Trend Confluence Detected (Best Setup in 4 Hours):*",
+        f"• *Side*: `{side}` | Entry: `{el}–{eh}`",
+        f"• *TP1 Target*: `+{tp1_pct:.1f}%` ({tp1})",
+        f"• *TP2 Target*: `+{tp2_pct:.1f}%` ({tp2})",
+        f"• *Stop Loss*: `-{sl_pct:.1f}%` ({sl}) (R:R {rr:.1f})",
+        f"• *Thesis*: _{reason}_",
+        "",
+        "👇 *Tap button below for live chart markup & institutional thesis:*",
+    ]
+
+    badge = "⚡" if tf == "15m" else "🏛"
+    inline_keyboard = [[{"text": f"{badge} View ${ticker} Chart & Analysis", "callback_data": f"call_view_{ticker}_{tf}"}]]
+    index_msg = "\n".join(lines)
+
+    send_url = f"https://api.telegram.org/bot{target_token}/sendMessage"
+    chats = call_cfg.get("all_chats")
+    if not chats:
+        chats = [target_chat] if target_chat else []
+
+    for c in chats:
+        payload = {
+            "chat_id": c,
+            "text": index_msg,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True,
+            "reply_markup": {"inline_keyboard": inline_keyboard},
+        }
+        try:
+            requests.post(send_url, json=payload, timeout=8)
+        except Exception as exc:
+            log.warning("Instant trend alert send error: %s", exc)
+
+    try:
+        import winz_discord
+        winz_discord.broadcast_discord_message(f"⚡ **WINZ REAL-TIME TREND ALERT: ${ticker} {side} ({tf})** — Conviction: [{conv:.0f}%]")
+    except Exception:
+        pass
+
+    log.info("Instant 4-hour trend alert dispatched for %s %s (conviction=%.1f%%)", ticker, side, conv)
     return True
 
 

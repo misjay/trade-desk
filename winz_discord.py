@@ -155,29 +155,44 @@ def _build_calls_message(signals: Optional[list] = None) -> tuple[discord.Embed,
     import market_research
 
     if signals is None:
-        signals = market_research.get_top_a_plus_signals(limit=3)
+        signals = market_research.get_scheduled_2h_calls()
 
     all_calls = signals
     state.save_tracked_calls(all_calls)
 
+    scalp_sigs = [s for s in all_calls if s.get("tf") in ("15m", "15")]
+    day_sigs = [s for s in all_calls if s.get("tf") not in ("15m", "15")]
+
     embed = discord.Embed(
-        title="🚨 WINZ 2-HOUR A+ QUALITY DESK (MAX 3 SETUPS)",
+        title="🚨 WINZ 2-HOUR TRADE DESK (4 SCALPS + 3 DAY TRADES)",
         description="**For Manual / External Exchange Trading**\nSelect any asset from the dropdown below to view its live chart markup and institutional research note.",
         color=0x00FF88,
     )
 
-    lines = []
-    for idx, s in enumerate(all_calls, 1):
+    scalp_text = []
+    for idx, s in enumerate(scalp_sigs, 1):
         t, side = s["ticker"], s["side"]
-        tf = s.get("tf", "15m")
         conv = s.get("conviction", 90.0)
         el, eh = fmt_dollar(s["entry_low"]), fmt_dollar(s["entry_high"])
         tp1, sl, rr = fmt_dollar(s["tp1"]), fmt_dollar(s["sl"]), s.get("rr", 2.0)
         tp1_pct = s.get("tp1_pct", 2.4)
         sl_pct = s.get("sl_pct", 1.2)
-        lines.append(f"**{idx}. `[{conv:.0f}% Conviction]` ${t}** `{side}` ({tf}) — Entry: `{el}–{eh}` | TP: `+{tp1_pct:.1f}%` ({tp1}) | SL: `-{sl_pct:.1f}%` ({sl}) (R:R {rr:.1f})")
+        scalp_text.append(f"**{idx}. `[{conv:.0f}% Conviction]` ${t}** `{side}` — Entry: `{el}–{eh}` | TP: `+{tp1_pct:.1f}%` ({tp1}) | SL: `-{sl_pct:.1f}%` ({sl}) (R:R {rr:.1f})")
 
-    embed.add_field(name="🎯 TOP A+ QUALITY SETUPS (≥90% Conviction, R:R ≥ 1.8)", value="\n".join(lines) if lines else "None", inline=False)
+    day_text = []
+    for idx, s in enumerate(day_sigs, len(scalp_sigs) + 1):
+        t, side = s["ticker"], s["side"]
+        conv = s.get("conviction", 92.0)
+        el, eh = fmt_dollar(s["entry_low"]), fmt_dollar(s["entry_high"])
+        tp1, sl, rr = fmt_dollar(s["tp1"]), fmt_dollar(s["sl"]), s.get("rr", 2.0)
+        tp1_pct = s.get("tp1_pct", 6.5)
+        sl_pct = s.get("sl_pct", 2.8)
+        day_text.append(f"**{idx}. `[{conv:.0f}% Conviction]` ${t}** `{side}` — Entry: `{el}–{eh}` | TP: `+{tp1_pct:.1f}%` ({tp1}) | SL: `-{sl_pct:.1f}%` ({sl}) (R:R {rr:.1f})")
+
+    if scalp_text:
+        embed.add_field(name="⚡ 4 SCALP CALLS (15m Timeframe)", value="\n".join(scalp_text), inline=False)
+    if day_text:
+        embed.add_field(name="🏛 3 DAY TRADE CALLS (4h Timeframe)", value="\n".join(day_text), inline=False)
 
     view = CallSelectView(all_calls)
     return embed, view

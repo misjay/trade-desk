@@ -176,7 +176,30 @@ ALL_TICKERS: List[str] = CORE_TICKERS + EXTRA_TICKERS
 # Market order allowed ONLY on Tier A if mark inside Entry and slip < 0.15%
 MARKET_ALLOWED_TICKERS: List[str] = ["BTC", "ETH", "SOL", "XRP", "BNB"]
 
+# Weekend defensive trading universe (high-liquidity majors only)
+WEEKEND_MAJORS_ONLY: List[str] = ["BTC", "ETH", "SOL"]
+
 NO_MARKET_TICKERS: List[str] = ["PEPE", "TAO", "ENA", "HBAR", "NEAR"]
+
+
+def is_weekend_derisk_window(now_utc: Optional[datetime] = None) -> bool:
+    """
+    Returns True if current UTC time is inside the Friday Afternoon -> Sunday Night derisking window.
+    Window: Friday 14:00 UTC through Sunday 22:00 UTC.
+    Covers US cash session close, CME settlement, and illiquid weekend chop.
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    weekday = now_utc.weekday()  # Monday=0, Friday=4, Saturday=5, Sunday=6
+    hour = now_utc.hour
+
+    if weekday == 4 and hour >= 14:  # Friday starting at 14:00 UTC
+        return True
+    if weekday == 5:                 # All of Saturday
+        return True
+    if weekday == 6 and hour < 22:   # Sunday until 22:00 UTC
+        return True
+    return False
 
 # Volatile high-beta assets prioritized for 3-tier fast profit lock (33% @ TP1, 33% @ TP2, 34% runner)
 VOLATILE_TICKERS: List[str] = [

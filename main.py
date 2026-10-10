@@ -63,8 +63,7 @@ if args.demo:
 if args.live:
     os.environ["TRADE_MODE"] = "live"
 
-# Safe imports
-from config import cfg, CORE_TICKERS, EXTRA_TICKERS
+from config import cfg, CORE_TICKERS, EXTRA_TICKERS, WEEKEND_MAJORS_ONLY, is_weekend_derisk_window
 import state
 import scanner
 import notifier
@@ -171,6 +170,11 @@ def run_scan_cycle(trade_type: str = "scalp", manual: bool = False):
     skipped_paused_count = 0
     executed_count = 0
 
+    in_weekend_derisk = is_weekend_derisk_window()
+    if in_weekend_derisk and trade_type == "scalp" and not manual:
+        log.info("🛡️ Weekend Defense Mode active (Friday 14:00 -> Sunday 22:00 UTC): 15m scalp execution muted. High-timeframe A+ setups only.")
+        return
+
     for sig in all_sigs:
         ticker = sig["ticker"]
         side = sig["side"]
@@ -185,6 +189,19 @@ def run_scan_cycle(trade_type: str = "scalp", manual: bool = False):
             state.save_signal(sig)
             continue
 
+        # Weekend Defense Mode Gatekeeper (Majors only, Max 2 positions, >=92% conviction)
+        if in_weekend_derisk:
+            if ticker not in WEEKEND_MAJORS_ONLY:
+                log.info("🛡️ Weekend Defense: Skipping %s %s (Weekend trading restricted to high-liquidity majors: %s)",
+                         ticker, side, ", ".join(WEEKEND_MAJORS_ONLY))
+                state.save_signal(sig)
+                continue
+            if sig.get("conviction", 0) < 92.0:
+                log.info("🛡️ Weekend Defense: Skipping %s %s (conviction %.1f%% < 92.0%% A+ weekend threshold)",
+                         ticker, side, sig.get("conviction", 0))
+                state.save_signal(sig)
+                continue
+
         # Check if an active open position already exists for this ticker
         open_pos = state.get_open_positions()
         if has_active_pos := any(p.get("ticker") == ticker for p in open_pos.values()):
@@ -192,9 +209,11 @@ def run_scan_cycle(trade_type: str = "scalp", manual: bool = False):
             state.save_signal(sig)
             continue
 
-        # Check max concurrent positions cap to prevent margin exhaustion
-        if len(open_pos) >= cfg.max_concurrent_positions:
-            log.info("Active positions at cap (%d/%d). Skipping %s execution to minimize risk.", len(open_pos), cfg.max_concurrent_positions, ticker)
+        # Check max concurrent positions cap (capped to 2 on weekends, cfg.max_concurrent_positions on weekdays)
+        effective_max_pos = 2 if in_weekend_derisk else cfg.max_concurrent_positions
+        if len(open_pos) >= effective_max_pos:
+            log.info("Active positions at cap (%d/%d). Skipping %s execution to minimize risk.",
+                     len(open_pos), effective_max_pos, ticker)
             state.save_signal(sig)
             continue
 
@@ -217,6 +236,13 @@ def run_scan_cycle(trade_type: str = "scalp", manual: bool = False):
                     daemon=True,
                     name=f"research-{ticker}",
                 ).start()
+                if sig.get("conviction", 0) >= 90.0:
+                    threading.Thread(
+                        target=market_research.dispatch_instant_high_conviction_call,
+                        args=(sig,),
+                        daemon=True,
+                        name=f"trend-alert-{ticker}",
+                    ).start()
 
         # If bot is paused, do NOT execute any automated orders
         if is_paused:

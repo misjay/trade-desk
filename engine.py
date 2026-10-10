@@ -43,6 +43,7 @@ from config import (
     VERTICAL_CANDLE_BODY_PCT,
     get_sector,
     is_volatile_ticker,
+    is_weekend_derisk_window,
 )
 import notifier
 from notifier import (
@@ -455,13 +456,13 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
     effective_risk_pct = cfg.risk_per_trade
     conviction = sig.get("conviction", 80)
     now_utc = datetime.now(timezone.utc)
-    is_weekend = now_utc.weekday() in (5, 6)  # Saturday or Sunday
+    in_weekend = is_weekend_derisk_window(now_utc)
 
     if cfg.enable_dynamic_kelly_sizing:
-        if is_weekend:
-            # Scale down to preserve capital during low liquidity chop
-            effective_risk_pct = cfg.risk_weekend_chop
-            log.info("Weekend chop regime: Applied defensive sizing risk=%.2f%% for %s", effective_risk_pct * 100, ticker)
+        if in_weekend:
+            # Scale down to defensive 0.25% (or configured chop risk) during Friday 14:00 -> Sunday 22:00 window
+            effective_risk_pct = min(cfg.risk_weekend_chop, 0.0025)
+            log.info("Weekend Derisk Window active: Applied defensive sizing risk=%.2f%% for %s", effective_risk_pct * 100, ticker)
         elif conviction >= 92:
             # Scale up on A+ setups (multi-confluence, OI flush reversal, order book absorption)
             effective_risk_pct = cfg.risk_a_plus
