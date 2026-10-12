@@ -60,7 +60,15 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
 
     # Natural Language Interceptors
     lower_raw = raw_text.lower()
-    if "convert to twitter post" in lower_raw or "convert to twitter" in lower_raw or "convert to tweet" in lower_raw or lower_raw == "tweet":
+    if (
+        "scan the market" in lower_raw
+        or "best setups" in lower_raw
+        or "show me the best setups" in lower_raw
+        or "setups to watch" in lower_raw
+        or "watchlist" in lower_raw
+    ):
+        parts = ["/watchlist"]
+    elif "convert to twitter post" in lower_raw or "convert to twitter" in lower_raw or "convert to tweet" in lower_raw or lower_raw == "tweet":
         parts = ["/tweet"]
     elif lower_raw.startswith("tweet ") or lower_raw.startswith("/tweet "):
         parts = ["/tweet"] + raw_text.split()[1:]
@@ -76,6 +84,8 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
                 parts.append(ticker_arg)
         else:
             parts = raw_text.split()
+    elif "how are we doing" in lower_raw or "performance today" in lower_raw or "what is the drawdown" in lower_raw or "show positions" in lower_raw:
+        parts = ["/status"]
     else:
         parts = raw_text.split()
 
@@ -117,6 +127,7 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
         else:
             msg = (
                 "🤖 *Xira Autonomous Trade Desk Control*\n\n"
+                "• `/watchlist` — 🎯 Best setups to watch right now (Shelves, invalidations & macro context)\n"
                 "• `/status` — Balance, equity, open positions & win stats\n"
                 "• `/positions` — Detailed active positions with live PnL & targets\n"
                 "• `/tp` — 🎯 Close all open trades currently in profit\n"
@@ -956,6 +967,77 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
             + _paused_footer()
         )
 
+    elif cmd in ("/watchlist", "/setups", "/scanwatch"):
+        _reply(chat_id, "🔍 *Scanning market for institutional setups, key shelves & macro context...*")
+        def _do_watchlist_scan():
+            import scanner
+            from config import CORE_TICKERS
+            btc_regime = scanner.get_btc_macro_regime()
+            
+            actionable = []
+            watchlist = []
+            
+            for t in CORE_TICKERS:
+                try:
+                    s = scanner.analyze_ticker(t, "scalp")
+                    if not s:
+                        continue
+                    if s.get("side") in ("BUY", "SELL"):
+                        actionable.append(s)
+                    else:
+                        watchlist.append(s)
+                except Exception:
+                    pass
+            
+            lines = [
+                "🎯 *Market Scan: Best Setups & Smart Watchlist*",
+                f"• *BTC Macro Regime*: `{btc_regime}`",
+                "• *Execution Filter*: `Strict 4H Trend Confluence + Regime Lock Active`",
+                ""
+            ]
+            
+            if actionable:
+                lines.append(f"🔥 *Actionable High-Conviction Setups ({len(actionable)}):*")
+                for s in actionable:
+                    t = s["ticker"]
+                    side = s["side"]
+                    conv = s.get("conviction", 0.0)
+                    rr = s.get("rr", 0.0)
+                    e_low = fmt_dollar(s.get("entry_low"))
+                    e_high = fmt_dollar(s.get("entry_high"))
+                    mark = fmt_dollar(s.get("live_price"))
+                    sl = fmt_dollar(s.get("sl"))
+                    tp1 = fmt_dollar(s.get("tp1"))
+                    lines.append(
+                        f"• *{t}* `{side}` (Conviction: `{conv:.0f}%` | R:R: `1:{rr:.2f}`)\n"
+                        f"  Entry: `{e_low} – {e_high}` | Mark: `{mark}`\n"
+                        f"  Stop: `{sl}` | TP1: `{tp1}`\n"
+                    )
+            else:
+                lines.append("🛡️ *Actionable Entries*: `None currently` (Counter-trend dip buying blocked by BTC Bear Regime).\n")
+            
+            lines.append("👀 *Curated Watchlist (Key Shelves & Invalidation Levels):*")
+            # Pull top 4 key assets
+            focus_assets = ["BTC", "SOL", "ETH", "SUI"]
+            for t in focus_assets:
+                df = scanner.fetch_ohlcv(t, tf_minutes=15, limit=60)
+                if df is not None:
+                    struct = scanner.detect_shelves_and_edges(df)
+                    live_p = fmt_dollar(struct["live_price"])
+                    dem_l, dem_h = struct["demand_shelf"]
+                    sup_l, sup_h = struct["supply_shelf"]
+                    trend_4h = scanner.get_4h_trend(t)
+                    lines.append(
+                        f"• *{t}* (`{live_p}` | 4H: `{trend_4h}`)\n"
+                        f"  Demand Support: `{fmt_dollar(dem_l)} – {fmt_dollar(dem_h)}`\n"
+                        f"  Supply Resistance: `{fmt_dollar(sup_l)} – {fmt_dollar(sup_h)}`\n"
+                    )
+            
+            lines.append("_Less noise. Better context. Disciplined execution._")
+            _reply(chat_id, "\n".join(lines) + _paused_footer())
+        
+        threading.Thread(target=_do_watchlist_scan, daemon=True, name="tg-watchlist-scan").start()
+
     else:
         _reply(chat_id, f"Unknown command: `{cmd}`. Type `/help` for available commands.")
 
@@ -1067,6 +1149,9 @@ def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_tri
                         or "convert to twitter" in lower_text
                         or "tweet" in lower_text
                         or ("research" in lower_text and "(" in lower_text and ")" in lower_text)
+                        or "scan the market" in lower_text
+                        or "best setups" in lower_text
+                        or "watchlist" in lower_raw
                     )
                     if is_cmd:
                         log.info("Received command on bot %s: %s from %s", token[:10], raw_text, chat_id)
@@ -1144,6 +1229,7 @@ def _poll_updates_loop(scan_trigger_fn=None) -> None:
 
 
 BOT_COMMANDS = [
+    {"command": "watchlist", "description": "🎯 Best setups to watch now & smart shelves"},
     {"command": "status", "description": "Balance, equity & open positions"},
     {"command": "positions", "description": "Active Bybit positions & targets"},
     {"command": "tp", "description": "🎯 Close all open trades in profit"},

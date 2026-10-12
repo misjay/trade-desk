@@ -403,6 +403,13 @@ async def slash_sentiment(interaction: discord.Interaction, ticker: str = "BTC")
     await interaction.followup.send(embed=embed)
 
 
+@bot.tree.command(name="watchlist", description="Scan market for the best setups, key shelves & macro context")
+async def slash_watchlist(interaction: discord.Interaction):
+    await interaction.response.defer()
+    embed = _build_watchlist_embed()
+    await interaction.followup.send(embed=embed)
+
+
 # Prefix Commands
 @bot.command(name="help")
 async def cmd_help(ctx: commands.Context):
@@ -468,6 +475,72 @@ async def cmd_sentiment(ctx: commands.Context, ticker: str = "BTC"):
         color=0x3498DB,
     )
     await ctx.send(embed=embed)
+
+
+@bot.command(name="watchlist", aliases=["setups"])
+async def cmd_watchlist(ctx: commands.Context):
+    await ctx.send("🔍 *Scanning market for institutional setups, key shelves & macro context...*")
+    embed = _build_watchlist_embed()
+    await ctx.send(embed=embed)
+
+
+def _build_watchlist_embed() -> discord.Embed:
+    import scanner
+    from config import CORE_TICKERS
+    btc_regime = scanner.get_btc_macro_regime()
+
+    actionable = []
+    for t in CORE_TICKERS:
+        try:
+            s = scanner.analyze_ticker(t, "scalp")
+            if s and s.get("side") in ("BUY", "SELL"):
+                actionable.append(s)
+        except Exception:
+            pass
+
+    embed = discord.Embed(
+        title="🎯 Market Scan: Best Setups & Smart Watchlist",
+        description=f"**BTC Macro Regime:** `{btc_regime}`\n**Confluence Shield:** Strict 4H Trend Confluence + Regime Lock Active\n\n*Less noise. Better context. Disciplined execution.*",
+        color=0x00FF88 if actionable else 0xE67E22,
+    )
+
+    if actionable:
+        act_text = []
+        for s in actionable:
+            t = s["ticker"]
+            side = s["side"]
+            conv = s.get("conviction", 0.0)
+            rr = s.get("rr", 0.0)
+            e_low = fmt_dollar(s.get("entry_low"))
+            e_high = fmt_dollar(s.get("entry_high"))
+            mark = fmt_dollar(s.get("live_price"))
+            sl = fmt_dollar(s.get("sl"))
+            tp1 = fmt_dollar(s.get("tp1"))
+            act_text.append(f"• **{t}** `{side}` (Conv: `{conv:.0f}%` | R:R `1:{rr:.2f}`)\n  Entry: `{e_low}–{e_high}` | Stop: `{sl}` | TP1: `{tp1}`")
+        embed.add_field(name="🔥 Actionable Setups Ready For Entry", value="\n\n".join(act_text), inline=False)
+    else:
+        embed.add_field(
+            name="🛡️ Actionable Execution Status",
+            value="`No entries meeting criteria right now` (Counter-trend dip buys blocked by BTC Bear Regime).",
+            inline=False,
+        )
+
+    # Focus Shelves
+    watch_text = []
+    for t in ["BTC", "SOL", "ETH", "SUI"]:
+        df = scanner.fetch_ohlcv(t, tf_minutes=15, limit=60)
+        if df is not None:
+            struct = scanner.detect_shelves_and_edges(df)
+            live_p = fmt_dollar(struct["live_price"])
+            dem_l, dem_h = struct["demand_shelf"]
+            sup_l, sup_h = struct["supply_shelf"]
+            trend_4h = scanner.get_4h_trend(t)
+            watch_text.append(f"• **{t}** (`{live_p}` | 4H: `{trend_4h}`)\n  Demand: `{fmt_dollar(dem_l)}–{fmt_dollar(dem_h)}` | Supply: `{fmt_dollar(sup_l)}–{fmt_dollar(sup_h)}`")
+    if watch_text:
+        embed.add_field(name="👀 Curated Watchlist (Key Shelves & Invalidation Levels)", value="\n\n".join(watch_text), inline=False)
+
+    embed.set_footer(text="Winz Trade Desk • Smarter Watchlists & Automated Follow-Ups")
+    return embed
 
 
 # ── External Message Broadcaster (Called by tracker and schedulers) ────────
