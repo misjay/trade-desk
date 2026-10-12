@@ -442,14 +442,34 @@ def analyze_ticker(ticker: str, trade_type: str = "scalp") -> dict:
                         trade_type,
                     )
 
-        # Freqtrade Regime Filter: Block counter-trend Long in macro bear market
+        # Freqtrade & BTC Macro Regime Filter: Block counter-trend Long in macro bear market
         is_bear_locked = (ticker_regime == "STRONG_BEAR") or (trade_type == "day" and btc_regime == "STRONG_BEAR")
+        if cfg.enable_btc_regime_lock and btc_regime == "STRONG_BEAR" and ticker.upper() != "BTC":
+            log.info("BTC Regime Lock blocked BUY on %s: BTC is in STRONG_BEAR flush. Altcoin Longs frozen.", ticker)
+            return _make_wait(
+                ticker, live, tf_str,
+                f"Demand shelf test during BTC STRONG_BEAR",
+                "BTC Macro Regime Lock: BTC is in STRONG_BEAR. Altcoin Longs frozen to prevent knife-catching.",
+                trade_type,
+            )
+
         if cfg.enable_market_regime_filter and is_bear_locked:
             log.info("Regime filter blocked BUY on %s: Market in STRONG_BEAR (ticker=%s, btc=%s)", ticker, ticker_regime, btc_regime)
             return _make_wait(
                 ticker, live, tf_str,
                 f"Demand shelf test in STRONG_BEAR",
                 "Freqtrade regime filter: Counter-trend LONG blocked in STRONG_BEAR flush. Shorts only.",
+                trade_type,
+            )
+
+        # Higher-timeframe (4h) confluence filter
+        trend_4h = get_4h_trend(ticker) if trade_type == "scalp" else None
+        if cfg.enable_strict_4h_confluence and trend_4h and trend_4h != "BULLISH":
+            log.info("Strict 4H Trend Confluence blocked BUY on %s: 4H Trend is %s. Counter-trend 15m Long blocked.", ticker, trend_4h)
+            return _make_wait(
+                ticker, live, tf_str,
+                f"15m demand test against {trend_4h} 4H trend",
+                f"Strict 4H Macro Confluence: 15m scalp BUY rejected because 4H trend is {trend_4h}. Only trades aligned with 4H macro trend are permitted.",
                 trade_type,
             )
 
@@ -586,14 +606,34 @@ def analyze_ticker(ticker: str, trade_type: str = "scalp") -> dict:
                         trade_type,
                     )
 
-        # Freqtrade Regime Filter: Block counter-trend Short in macro bull market
+        # Freqtrade & BTC Macro Regime Filter: Block counter-trend Short in macro bull market
         is_bull_locked = (ticker_regime == "STRONG_BULL") or (trade_type == "day" and btc_regime == "STRONG_BULL")
+        if cfg.enable_btc_regime_lock and btc_regime == "STRONG_BULL" and ticker.upper() != "BTC":
+            log.info("BTC Regime Lock blocked SELL on %s: BTC is in STRONG_BULL expansion. Altcoin Shorts frozen.", ticker)
+            return _make_wait(
+                ticker, live, tf_str,
+                f"Supply shelf test during BTC STRONG_BULL",
+                "BTC Macro Regime Lock: BTC is in STRONG_BULL. Altcoin Shorts frozen to prevent short-squeezes.",
+                trade_type,
+            )
+
         if cfg.enable_market_regime_filter and is_bull_locked:
             log.info("Regime filter blocked SELL on %s: Market in STRONG_BULL (ticker=%s, btc=%s)", ticker, ticker_regime, btc_regime)
             return _make_wait(
                 ticker, live, tf_str,
                 f"Supply shelf test in STRONG_BULL",
                 "Freqtrade regime filter: Counter-trend SHORT blocked in STRONG_BULL expansion. Longs only.",
+                trade_type,
+            )
+
+        # Higher-timeframe (4h) confluence filter
+        trend_4h = get_4h_trend(ticker) if trade_type == "scalp" else None
+        if cfg.enable_strict_4h_confluence and trend_4h and trend_4h != "BEARISH":
+            log.info("Strict 4H Trend Confluence blocked SELL on %s: 4H Trend is %s. Counter-trend 15m Short blocked.", ticker, trend_4h)
+            return _make_wait(
+                ticker, live, tf_str,
+                f"15m supply test against {trend_4h} 4H trend",
+                f"Strict 4H Macro Confluence: 15m scalp SELL rejected because 4H trend is {trend_4h}. Only trades aligned with 4H macro trend are permitted.",
                 trade_type,
             )
 

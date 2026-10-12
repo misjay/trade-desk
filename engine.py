@@ -939,7 +939,7 @@ def _sync_with_bybit() -> None:
                 log.info("%s failed probation and re-quarantined for 24h.", ticker)
                 notifier.send_text(f"🚫 *Probation Failed:* {ticker} incurred net loss on probation (${pnl_u:,.2f}). Quarantined on Avoid List for 24h.")
             elif pnl_u < -1.0:
-                # Real-time 2-loss circuit breaker
+                # Real-time 2-loss circuit breaker for individual ticker
                 quar_info = state.check_and_trigger_consecutive_loss_quarantine(ticker)
                 if quar_info:
                     log.warning("Real-time circuit breaker triggered for %s", ticker)
@@ -949,6 +949,18 @@ def _sync_with_bybit() -> None:
                         f"• *Action*: Automatically quarantined on Avoid List for 24 hours.\n"
                         f"• *Outcome*: Capital protected from repeated drawdowns."
                     )
+
+            # Global 24h Account Loss Circuit Breaker check
+            gcb = state.check_and_trigger_global_daily_circuit_breaker()
+            if gcb:
+                log.warning("Global daily circuit breaker triggered: loss -$%.2f", gcb.get("loss_24h", 0.0))
+                notifier.send_text(
+                    f"🛑 *GLOBAL ACCOUNT CIRCUIT BREAKER TRIGGERED*\n\n"
+                    f"• *24h Realized Loss*: **-${gcb.get('loss_24h', 0.0):,.2f} USDT**\n"
+                    f"• *Threshold*: -${cfg.max_daily_loss_usdt:,.2f} USDT\n"
+                    f"• *Action*: All automated trade entries **FROZEN for {gcb.get('hours', 12.0):.0f} hours**.\n"
+                    f"• *Protection*: Portfolio drawdown capped. Existing open positions remain monitored with active trailing stops."
+                )
 
     # 3. Check Bybit active positions
     bybit_positions = client.get_active_positions(category="linear")

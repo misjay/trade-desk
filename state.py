@@ -17,7 +17,7 @@ import threading
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from config import cfg
 
@@ -462,6 +462,88 @@ def check_and_trigger_consecutive_loss_quarantine(ticker: str) -> Optional[dict]
     return None
 
 
+def is_global_circuit_breaker_active() -> Tuple[bool, str]:
+    """
+    Check if the global daily account loss circuit breaker is active.
+    Returns (is_active, reason).
+    """
+    with _lock:
+        s = _load_raw()
+        gcb = s.get("global_circuit_breaker", {})
+        if not gcb or not gcb.get("active"):
+            return False, ""
+        exp_str = gcb.get("expires_at")
+        if exp_str:
+            try:
+                exp_dt = datetime.fromisoformat(exp_str)
+                now = datetime.now(timezone.utc)
+                if now < exp_dt:
+                    rem_mins = int((exp_dt - now).total_seconds() / 60)
+                    return True, f"Global Daily Loss Circuit Breaker Active (Loss: -${gcb.get('loss_24h', 0):,.2f}). Trading frozen for {rem_mins} more minutes."
+                else:
+                    # Expired
+                    gcb["active"] = False
+                    s["global_circuit_breaker"] = gcb
+                    _save(s)
+                    log.info("Global Daily Loss Circuit Breaker expired. Normal trading restored.")
+            except Exception:
+                pass
+    return False, ""
+
+
+def check_and_trigger_global_daily_circuit_breaker() -> Optional[dict]:
+    """
+    Check rolling 24-hour total realized loss across all assets.
+    If total realized loss >= cfg.max_daily_loss_usdt ($500), freeze all new entries for cfg.global_circuit_breaker_freeze_hours (12h).
+    """
+    if not cfg.enable_global_daily_circuit_breaker:
+        return None
+
+    active, _ = is_global_circuit_breaker_active()
+    if active:
+        return None
+
+    with _lock:
+        s = _load_raw()
+        closed = s.get("closed_positions", [])
+        now = datetime.now(timezone.utc)
+        cutoff_24h = now - timedelta(hours=24)
+
+        recent_losses = 0.0
+        recent_pnl = 0.0
+        for c in closed:
+            c_time_str = c.get("closed_at")
+            if c_time_str:
+                try:
+                    c_dt = datetime.fromisoformat(c_time_str.replace("Z", "+00:00"))
+                    if c_dt >= cutoff_24h:
+                        pnl = float(c.get("pnl_usdt", 0.0) or c.get("closed_pnl", 0.0))
+                        recent_pnl += pnl
+                        if pnl < 0:
+                            recent_losses += abs(pnl)
+                except Exception:
+                    pass
+
+        # If net PnL is negative and net loss exceeds threshold:
+        if recent_pnl <= -abs(cfg.max_daily_loss_usdt):
+            freeze_hrs = cfg.global_circuit_breaker_freeze_hours
+            expires = now + timedelta(hours=freeze_hrs)
+            gcb = {
+                "active": True,
+                "triggered_at": now.isoformat(),
+                "expires_at": expires.isoformat(),
+                "hours": freeze_hrs,
+                "loss_24h": round(abs(recent_pnl), 2),
+                "reason": f"Rolling 24h loss (-${abs(recent_pnl):,.2f}) exceeded daily cap (-${cfg.max_daily_loss_usdt:,.2f})",
+            }
+            s["global_circuit_breaker"] = gcb
+            _save(s)
+            log.warning("🚨 GLOBAL DAILY CIRCUIT BREAKER TRIGGERED! 24h loss -$%.2f >= -$%.2f cap. Freezing new orders for %.1f hours.",
+                        abs(recent_pnl), cfg.max_daily_loss_usdt, freeze_hrs)
+            return gcb
+    return None
+
+
 def get_custom_leverage(ticker: Optional[str] = None) -> Union[Dict[str, int], Optional[int]]:
     with _lock:
         levs = _load_raw().get("custom_leverage", {})
@@ -671,8 +753,22 @@ def get_last_researched_signal() -> Optional[dict]:
         return _load_raw().get("last_researched_signal")
 
 
+def get_last_dispatch_time() -> float:
+    with _lock:
+        return float(_load_raw().get("last_dispatch_time", 0.0))
+
+
+def set_last_dispatch_time(ts: Optional[float] = None) -> float:
+    with _lock:
+        s = _load_raw()
+        now = ts if ts is not None else time.time()
+        s["last_dispatch_time"] = now
+        _save(s)
+        return now
+
+
 # ── Tracked Calls Storage (for TP1, TP2, SL, +10% gain, -20% drop tracking) ──
-def save_tracked_calls(calls: List[dict]) -> None:
+def save_tracked_calls(calls: List[dict], update_dispatch_time: bool = False) -> None:
     with _lock:
         s = _load_raw()
         if "tracked_calls" not in s:
@@ -681,15 +777,33 @@ def save_tracked_calls(calls: List[dict]) -> None:
             t = c.get("ticker", "").upper()
             tf = c.get("tf", "15m")
             cid = f"{t}_{tf}"
-            # Preserve existing tracking flags if already present
-            existing = s["tracked_calls"].get(cid, {})
-            c["tp1_hit"] = existing.get("tp1_hit", False)
-            c["tp2_hit"] = existing.get("tp2_hit", False)
-            c["sl_hit"] = existing.get("sl_hit", False)
-            c["highest_gain_step"] = existing.get("highest_gain_step", 0) # e.g. 10, 20, 30%
-            c["drop_alert_triggered"] = existing.get("drop_alert_triggered", False)
-            c["created_at"] = existing.get("created_at", _now())
+            existing = s["tracked_calls"].get(cid)
+
+            # If there is already an active running trade from days ago, preserve it under
+            # a timestamped key so it continues tracking all the way to TP or SL!
+            if existing and not existing.get("is_closed") and existing.get("status") in ("ACTIVE", "ACTIVE_TP1", "PENDING_ENTRY"):
+                try:
+                    c_dt_str = existing.get("created_at", _now())
+                    c_dt = datetime.fromisoformat(c_dt_str.replace("Z", "+00:00"))
+                    archived_key = f"{t}_{tf}_{int(c_dt.timestamp())}"
+                except Exception:
+                    archived_key = f"{t}_{tf}_{int(time.time() - 3600)}"
+                s["tracked_calls"][archived_key] = existing
+
+            # Register new call
+            c["tp1_hit"] = False
+            c["tp2_hit"] = False
+            c["sl_hit"] = False
+            c["entry_filled"] = c.get("entry_filled", False)
+            c["is_closed"] = False
+            c["status"] = "PENDING_ENTRY"
+            c["highest_gain_step"] = 0
+            c["lowest_drop_step"] = 0
+            c["drop_alert_triggered"] = False
+            c["created_at"] = c.get("created_at", _now())
             s["tracked_calls"][cid] = c
+        if update_dispatch_time:
+            s["last_dispatch_time"] = time.time()
         _save(s)
 
 
@@ -710,9 +824,13 @@ def clear_closed_tracked_calls() -> int:
     with _lock:
         s = _load_raw()
         tc = s.get("tracked_calls", {})
-        active = {k: v for k, v in tc.items() if not (v.get("tp2_hit") or v.get("sl_hit"))}
+        active = {
+            k: v for k, v in tc.items()
+            if not (v.get("tp2_hit") or v.get("sl_hit") or v.get("is_closed") or v.get("status") in ("CLOSED_TP2", "CLOSED_SL", "EXPIRED"))
+        }
         removed = len(tc) - len(active)
-        s["tracked_calls"] = active
-        _save(s)
+        if removed > 0:
+            s["tracked_calls"] = active
+            _save(s)
         return removed
 

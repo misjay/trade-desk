@@ -894,11 +894,19 @@ def get_top_a_plus_signals(limit: int = 3) -> List[Dict]:
 def dispatch_hourly_calls(
     bot_token: Optional[str] = None,
     chat_id: Optional[str] = None,
+    force: bool = False,
 ) -> bool:
     """
     Every 2 hours: Dispatches 4 Standard Scalp Trades + 3 High-Signal Day Trades (7 setups total).
     Delivers a clean index digest with interactive buttons for live charts & research.
     """
+    if not force:
+        last_disp = state.get_last_dispatch_time()
+        elapsed = time.time() - last_disp
+        if last_disp > 0 and elapsed < 7000:  # 7000s ~ 1 hour 56 minutes
+            log.info("Skipping 2-hour call dispatch: last dispatch was %.1f minutes ago (< 2h cooldown)", elapsed / 60.0)
+            return False
+
     call_cfg = state.get_call_bot_config()
     target_token = bot_token or call_cfg.get("token")
     target_chat = chat_id or call_cfg.get("chat_id")
@@ -915,8 +923,8 @@ def dispatch_hourly_calls(
 
     now_utc_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
-    # Save tracked calls for real-time tracking
-    state.save_tracked_calls(all_calls)
+    # Save tracked calls & record dispatch timestamp
+    state.save_tracked_calls(all_calls, update_dispatch_time=True)
 
     # Deliver Clean Digest with Interactive Buttons (No photo flood!)
     index_lines = [

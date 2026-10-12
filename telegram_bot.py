@@ -801,10 +801,11 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
         )
 
     elif cmd in ("/hourlycalls", "/sendcalls"):
-        _reply(chat_id, "🚀 *Generating and Dispatching 15 Hourly Calls (6 Scalps + 4 Day + 5 Spot Trades with Interactive Buttons)...*")
+        _reply(chat_id, "🚀 *Generating and Dispatching 2-Hour Calls Digest (4 Scalps + 3 Day Trades with Interactive Buttons)...*")
         import market_research
         threading.Thread(
             target=market_research.dispatch_hourly_calls,
+            kwargs={"force": True},
             daemon=True,
             name="hourly-calls-manual",
         ).start()

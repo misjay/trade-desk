@@ -85,12 +85,19 @@ class Config:
 
     # Precision Risk & Gatekeeper Parameters
     enable_btc_momentum_gate: bool = field(default_factory=lambda: os.getenv("ENABLE_BTC_MOMENTUM_GATE", "true").lower() in ("true", "1", "yes"))
+    enable_btc_regime_lock: bool = field(default_factory=lambda: os.getenv("ENABLE_BTC_REGIME_LOCK", "true").lower() in ("true", "1", "yes"))
+    enable_strict_4h_confluence: bool = field(default_factory=lambda: os.getenv("ENABLE_STRICT_4H_CONFLUENCE", "true").lower() in ("true", "1", "yes"))
     enable_wick_confirmation: bool = field(default_factory=lambda: os.getenv("ENABLE_WICK_CONFIRMATION", "true").lower() in ("true", "1", "yes"))
     enable_dynamic_kelly_sizing: bool = field(default_factory=lambda: os.getenv("ENABLE_DYNAMIC_KELLY_SIZING", "true").lower() in ("true", "1", "yes"))
     risk_a_plus: float = field(default_factory=lambda: float(os.getenv("RISK_A_PLUS", "0.0070")))
     risk_standard: float = field(default_factory=lambda: float(os.getenv("RISK_STANDARD", "0.0045")))
     risk_weekend_chop: float = field(default_factory=lambda: float(os.getenv("RISK_WEEKEND_CHOP", "0.0030")))
     enable_daily_pruning: bool = field(default_factory=lambda: os.getenv("ENABLE_DAILY_PRUNING", "true").lower() in ("true", "1", "yes"))
+
+    # Global Daily Loss Circuit Breaker: Freeze all trading for 12h if rolling 24h loss exceeds limit
+    enable_global_daily_circuit_breaker: bool = field(default_factory=lambda: os.getenv("ENABLE_GLOBAL_DAILY_CIRCUIT_BREAKER", "true").lower() in ("true", "1", "yes"))
+    max_daily_loss_usdt: float = field(default_factory=lambda: float(os.getenv("MAX_DAILY_LOSS_USDT", "500.0")))
+    global_circuit_breaker_freeze_hours: float = field(default_factory=lambda: float(os.getenv("GLOBAL_CIRCUIT_BREAKER_FREEZE_HOURS", "12.0")))
 
     # Advanced Precision Upgrades: Sector Baskets, Orderbook Wall Frontrunning, Multi-Step Ratchet Trail
     enable_sector_caps: bool = field(default_factory=lambda: os.getenv("ENABLE_SECTOR_CAPS", "true").lower() in ("true", "1", "yes"))

@@ -170,6 +170,12 @@ def run_scan_cycle(trade_type: str = "scalp", manual: bool = False):
     skipped_paused_count = 0
     executed_count = 0
 
+    # 1. Global Daily Loss Circuit Breaker Check
+    gcb_active, gcb_reason = state.is_global_circuit_breaker_active()
+    if gcb_active and not manual:
+        log.warning("🚨 %s Skipping scheduled %s execution.", gcb_reason, trade_type)
+        return
+
     in_weekend_derisk = is_weekend_derisk_window()
     if in_weekend_derisk and trade_type == "scalp" and not manual:
         log.info("🛡️ Weekend Defense Mode active (Friday 14:00 -> Sunday 22:00 UTC): 15m scalp execution muted. High-timeframe A+ setups only.")
@@ -446,11 +452,16 @@ def main():
     _setup_scheduler()
     _scheduler.start()
 
-    # Dispatch initial batch of Winz hourly calls and spot setups immediately on launch
+    # Dispatch initial batch of Winz hourly calls and spot setups on launch (if >= 2h since last dispatch)
     def _delayed_initial_calls():
         time.sleep(3)
         try:
             import market_research
+            last_disp = state.get_last_dispatch_time()
+            elapsed = time.time() - last_disp
+            if last_disp > 0 and elapsed < 7200:
+                log.info("Skipping initial 2-hour call dispatch on startup (last dispatch was %.1f minutes ago)", elapsed / 60.0)
+                return
             log.info("Dispatching initial batch of Winz hourly calls & spot trades...")
             market_research.dispatch_hourly_calls()
         except Exception as exc:
