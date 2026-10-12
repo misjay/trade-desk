@@ -63,7 +63,7 @@ if args.demo:
 if args.live:
     os.environ["TRADE_MODE"] = "live"
 
-from config import cfg, CORE_TICKERS, EXTRA_TICKERS, WEEKEND_MAJORS_ONLY, is_weekend_derisk_window
+from config import cfg, CORE_TICKERS, EXTRA_TICKERS, WEEKEND_MAJORS_ONLY, is_weekend_derisk_window, check_macro_news_blackout
 import state
 import scanner
 import notifier
@@ -174,6 +174,12 @@ def run_scan_cycle(trade_type: str = "scalp", manual: bool = False):
     gcb_active, gcb_reason = state.is_global_circuit_breaker_active()
     if gcb_active and not manual:
         log.warning("🚨 %s Skipping scheduled %s execution.", gcb_reason, trade_type)
+        return
+
+    # 2. High-Impact Macro Economic News Blackout Check (CPI, FOMC, NFP)
+    macro_active, macro_reason = check_macro_news_blackout()
+    if macro_active and not manual:
+        log.warning("🛑 Macro News Blackout: %s Skipping %s execution.", macro_reason, trade_type)
         return
 
     in_weekend_derisk = is_weekend_derisk_window()

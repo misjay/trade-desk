@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -98,6 +98,11 @@ class Config:
     enable_global_daily_circuit_breaker: bool = field(default_factory=lambda: os.getenv("ENABLE_GLOBAL_DAILY_CIRCUIT_BREAKER", "true").lower() in ("true", "1", "yes"))
     max_daily_loss_usdt: float = field(default_factory=lambda: float(os.getenv("MAX_DAILY_LOSS_USDT", "500.0")))
     global_circuit_breaker_freeze_hours: float = field(default_factory=lambda: float(os.getenv("GLOBAL_CIRCUIT_BREAKER_FREEZE_HOURS", "12.0")))
+
+    # High-Impact Macro Economic Event Blackout (CPI, FOMC, NFP)
+    enable_macro_news_blackout: bool = field(default_factory=lambda: os.getenv("ENABLE_MACRO_NEWS_BLACKOUT", "true").lower() in ("true", "1", "yes"))
+    macro_blackout_pre_mins: int = field(default_factory=lambda: int(os.getenv("MACRO_BLACKOUT_PRE_MINS", "30")))
+    macro_blackout_post_mins: int = field(default_factory=lambda: int(os.getenv("MACRO_BLACKOUT_POST_MINS", "30")))
 
     # Advanced Precision Upgrades: Sector Baskets, Orderbook Wall Frontrunning, Multi-Step Ratchet Trail
     enable_sector_caps: bool = field(default_factory=lambda: os.getenv("ENABLE_SECTOR_CAPS", "true").lower() in ("true", "1", "yes"))
@@ -208,6 +213,83 @@ def is_weekend_derisk_window(now_utc: Optional[datetime] = None) -> bool:
     if weekday == 6 and hour < 22:   # Sunday until 22:00 UTC
         return True
     return False
+
+
+# ── High-Impact Macro Economic Events Schedule (CPI, FOMC, NFP) ────────────
+# Times are in UTC.
+# U.S. BLS reports (CPI, NFP): 8:30 AM Eastern (12:30 UTC during EDT, 13:30 UTC during EST).
+# FOMC rate decisions: 2:00 PM Eastern (18:00 UTC during EST / 19:00 UTC during EDT).
+MACRO_EVENTS: List[Dict[str, str]] = [
+    # 2026 CPI Releases (8:30 AM ET)
+    {"event": "CPI (Jan)", "time": "2026-02-10T13:30:00Z"},
+    {"event": "CPI (Feb)", "time": "2026-03-11T12:30:00Z"},
+    {"event": "CPI (Mar)", "time": "2026-04-14T12:30:00Z"},
+    {"event": "CPI (Apr)", "time": "2026-05-12T12:30:00Z"},
+    {"event": "CPI (May)", "time": "2026-06-10T12:30:00Z"},
+    {"event": "CPI (Jun)", "time": "2026-07-14T12:30:00Z"},
+    {"event": "CPI (Jul)", "time": "2026-08-12T12:30:00Z"},
+    {"event": "CPI (Aug)", "time": "2026-09-11T12:30:00Z"},
+    {"event": "CPI (Sep)", "time": "2026-10-14T12:30:00Z"},
+    {"event": "CPI (Oct)", "time": "2026-11-10T13:30:00Z"},
+    {"event": "CPI (Nov)", "time": "2026-12-10T13:30:00Z"},
+
+    # 2026 NFP / Employment Situation (8:30 AM ET)
+    {"event": "NFP (Dec)", "time": "2026-01-09T13:30:00Z"},
+    {"event": "NFP (Jan)", "time": "2026-02-11T13:30:00Z"},
+    {"event": "NFP (Feb)", "time": "2026-03-06T13:30:00Z"},
+    {"event": "NFP (Mar)", "time": "2026-04-03T12:30:00Z"},
+    {"event": "NFP (Apr)", "time": "2026-05-08T12:30:00Z"},
+    {"event": "NFP (May)", "time": "2026-06-05T12:30:00Z"},
+    {"event": "NFP (Jun)", "time": "2026-07-02T12:30:00Z"},
+    {"event": "NFP (Jul)", "time": "2026-08-07T12:30:00Z"},
+    {"event": "NFP (Aug)", "time": "2026-09-04T12:30:00Z"},
+    {"event": "NFP (Sep)", "time": "2026-10-02T12:30:00Z"},
+    {"event": "NFP (Oct)", "time": "2026-11-06T13:30:00Z"},
+    {"event": "NFP (Nov)", "time": "2026-12-04T13:30:00Z"},
+
+    # 2026 FOMC Interest Rate Decisions (2:00 PM ET / 18:00 UTC or 19:00 UTC)
+    {"event": "FOMC Rate Decision", "time": "2026-01-28T19:00:00Z"},
+    {"event": "FOMC Rate Decision", "time": "2026-03-18T18:00:00Z"},
+    {"event": "FOMC Rate Decision", "time": "2026-04-29T18:00:00Z"},
+    {"event": "FOMC Rate Decision", "time": "2026-06-17T18:00:00Z"},
+    {"event": "FOMC Rate Decision", "time": "2026-07-29T18:00:00Z"},
+    {"event": "FOMC Rate Decision", "time": "2026-09-16T18:00:00Z"},
+    {"event": "FOMC Rate Decision", "time": "2026-10-28T18:00:00Z"},
+    {"event": "FOMC Rate Decision", "time": "2026-12-09T19:00:00Z"},
+]
+
+
+def check_macro_news_blackout(now_utc: Optional[datetime] = None) -> Tuple[bool, str]:
+    """
+    Checks if the current time falls inside a high-impact macro news blackout window.
+    Default window: 30 minutes before release through 30 minutes after release.
+    Prevents toxic execution slippage and whipsaw liquidations during FOMC, CPI, and NFP.
+    """
+    if not cfg.enable_macro_news_blackout:
+        return False, "Macro blackout disabled"
+
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+
+    pre_delta = timedelta(minutes=cfg.macro_blackout_pre_mins)
+    post_delta = timedelta(minutes=cfg.macro_blackout_post_mins)
+
+    for item in MACRO_EVENTS:
+        ev_name = item["event"]
+        ev_dt = datetime.fromisoformat(item["time"].replace("Z", "+00:00"))
+        start_blackout = ev_dt - pre_delta
+        end_blackout = ev_dt + post_delta
+
+        if start_blackout <= now_utc <= end_blackout:
+            if now_utc < ev_dt:
+                mins_left = (ev_dt - now_utc).total_seconds() / 60.0
+                return True, f"High-Impact Macro Event Incoming: {ev_name} in {mins_left:.0f} mins. Order entry locked."
+            else:
+                mins_elapsed = (now_utc - ev_dt).total_seconds() / 60.0
+                mins_rem = cfg.macro_blackout_post_mins - mins_elapsed
+                return True, f"High-Impact Macro Event Volatility: {ev_name} released {mins_elapsed:.0f} mins ago. Order entry locked for {mins_rem:.0f} mins."
+
+    return False, "Clear of scheduled macro events"
 
 # Volatile high-beta assets prioritized for 3-tier fast profit lock (33% @ TP1, 33% @ TP2, 34% runner)
 VOLATILE_TICKERS: List[str] = [

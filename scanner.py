@@ -41,6 +41,7 @@ from config import (
     get_leverage,
     tv_url,
     VERTICAL_CANDLE_BODY_PCT,
+    check_macro_news_blackout,
 )
 import state
 
@@ -366,6 +367,16 @@ def analyze_ticker(ticker: str, trade_type: str = "scalp") -> dict:
     live = struct["live_price"]
     pos = struct["range_pos"]
     is_vert = struct["is_vertical"]
+
+    # High-Impact Macro Economic Event Blackout Check (CPI, FOMC, NFP)
+    macro_active, macro_reason = check_macro_news_blackout()
+    if macro_active:
+        return _make_wait(
+            ticker, live, tf_str,
+            "Macro Event Blackout",
+            macro_reason,
+            trade_type,
+        )
 
     # Rule: Vertical 15m candle in progress -> WAIT
     if is_vert:
