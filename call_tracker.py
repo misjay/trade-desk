@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 import logging
 import threading
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -25,20 +25,141 @@ import state
 log = logging.getLogger(__name__)
 
 _tracker_running = False
+_last_known_btc_regime: Optional[str] = None
+_last_macro_reversal_alert_time: float = 0.0
+_triggered_alerts_cache: Dict[str, float] = {}
+
+
+def detect_trade_reversal(
+    call: dict,
+    live_price: float,
+    gain_pct: float,
+    drop_pct: float,
+    entry_mid: float,
+) -> Optional[Tuple[str, List[str]]]:
+    """
+    Evaluate structural, momentum, and macro signals for an active trade.
+    Returns (reason_string, list_of_actionable_advice_strings) if a reversal is triggered, else None.
+    """
+    ticker = call.get("ticker", "").upper()
+    side = call.get("side", "BUY").upper()
+    tf = call.get("tf", "15m")
+
+    # 1. Profit Retracement (Severe Peak Retracement)
+    peak_gain = float(call.get("peak_gain_pct", 0.0))
+    if peak_gain >= 1.8 and gain_pct <= (peak_gain * 0.40) and gain_pct < 1.0:
+        reason = f"Profit Fade: Trade pulled back from +{peak_gain:.1f}% peak to {gain_pct:+.1f}%"
+        if gain_pct > 0.3:
+            advice = [
+                f"👉 *Lock In Remaining Profit:* Bank remaining {gain_pct:+.1f}% profit at market price.",
+                f"👉 *Trail Stop-Loss to Breakeven:* Move stop to entry ({fmt_dollar(entry_mid)}) immediately to eliminate downside risk.",
+                "👉 *Market Note:* Momentum has stalled; do not let a winning setup become a stop-loss hit.",
+            ]
+        else:
+            advice = [
+                f"👉 *Exit at Breakeven / Market:* Price has given back gains and is threatening entry.",
+                "👉 *Preserve Capital:* Close setup at current mark or move stop to entry level.",
+                "👉 *Invalidate Setup:* Momentum reversed against the setup; cancel remaining targets.",
+            ]
+        return reason, advice
+
+    # 2. Macro BTC Momentum Reversal
+    try:
+        from scanner import check_btc_momentum_gate
+        gate_ok, gate_reason = check_btc_momentum_gate(side)
+        if not gate_ok:
+            if side == "SELL":
+                reason = f"Macro BTC Short Squeeze: {gate_reason}"
+                advice = [
+                    "👉 *Short Squeeze Alert:* Bitcoin is expanding upward, pulling altcoins higher against our short.",
+                    f"👉 *Action:* Tighten Stop-Loss to Entry Breakeven ({fmt_dollar(entry_mid)}) or scale out 50%-75% of position at market.",
+                    "👉 *Discipline:* Do NOT average down into expanding upward momentum.",
+                ]
+            else:  # BUY
+                reason = f"Macro BTC Flush: {gate_reason}"
+                advice = [
+                    "👉 *Liquidation Flush Alert:* Bitcoin is cascading downward, breaking support levels across alts.",
+                    "👉 *Action:* Close Long position at market or tighten stop immediately to avoid knife-catching.",
+                    "👉 *Preserve Cash:* Wait for Bitcoin stabilization before re-entering longs.",
+                ]
+            return reason, advice
+    except Exception as exc:
+        log.debug("Error checking BTC momentum gate in reversal check: %s", exc)
+
+    # 3. 15m Candle Rejection with Volume Spike
+    try:
+        import scanner
+        df = scanner.fetch_ohlcv(ticker, tf_minutes=15, limit=6)
+        if df is not None and len(df) >= 3:
+            c_open = float(df["open"].iloc[-2])
+            c_close = float(df["close"].iloc[-2])
+            c_high = float(df["high"].iloc[-2])
+            c_low = float(df["low"].iloc[-2])
+            vol_latest = float(df["volume"].iloc[-2])
+            vol_avg = float(df["volume"].iloc[-5:-2].mean()) if len(df) >= 5 else 1.0
+            vol_spike = (vol_latest / vol_avg) if vol_avg > 0 else 1.0
+            body = abs(c_close - c_open)
+
+            if vol_spike >= 2.2:
+                if side == "BUY" and (c_close < c_open or (c_high - max(c_open, c_close)) >= 1.5 * body):
+                    reason = f"Bearish Supply Rejection: Reversal wick with {vol_spike:.1f}x volume surge"
+                    advice = [
+                        "👉 *Institutional Distribution:* Heavy seller volume rejecting upside expansion.",
+                        f"👉 *Action:* Lock in partial gains now and tighten Stop-Loss toward {fmt_dollar(live_price)}.",
+                        "👉 *Caution:* Invalidate setup if local support shelf fails.",
+                    ]
+                    return reason, advice
+                elif side == "SELL" and (c_close > c_open or (min(c_open, c_close) - c_low) >= 1.5 * body):
+                    reason = f"Bullish Demand Absorption: Lower absorption wick with {vol_spike:.1f}x volume surge"
+                    advice = [
+                        "👉 *Buyer Absorption:* Aggressive buying absorbing orders off support.",
+                        f"👉 *Action:* Lock in partial short gains now and trail Stop-Loss to Breakeven.",
+                        "👉 *Caution:* Invalidate setup if local supply ceiling is reclaimed.",
+                    ]
+                    return reason, advice
+    except Exception as exc:
+        log.debug("Error checking 15m candle structure for %s: %s", ticker, exc)
+
+    return None
+
+
+_recent_sent_hashes: Dict[str, float] = {}
 
 
 def _send_alert(msg: str) -> None:
-    """Send alert to Telegram calls destination and Discord if configured."""
+    """Send alert to Telegram calls destination and Discord without duplicates."""
+    global _recent_sent_hashes
+    now_ts = time.time()
+    
+    # Clean cache older than 60s
+    _recent_sent_hashes = {k: v for k, v in _recent_sent_hashes.items() if now_ts - v < 60.0}
+    
+    # Hash check to block exact duplicate alert across multiple rapid ticks
+    msg_hash = hash(msg.strip())
+    if msg_hash in _recent_sent_hashes and (now_ts - _recent_sent_hashes[msg_hash]) < 30.0:
+        log.debug("Suppressing duplicate alert dispatched within 30s: %s", msg[:40])
+        return
+    _recent_sent_hashes[msg_hash] = now_ts
+
     call_cfg = state.get_call_bot_config()
     tok = call_cfg.get("token") or cfg.call_bot_token or cfg.telegram_token
-    chats = call_cfg.get("all_chats")
-    if not chats:
+    raw_chats = call_cfg.get("all_chats")
+    if not raw_chats:
         cid = call_cfg.get("chat_id") or cfg.call_bot_chat_id or cfg.telegram_chat_id
-        chats = [cid] if cid else []
+        raw_chats = [cid] if cid else []
 
-    if tok and chats:
+    # Strict Deduplication: preserve order, unique string IDs only
+    seen_chats = set()
+    unique_chats: List[str] = []
+    for c in raw_chats:
+        c_str = str(c).strip()
+        if c_str and c_str not in seen_chats:
+            seen_chats.add(c_str)
+            unique_chats.append(c_str)
+
+    if tok and unique_chats:
         url = f"https://api.telegram.org/bot{tok}/sendMessage"
-        for target_chat in chats:
+        for target_chat in unique_chats:
             try:
                 requests.post(url, json={
                     "chat_id": target_chat,
@@ -150,21 +271,64 @@ def check_tracked_calls_once() -> None:
 
         updates = {}
 
-        # 4. Check Entry Fill Status (Only filled trades can hit targets/stops)
+        # 4. Check Entry Fill Status or Pre-Entry Setup Invalidation
         if not entry_filled:
+            # Check if price invalidated the setup BEFORE filling entry (e.g. blew past SL before ever entering band)
+            pre_entry_invalidated = (live_price <= sl) if side == "BUY" else (live_price >= sl)
+            if pre_entry_invalidated:
+                updates["is_closed"] = True
+                updates["status"] = "INVALIDATED"
+                updates["invalidated_at"] = now_utc.isoformat()
+                log.info("Tracked setup %s %s invalidated prior to entry fill at mark $%.4f (SL=$%.4f)", ticker, side, live_price, sl)
+                _send_alert(
+                    f"⚠️ *{type_prefix}SETUP INVALIDATED (UNFILLED)* ⚠️\n\n"
+                    f"• *Asset*: `${ticker}` ({tf}){age_str}\n"
+                    f"• *Side*: `{side}`\n"
+                    f"• *Planned Entry Band*: `{fmt_dollar(entry_low)} – {fmt_dollar(entry_high)}`\n"
+                    f"• *Invalidation Level*: `{fmt_dollar(sl)}`\n"
+                    f"• *Current Mark*: `{fmt_dollar(live_price)}`\n\n"
+                    f"🚫 *Outcome:* Price blew past structure before entry was filled. Setup cancelled and removed from active tracking."
+                )
+                state.update_tracked_call(cid, updates)
+                continue
+
             if side == "BUY" and live_price <= (entry_high * 1.0005):
                 entry_filled = True
                 updates["entry_filled"] = True
                 updates["status"] = "ACTIVE"
+                updates["trigger_price"] = live_price
+                updates["triggered_at"] = now_utc.isoformat()
                 log.info("Tracked call %s BUY entry filled at mark $%.4f (zone $%.4f–$%.4f)", cid, live_price, entry_low, entry_high)
             elif side == "SELL" and live_price >= (entry_low * 0.9995):
                 entry_filled = True
                 updates["entry_filled"] = True
                 updates["status"] = "ACTIVE"
+                updates["trigger_price"] = live_price
+                updates["triggered_at"] = now_utc.isoformat()
                 log.info("Tracked call %s SELL entry filled at mark $%.4f (zone $%.4f–$%.4f)", cid, live_price, entry_low, entry_high)
             else:
                 # Still waiting for price to retest entry band
                 continue
+
+            # Notify that trade has triggered and is now active
+            base_key = f"{ticker}_{tf}_{round(entry_mid, 4)}"
+            now_ts = time.time()
+            if not call.get("trigger_alert_sent") and (base_key not in _triggered_alerts_cache or now_ts - _triggered_alerts_cache[base_key] > 7200):
+                _triggered_alerts_cache[base_key] = now_ts
+                updates["trigger_alert_sent"] = True
+                tp1_p = call.get("tp1_pct", 2.5)
+                tp2_p = call.get("tp2_pct", 5.0)
+                sl_p = call.get("sl_pct", 1.2)
+                _send_alert(
+                    f"🟢 *{type_prefix}TRADE TRIGGERED & ACTIVE!* 🟢\n\n"
+                    f"• *Asset*: `${ticker}` ({tf} {side}){age_str}\n"
+                    f"• *Trigger / Fill Price*: `{fmt_dollar(live_price)}`\n"
+                    f"• *Entry Band*: `{fmt_dollar(entry_low)} – {fmt_dollar(entry_high)}`\n"
+                    f"• *Target 1 (TP1)*: `+{tp1_p:.1f}%` ({fmt_dollar(tp1)})\n"
+                    f"• *Target 2 (TP2)*: `+{tp2_p:.1f}%` ({fmt_dollar(tp2)})\n"
+                    f"• *Stop Loss (SL)*: `-{sl_p:.1f}%` ({fmt_dollar(sl)})\n\n"
+                    f"⚡ *Action:* Entry band reached. Position is now ACTIVE and under 24/7 target tracking."
+                )
 
         # ── 5. Calculate percentage gain / loss from mid entry ────────────────
         if side == "BUY":
@@ -173,6 +337,10 @@ def check_tracked_calls_once() -> None:
         else: # SELL
             gain_pct = ((entry_mid - live_price) / entry_mid) * 100.0
             drop_pct = ((live_price - entry_mid) / entry_mid) * 100.0
+
+        curr_peak = max(float(call.get("peak_gain_pct", 0.0)), gain_pct)
+        if curr_peak > float(call.get("peak_gain_pct", 0.0)):
+            updates["peak_gain_pct"] = round(curr_peak, 2)
 
         # ── 6. Check Stop-Loss / Breakeven Exit ──────────────────────────────
         tp1_hit = call.get("tp1_hit", False)
@@ -198,12 +366,12 @@ def check_tracked_calls_once() -> None:
                 updates["is_closed"] = True
                 updates["status"] = "CLOSED_SL"
                 _send_alert(
-                    f"🛑 *{type_prefix}STOP LOSS HIT / SETUP INVALIDATED* 🛑\n\n"
-                    f"• *Asset*: `${ticker}` ({tf}){age_str}\n"
-                    f"• *Side*: `{side}`\n"
-                    f"• *Invalidation Level*: `{fmt_dollar(sl)}`\n"
+                    f"🛑 *{type_prefix}STOP LOSS HIT (ACTIVE TRADE CLOSED)* 🛑\n\n"
+                    f"• *Asset*: `${ticker}` ({tf} {side}){age_str}\n"
+                    f"• *Entry Fill*: `{fmt_dollar(entry_mid)}`\n"
+                    f"• *Stop Loss Level*: `{fmt_dollar(sl)}`\n"
                     f"• *Exit Price*: `{fmt_dollar(live_price)}` (-{drop_pct:.1f}%)\n\n"
-                    f"⚠️ *Action:* Setup consumed. Position closed and removed from active tracking."
+                    f"⚠️ *Outcome:* Active position stopped out at predefined risk limit (-1R). Position closed and tracking finalized."
                 )
                 state.update_tracked_call(cid, updates)
                 continue
@@ -240,6 +408,33 @@ def check_tracked_calls_once() -> None:
                     f"💡 *Action:* Bank 50% profit now & Stop-Loss is automatically moved to Entry Breakeven (`{fmt_dollar(entry_mid)}`). Remaining 50% runs risk-free to TP2!"
                 )
 
+        # ── 8b. Check Reversal Warnings & Provide Best Advice ────────────────
+        last_rev_time = float(call.get("reversal_time", 0.0))
+        now_ts = time.time()
+        if not call.get("reversal_alert_sent") or (now_ts - last_rev_time > 7200):
+            rev_data = detect_trade_reversal(
+                call={**call, "peak_gain_pct": curr_peak},
+                live_price=live_price,
+                gain_pct=gain_pct,
+                drop_pct=drop_pct,
+                entry_mid=entry_mid,
+            )
+            if rev_data:
+                rev_reason, rev_advice = rev_data
+                updates["reversal_alert_sent"] = True
+                updates["reversal_reason"] = rev_reason
+                updates["reversal_time"] = now_ts
+                pnl_display = f"+{gain_pct:.1f}% 🟢" if gain_pct >= 0 else f"-{drop_pct:.1f}% 🔴"
+                advice_text = "\n".join(rev_advice)
+                _send_alert(
+                    f"⚠️ *{type_prefix}MARKET REVERSAL ALERT: ${ticker} ({tf} {side})* ⚠️\n\n"
+                    f"• *Active Setup*: `{side}` triggered @ `{fmt_dollar(entry_mid)}`{age_str}\n"
+                    f"• *Current Price*: `{fmt_dollar(live_price)}` (PnL: {pnl_display})\n"
+                    f"• *Reversal Driver*: {rev_reason}\n\n"
+                    f"💡 *Best Actionable Advice:*\n"
+                    f"{advice_text}"
+                )
+
         # ── 9. Check Every +10% Increase Milestone ──────────────────────────
         highest_step = int(call.get("highest_gain_step", 0))
         current_step = int(gain_pct // 10) * 10
@@ -274,6 +469,28 @@ def check_tracked_calls_once() -> None:
     removed = state.clear_closed_tracked_calls()
     if removed > 0:
         log.info("Call tracker purged %d closed/expired calls from memory", removed)
+
+    # ── 12. Desk-Wide Macro BTC Trend Shift Monitor ─────────────────────────
+    global _last_known_btc_regime, _last_macro_reversal_alert_time
+    try:
+        from scanner import get_btc_macro_regime
+        current_btc_regime = get_btc_macro_regime()
+        now_t = time.time()
+        if _last_known_btc_regime is not None and current_btc_regime != _last_known_btc_regime:
+            if now_t - _last_macro_reversal_alert_time > 1800:
+                _last_macro_reversal_alert_time = now_t
+                _send_alert(
+                    f"🌊 *WINZ MACRO REGIME SHIFT ALERT* 🌊\n\n"
+                    f"• *Bitcoin Regime Shift*: `{_last_known_btc_regime}` ➔ `{current_btc_regime}`\n"
+                    f"• *Context*: Macro trend structure has shifted. Altcoin beta will adjust accordingly.\n\n"
+                    f"💡 *Best Professional Advice for Traders:*\n"
+                    f"1. Type `/calls` to review all running trades and their current PnL.\n"
+                    f"2. Move Stop-Loss on profitable trades to Entry Breakeven.\n"
+                    f"3. Avoid new counter-trend entries until fresh 15m/4h structural consolidation confirms."
+                )
+        _last_known_btc_regime = current_btc_regime
+    except Exception as exc:
+        log.debug("Macro BTC regime monitor error: %s", exc)
 
 
 def _tracker_loop() -> None:
