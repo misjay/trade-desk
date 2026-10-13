@@ -522,8 +522,31 @@ def build_signal_for_timeframe(ticker: str, tf_minutes: int = 15) -> dict:
         live_price = struct["live_price"]
         range_pos = struct["range_pos"]
 
-        if range_pos <= 0.48:
-            side = "BUY"
+        # ── Higher-Timeframe (4H / BTC) Macro Trend Alignment Gatekeeper ──
+        # Fix: Never take counter-trend scalps against the dominant 4H trend
+        from scanner import detect_market_regime, get_btc_macro_regime
+        asset_regime_info = detect_market_regime(t_clean)
+        asset_regime = asset_regime_info.get("regime", "CHOP_RANGE")
+        btc_regime = get_btc_macro_regime()
+
+        if is_scalp:
+            # 15m Scalp must strictly align with 4H trend:
+            if asset_regime == "STRONG_BEAR" or btc_regime == "STRONG_BEAR":
+                side = "SELL"  # Macro downtrend: Short relief bounces at 15m supply
+            elif asset_regime == "STRONG_BULL" or btc_regime == "STRONG_BULL":
+                side = "BUY"   # Macro uptrend: Buy pullbacks into 15m demand
+            else:
+                side = "BUY" if range_pos <= 0.48 else "SELL"
+        else:
+            # 4h Day trade:
+            if asset_regime == "STRONG_BEAR":
+                side = "SELL"
+            elif asset_regime == "STRONG_BULL":
+                side = "BUY"
+            else:
+                side = "BUY" if range_pos <= 0.48 else "SELL"
+
+        if side == "BUY":
             d_low, d_high = struct["demand_shelf"]
             if is_scalp:
                 # Scalp: 0.6% limit accumulation band, TP1 +2.4%, TP2 +5.0%, SL 1.2%
@@ -539,10 +562,10 @@ def build_signal_for_timeframe(ticker: str, tf_minutes: int = 15) -> dict:
                 sl = round(entry_low * 0.970, 8)
                 tp1 = round(max(struct.get("mid_range", 0), entry_high * 1.065), 8)
                 tp2 = round(max(struct.get("session_high", 0), entry_high * 1.140), 8)
-            reason = f"Pullback into {tf_str} demand shelf ${entry_low:,.2f}–${entry_high:,.2f}"
+            trend_note = " (Aligned with 4H Bullish Macro Trend)" if (asset_regime == "STRONG_BULL" or btc_regime == "STRONG_BULL") else ""
+            reason = f"Pullback into {tf_str} demand shelf {fmt_dollar(entry_low)}–{fmt_dollar(entry_high)}{trend_note}"
             structure_str = f"Demand shelf at session discount ({range_pos*100:.1f}% range)"
         else:
-            side = "SELL"
             s_low, s_high = struct["supply_shelf"]
             if is_scalp:
                 # Scalp short: TP1 -2.4%, TP2 -5.0%, SL +1.2%
@@ -558,31 +581,48 @@ def build_signal_for_timeframe(ticker: str, tf_minutes: int = 15) -> dict:
                 sl = round(entry_high * 1.030, 8)
                 tp1 = round(min(struct.get("mid_range", 9e9), entry_low * 0.935), 8)
                 tp2 = round(min(struct.get("session_low", 9e9), entry_low * 0.860), 8)
-            reason = f"Rejection at {tf_str} supply ceiling ${entry_low:,.2f}–${entry_high:,.2f}"
+            trend_note = " (Aligned with 4H Bearish Macro Trend)" if (asset_regime == "STRONG_BEAR" or btc_regime == "STRONG_BEAR") else ""
+            reason = f"Rejection at {tf_str} supply ceiling {fmt_dollar(entry_low)}–{fmt_dollar(entry_high)}{trend_note}"
             structure_str = f"Supply ceiling at session premium ({range_pos*100:.1f}% range)"
 
         risk = abs(live_price - sl)
         reward = abs(tp1 - live_price)
         rr = round(reward / risk, 2) if risk > 0 else 2.0
     else:
+        from scanner import get_btc_macro_regime
+        btc_reg = get_btc_macro_regime()
+        side = "SELL" if btc_reg == "STRONG_BEAR" else "BUY"
         lp = fetch_live_price(t_clean) or 100.0
-        side = "BUY"
         live_price = lp
         if is_scalp:
-            entry_low = round(lp * 0.992, 8)
-            entry_high = round(lp * 0.998, 8)
-            sl = round(entry_low * 0.988, 8)
-            tp1 = round(entry_high * 1.025, 8)
-            tp2 = round(entry_high * 1.050, 8)
+            if side == "BUY":
+                entry_low = round(lp * 0.992, 8)
+                entry_high = round(lp * 0.998, 8)
+                sl = round(entry_low * 0.988, 8)
+                tp1 = round(entry_high * 1.025, 8)
+                tp2 = round(entry_high * 1.050, 8)
+            else:
+                entry_low = round(lp * 1.002, 8)
+                entry_high = round(lp * 1.008, 8)
+                sl = round(entry_high * 1.012, 8)
+                tp1 = round(entry_low * 0.975, 8)
+                tp2 = round(entry_low * 0.950, 8)
         else:
-            entry_low = round(lp * 0.982, 8)
-            entry_high = round(lp * 0.995, 8)
-            sl = round(entry_low * 0.970, 8)
-            tp1 = round(entry_high * 1.065, 8)
-            tp2 = round(entry_high * 1.140, 8)
+            if side == "BUY":
+                entry_low = round(lp * 0.982, 8)
+                entry_high = round(lp * 0.995, 8)
+                sl = round(entry_low * 0.970, 8)
+                tp1 = round(entry_high * 1.065, 8)
+                tp2 = round(entry_high * 1.140, 8)
+            else:
+                entry_low = round(lp * 1.005, 8)
+                entry_high = round(lp * 1.018, 8)
+                sl = round(entry_high * 1.030, 8)
+                tp1 = round(entry_low * 0.935, 8)
+                tp2 = round(entry_low * 0.860, 8)
         rr = 2.2
-        reason = f"Structural {tf_str} order block setup"
-        structure_str = f"Support shelf near ${lp:,.2f}"
+        reason = f"Structural {tf_str} order block setup ({side})"
+        structure_str = f"Support/Resistance shelf near ${lp:,.2f}"
 
     # Calculate exact distance percentages from average entry
     entry_mid = (entry_low + entry_high) / 2.0 if (entry_low and entry_high) else live_price
@@ -602,9 +642,12 @@ def build_signal_for_timeframe(ticker: str, tf_minutes: int = 15) -> dict:
     # Higher for strong R:R and clear structure
     base_conv = 88.0
     conv_rr_boost = min(6.0, (rr - 1.8) * 3.5)
-    # Give slight variance based on ticker for unique calibration
+    # Trend alignment conviction boost (+3% when aligned with 4H macro)
+    if (side == "SELL" and (asset_regime == "STRONG_BEAR" or btc_regime == "STRONG_BEAR")) or \
+       (side == "BUY" and (asset_regime == "STRONG_BULL" or btc_regime == "STRONG_BULL")):
+        base_conv += 3.0
     hash_offset = (sum(ord(c) for c in t_clean) % 5)
-    conviction = round(min(97.0, max(82.0, base_conv + conv_rr_boost + hash_offset)), 1)
+    conviction = round(min(98.0, max(82.0, base_conv + conv_rr_boost + hash_offset)), 1)
 
     return {
         "ticker": t_clean,

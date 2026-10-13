@@ -13,8 +13,32 @@ os.environ.setdefault("DEMO_ENV", "paper")
 
 
 class TestTelegramBot(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import tempfile
+        import shutil
+        from pathlib import Path
+        import state
+        import user_store
+        cls.temp_dir = tempfile.mkdtemp()
+        cls.orig_state_file = state._STATE_FILE
+        state._STATE_FILE = Path(cls.temp_dir) / "test_state.json"
+        cls.orig_users_file = user_store._USERS_FILE
+        user_store._USERS_FILE = Path(cls.temp_dir) / "test_users_state.json"
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        import state
+        import user_store
+        state._STATE_FILE = cls.orig_state_file
+        user_store._USERS_FILE = cls.orig_users_file
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+
     def setUp(self):
         import state
+        from config import cfg
+        cfg.telegram_chat_id = "12345"
         state.set_paused(False)
 
     def test_help_command(self):
@@ -478,6 +502,103 @@ class TestTelegramBot(unittest.TestCase):
             mock_send_tweet.reset_mock()
             telegram_bot.handle_command("convert to Twitter post", "12345")
             mock_send_tweet.assert_called()
+
+    def test_non_admin_blocked_from_master_desk_commands(self):
+        import telegram_bot
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/scan", "99999_stranger")
+            mock_reply.assert_called_once()
+            self.assertIn("Access Restricted: Master Desk Command", mock_reply.call_args[0][1])
+
+    def test_public_user_duplicated_commands(self):
+        import telegram_bot
+        import user_store
+        import state
+
+        stranger_id = "88888_trader"
+
+        # 1. /status for public user shows personal portfolio, does NOT call engine Bybit
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/status", stranger_id)
+            mock_reply.assert_called_once()
+            self.assertIn("Your Personal Trading Desk Status", mock_reply.call_args[0][1])
+            self.assertIn("$10,000.00 USDT", mock_reply.call_args[0][1])
+
+        # 2. /pause & /resume isolate between public user and master desk
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            state.set_paused(False)
+            telegram_bot.handle_command("/pause", stranger_id)
+            self.assertTrue(user_store.is_user_paused(stranger_id))
+            self.assertFalse(state.is_paused())  # Master desk remains unpaused!
+
+            telegram_bot.handle_command("/resume", stranger_id)
+            self.assertFalse(user_store.is_user_paused(stranger_id))
+
+        # 3. /avoid & /allow & /avoided isolate to public user
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/avoid DOGE PEPE", stranger_id)
+            user_avoid = user_store.get_user_avoid_list(stranger_id)
+            self.assertIn("DOGE", user_avoid)
+            self.assertIn("PEPE", user_avoid)
+            self.assertNotIn("DOGE", state.get_avoid_list())  # Master desk unaffected!
+
+            telegram_bot.handle_command("/allow DOGE", stranger_id)
+            user_avoid = user_store.get_user_avoid_list(stranger_id)
+            self.assertNotIn("DOGE", user_avoid)
+            self.assertIn("PEPE", user_avoid)
+
+        # 4. /leverage & /existingleverage isolate to public user
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/leverage SOL 20", stranger_id)
+            self.assertEqual(user_store.get_user_leverage(stranger_id, "SOL"), 20)
+            telegram_bot.handle_command("/existingleverage", stranger_id)
+            self.assertIn("20x", mock_reply.call_args[0][1])
+
+        # 5. /trade opens a paper position for public user
+        with patch("scanner.fetch_live_price", return_value=150.0):
+            with patch.object(telegram_bot, "_reply") as mock_reply:
+                telegram_bot.handle_command("/trade SOL BUY", stranger_id)
+                open_pos = user_store.get_user_open_positions(stranger_id)
+                self.assertEqual(len(open_pos), 1)
+                self.assertIn("Opened Personal Demo Trade", mock_reply.call_args[0][1])
+
+                # /positions displays the trade
+                telegram_bot.handle_command("/positions", stranger_id)
+                self.assertIn("Your Personal Active Positions", mock_reply.call_args[0][1])
+                self.assertIn("SOL", mock_reply.call_args[0][1])
+
+        # 6. /tp and /closeall operate on public user's positions
+        with patch("scanner.fetch_live_price", return_value=160.0):
+            with patch.object(telegram_bot, "_reply") as mock_reply:
+                telegram_bot.handle_command("/tp", stranger_id)
+                self.assertIn("Personal Take Profit Executed", mock_reply.call_args[0][1])
+                self.assertEqual(len(user_store.get_user_open_positions(stranger_id)), 0)
+
+        # 7. /resetdemo resets the public user's portfolio
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/resetdemo", stranger_id)
+            self.assertIn("Personal Demo Portfolio Reset", mock_reply.call_args[0][1])
+            self.assertEqual(user_store.get_user_equity(stranger_id), 10000.0)
+
+    def test_subscribe_and_unsubscribe_commands(self):
+        import telegram_bot
+        import state
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/subscribe", "77777_user")
+            self.assertTrue(state.is_call_bot_subscribed("77777_user"))
+            self.assertIn("Subscribed to Winz Signals & Alerts", mock_reply.call_args[0][1])
+
+            telegram_bot.handle_command("/unsubscribe", "77777_user")
+            self.assertFalse(state.is_call_bot_subscribed("77777_user"))
+            self.assertIn("Unsubscribed from Broadcasts", mock_reply.call_args[0][1])
+
+    def test_public_user_help_menu(self):
+        import telegram_bot
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/help", "99999_stranger")
+            mock_reply.assert_called_once()
+            self.assertIn("Winz Trading Desk & Market Intelligence Hub", mock_reply.call_args[0][1])
+            self.assertIn("/calls", mock_reply.call_args[0][1])
 
 
 if __name__ == "__main__":

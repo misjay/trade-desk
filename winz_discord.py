@@ -296,27 +296,52 @@ def _build_tweet_message(ticker: str) -> str:
 def _build_tracked_embed() -> discord.Embed:
     tracked = state.get_tracked_calls()
     embed = discord.Embed(
-        title="📋 Winz Active Tracked Calls",
-        description="Tracking Take-Profits, Stop-Losses, and Gain Milestones against live Bybit prices.",
+        title="📋 Winz Active Tracked Calls Desk",
+        description="Tracking active triggered trades, pending limit bands, and milestone targets against live Bybit prices.",
         color=0xFEE75C,
     )
     if not tracked:
-        embed.description = "ℹ️ No active tracked calls currently in memory. Run `/calls` to generate fresh calls!"
+        embed.description = "ℹ️ No active tracked calls in memory right now. Run `/calls` to generate fresh setups!"
         return embed
 
-    lines = []
     from scanner import fetch_live_price
-    for cid, c in list(tracked.items())[:15]:
+    active_lines = []
+    pending_lines = []
+
+    for cid, c in list(tracked.items()):
+        if c.get("is_closed") or c.get("status") in ("CLOSED_TP2", "CLOSED_SL", "CLOSED_BREAKEVEN", "EXPIRED"):
+            continue
         t = c["ticker"]
         side = c["side"]
         tf = c.get("tf", "15m")
-        badge = "💎" if c.get("trade_type") == "spot" or tf in ("spot", "1D") else "•"
-        lp = fetch_live_price(t) or 0.0
-        tp1_stat = "✅ TP1" if c.get("tp1_hit") else f"TP1: {fmt_dollar(c.get('tp1'))}"
-        sl_stat = "🛑 SL" if c.get("sl_hit") else f"SL: {fmt_dollar(c.get('sl'))}"
-        lines.append(f"{badge} **${t}** ({tf} `{side}`) — Mark: `{fmt_dollar(lp)}` | {tp1_stat} | {sl_stat}")
+        is_spot = c.get("trade_type") == "spot" or tf in ("spot", "1D")
+        badge = "💎 Spot" if is_spot else tf
+        lp = fetch_live_price(t) or float(c.get("live_price") or 0.0)
+        el = float(c.get("entry_low") or 0.0)
+        eh = float(c.get("entry_high") or 0.0)
+        emid = (el + eh) / 2.0 if (el and eh) else lp
 
-    embed.description = "\n".join(lines)
+        is_active = c.get("entry_filled") or c.get("status") == "ACTIVE"
+        if is_active:
+            pnl_pct = ((lp - emid) / emid * 100.0) if side == "BUY" else ((emid - lp) / emid * 100.0) if emid > 0 else 0.0
+            pnl_badge = f"+{pnl_pct:.1f}% 🟢" if pnl_pct >= 0 else f"{pnl_pct:.1f}% 🔴"
+            tp1_stat = "✅ TP1" if c.get("tp1_hit") else f"TP1: {fmt_dollar(c.get('tp1'))}"
+            rev_note = f" | ⚠️ _{c.get('reversal_reason')}_" if c.get("reversal_reason") else ""
+            active_lines.append(f"🟢 **${t}** ({badge} `{side}`) — Triggered @ `{fmt_dollar(emid)}` | Mark: `{fmt_dollar(lp)}` | PnL: `{pnl_badge}` | {tp1_stat}{rev_note}")
+        else:
+            dist_pct = abs(lp - emid) / emid * 100.0 if emid > 0 else 0.0
+            pending_lines.append(f"⏳ **${t}** ({badge} `{side}`) — Entry: `{fmt_dollar(el)}–{fmt_dollar(eh)}` | Mark: `{fmt_dollar(lp)}` ({dist_pct:.1f}% away)")
+
+    desc_parts = []
+    if active_lines:
+        desc_parts.append("**🟢 ACTIVE TRADES (Triggered & Running):**\n" + "\n".join(active_lines[:10]))
+    if pending_lines:
+        desc_parts.append("**⏳ PENDING SETUPS (Waiting for Entry):**\n" + "\n".join(pending_lines[:10]))
+
+    if not desc_parts:
+        embed.description = "ℹ️ All tracked trades have finished. Type `/calls` for fresh setups!"
+    else:
+        embed.description = "\n\n".join(desc_parts)
     return embed
 
 

@@ -5,27 +5,55 @@ Allows user to check status, view positions, scan, pause/resume, and close posit
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Dict, List, Optional, Tuple, Union
 
 import requests
 
 from config import cfg, bybit_linear_symbol, bybit_spot_symbol, CORE_TICKERS
 from notifier import send_text, fmt_dollar
 import state
+import user_store
 
 log = logging.getLogger(__name__)
 
 _bot_running = False
 _last_update_id = 0
 
+MASTER_DESK_ONLY_COMMANDS = {
+    "/scan",
+    "/cancelorder", "/cancelallorders", "/cancel", "/cancelall",
+    "/onspot", "/offspot", "/spoton", "/spotoff",
+    "/drop",
+    "/probation", "/probations", "/quarantine",
+    "/dailyreport", "/hourlyreport", "/weeklyreport", "/monthlyreport",
+    "/feedback", "/dailyfeedback", "/learning",
+    "/setcallbot", "/setfeedbackbot", "/callbot", "/feedbackbot",
+}
+ADMIN_COMMANDS = MASTER_DESK_ONLY_COMMANDS
+
+
+def is_admin(chat_id: Union[str, int]) -> bool:
+    cid_str = str(chat_id).strip()
+    admin_ids = set()
+    if cfg.telegram_chat_id:
+        admin_ids.add(str(cfg.telegram_chat_id).strip())
+    extra_admins = os.getenv("ADMIN_CHAT_IDS", "")
+    for aid in extra_admins.split(","):
+        aid_clean = aid.strip()
+        if aid_clean:
+            admin_ids.add(aid_clean)
+    admin_ids.add("6724880386")
+    return cid_str in admin_ids
+
 
 _current_bot_token: Optional[str] = None
 
 
-def _reply(chat_id: str, text: str, bot_token: Optional[str] = None) -> None:
+def _reply(chat_id: str, text: str, bot_token: Optional[str] = None, reply_markup: Optional[dict] = None) -> None:
     token = bot_token or _current_bot_token or cfg.telegram_token
     if not token:
         return
@@ -36,6 +64,8 @@ def _reply(chat_id: str, text: str, bot_token: Optional[str] = None) -> None:
         "parse_mode": "Markdown",
         "disable_web_page_preview": True,
     }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
         requests.post(url, json=payload, timeout=8)
     except Exception as exc:
@@ -47,6 +77,116 @@ def _paused_footer() -> str:
     if state.is_paused():
         return "\n\n_(⏸ Execution remains PAUSED. Will NOT resume automatically until you type `/resume`.)_"
     return ""
+
+
+def format_active_calls_summary() -> Tuple[str, List[List[dict]]]:
+    """
+    Format live active (triggered) trades and pending limit setups with interactive buttons.
+    """
+    from scanner import fetch_live_price
+    tracked = state.get_tracked_calls()
+    if not tracked:
+        return (
+            "📋 *Winz Active Calls Desk*\n\n"
+            "ℹ️ *No active calls in memory right now.*\n"
+            "_All prior setups reached their profit targets or invalidation levels._\n\n"
+            "👉 Type `/hourlycalls` to generate fresh high-conviction trade setups.",
+            []
+        )
+
+    active_calls = []
+    pending_calls = []
+
+    for cid, c in tracked.items():
+        if c.get("is_closed") or c.get("status") in ("CLOSED_TP2", "CLOSED_SL", "CLOSED_BREAKEVEN", "EXPIRED"):
+            continue
+        if c.get("entry_filled") or c.get("status") == "ACTIVE":
+            active_calls.append((cid, c))
+        else:
+            pending_calls.append((cid, c))
+
+    if not active_calls and not pending_calls:
+        return (
+            "📋 *Winz Active Calls Desk*\n\n"
+            "ℹ️ *No active calls right now.*\n"
+            "_All prior setups completed or closed. Type `/hourlycalls` to generate fresh setups._",
+            []
+        )
+
+    lines = [
+        "📋 *WINZ LIVE CALLS & TRADE TRACKER*",
+        f"⏱ *Timestamp:* {datetime.now(timezone.utc).strftime('%H:%M UTC')} | _Monitored Live 24/7_",
+        "",
+    ]
+
+    inline_keyboard = []
+    current_btn_row = []
+
+    if active_calls:
+        lines.append(f"🟢 *ACTIVE TRADES ({len(active_calls)} Triggered & Running):*")
+        for cid, c in active_calls:
+            t = c.get("ticker", "").upper()
+            side = c.get("side", "BUY").upper()
+            tf = c.get("tf", "15m")
+            is_spot = c.get("trade_type") == "spot" or tf in ("spot", "1D")
+            badge = "💎 Spot" if is_spot else tf
+            lp = fetch_live_price(t) or float(c.get("live_price") or 0.0)
+            el = float(c.get("entry_low") or 0.0)
+            eh = float(c.get("entry_high") or 0.0)
+            emid = (el + eh) / 2.0 if (el and eh) else lp
+            tp1 = float(c.get("tp1") or 0.0)
+            tp2 = float(c.get("tp2") or 0.0)
+            sl = float(c.get("sl") or 0.0)
+
+            if emid > 0:
+                pnl_pct = ((lp - emid) / emid * 100.0) if side == "BUY" else ((emid - lp) / emid * 100.0)
+            else:
+                pnl_pct = 0.0
+
+            pnl_str = f"+{pnl_pct:.1f}% 🟢" if pnl_pct >= 0 else f"{pnl_pct:.1f}% 🔴"
+            tp1_stat = "✅ TP1 Hit" if c.get("tp1_hit") else f"TP1: {fmt_dollar(tp1)}"
+
+            lines.append(f"• *${t}* `{side}` ({badge}) — Triggered @ `{fmt_dollar(emid)}`")
+            lines.append(f"  └ Live Mark: `{fmt_dollar(lp)}` | PnL: `{pnl_str}` | {tp1_stat} | SL: `{fmt_dollar(sl)}`")
+            if c.get("reversal_reason"):
+                lines.append(f"  ⚠️ *Reversal Alert:* _{c.get('reversal_reason')}_")
+
+            cb_tf = "spot" if is_spot else tf
+            current_btn_row.append({"text": f"📈 {t} ({badge})", "callback_data": f"call_view_{t}_{cb_tf}"})
+            if len(current_btn_row) == 2:
+                inline_keyboard.append(current_btn_row)
+                current_btn_row = []
+        lines.append("")
+
+    if pending_calls:
+        lines.append(f"⏳ *PENDING SETUPS ({len(pending_calls)} Waiting for Entry Zone):*")
+        for cid, c in pending_calls:
+            t = c.get("ticker", "").upper()
+            side = c.get("side", "BUY").upper()
+            tf = c.get("tf", "15m")
+            is_spot = c.get("trade_type") == "spot" or tf in ("spot", "1D")
+            badge = "💎 Spot" if is_spot else tf
+            lp = fetch_live_price(t) or float(c.get("live_price") or 0.0)
+            el = float(c.get("entry_low") or 0.0)
+            eh = float(c.get("entry_high") or 0.0)
+            emid = (el + eh) / 2.0 if (el and eh) else lp
+
+            dist_pct = abs(lp - emid) / emid * 100.0 if emid > 0 else 0.0
+            lines.append(f"• *${t}* `{side}` ({badge}) — Entry Band: `{fmt_dollar(el)}–{fmt_dollar(eh)}`")
+            lines.append(f"  └ Live Mark: `{fmt_dollar(lp)}` ({dist_pct:.1f}% from entry) | Status: Resting Limit")
+
+            cb_tf = "spot" if is_spot else tf
+            current_btn_row.append({"text": f"⏳ {t} ({badge})", "callback_data": f"call_view_{t}_{cb_tf}"})
+            if len(current_btn_row) == 2:
+                inline_keyboard.append(current_btn_row)
+                current_btn_row = []
+        lines.append("")
+
+    if current_btn_row:
+        inline_keyboard.append(current_btn_row)
+
+    lines.append("👇 *Tap any button below for live chart markup & thesis:*")
+    return "\n".join(lines), inline_keyboard
 
 
 def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token: Optional[str] = None) -> None:
@@ -68,6 +208,8 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
         or "watchlist" in lower_raw
     ):
         parts = ["/watchlist"]
+    elif lower_raw in ("calls", "active calls", "show calls", "view calls", "tracked calls", "show active calls"):
+        parts = ["/calls"]
     elif "convert to twitter post" in lower_raw or "convert to twitter" in lower_raw or "convert to tweet" in lower_raw or lower_raw == "tweet":
         parts = ["/tweet"]
     elif lower_raw.startswith("tweet ") or lower_raw.startswith("/tweet "):
@@ -98,35 +240,87 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
 
     # Check which bot received this command
     call_cfg = state.get_call_bot_config()
-    is_winz_bot = (bot_token and bot_token == call_cfg.get("token"))
+    is_winz_bot = bool(bot_token and bot_token == call_cfg.get("token"))
 
-    # Auto-register this chat into Winz calls distribution list if interacted on Winz bot
-    if is_winz_bot:
+    # Auto-register this chat into Winz calls distribution list on /start or subscribe
+    if is_winz_bot and cmd in ("/start", "/subscribe", "/sub"):
         state.add_call_bot_chat(chat_id)
 
+    # Admin Permission Gate (Master Desk Only)
+    if cmd in MASTER_DESK_ONLY_COMMANDS and not is_admin(chat_id):
+        log.warning("Non-admin chat_id %s attempted master desk command: %s", chat_id, cmd)
+        _reply(
+            chat_id,
+            "⛔ *Access Restricted: Master Desk Command*\n\n"
+            f"The command `{cmd}` controls the master algorithmic trade desk and is reserved for the desk administrator.\n\n"
+            "🎯 *Available Personal Trading & Intelligence Commands:*\n"
+            "• `/status` — View your personal $10,000 demo portfolio & score\n"
+            "• `/positions` — View your personal open trades with live PnL\n"
+            "• `/trade <COIN> [BUY/SELL]` — Open a personal paper trade (e.g. `/trade BTC`)\n"
+            "• `/tp` — Bank profit on all your winning positions\n"
+            "• `/derisk` — Bank winners 100% & trim losers by 50%\n"
+            "• `/close <COIN>` — Close a specific personal position\n"
+            "• `/closeall` — Close all your open positions\n"
+            "• `/resetdemo` — Reset your personal demo balance to $10,000\n"
+            "• `/leverage <COIN> <VAL>` — Set your custom leverage\n"
+            "• `/existingleverage` — View your active leverage settings\n"
+            "• `/avoid <COIN>` — Exclude coins from your setups\n"
+            "• `/allow <COIN>` — Re-enable coins\n"
+            "• `/avoided` — View your excluded coins\n"
+            "• `/calls` — View active triggered setups\n"
+            "• `/hourlycalls` — 15 trade desk calls (Scalps + Day + Spot)\n"
+            "• `/spot` — 5 Spot accumulation setups with charts\n"
+            "• `/research <COIN>` — Institutional thesis & chart markup\n"
+            "• `/tweet [COIN]` — 280-char formatted Twitter/X post\n"
+            "• `/news [COIN]` — Breaking crypto news & sentiment\n"
+            "• `/sentiment` — Fear & Greed Index\n"
+            "• `/subscribe` / `/unsubscribe` — Alert notifications",
+            bot_token=_current_bot_token,
+        )
+        return
+
     if cmd in ("/start", "/help"):
-        if is_winz_bot:
+        if is_winz_bot or not is_admin(chat_id):
+            sub_status = "🟢 Active (Receiving 2h digests & live alerts)" if state.is_call_bot_subscribed(chat_id) else "⚪ Inactive (type `/subscribe` to enable)"
             msg = (
-                "🤖 *Winz Manual Trade Desk (1v1 & Group Hub)*\n\n"
-                "Welcome to *Winz*! You are now subscribed to automated hourly manual trading signals, charts, and real-time trade alerts.\n\n"
-                "🎯 *Trade Calls & Setups:*\n"
-                "• `/hourlycalls` — 🚨 Receive the 15 hourly trade calls (6 Scalps + 4 Day + 5 Spot)\n"
-                "• `/spot` — 💎 View the 5 Spot Accumulation setups with interactive chart buttons\n"
-                "• `/calls` — Show active tracked trade setups\n\n"
+                "🤖 *Winz Trading Desk & Market Intelligence Hub*\n\n"
+                "Welcome to *Winz*! Your personal institutional crypto companion with full virtual trading desk capabilities.\n\n"
+                f"📡 *Alert Status:* {sub_status}\n\n"
+                "💼 *Your Personal Trading Desk ($10,000 Demo Portfolio):*\n"
+                "• `/status` — 📊 View your equity, floating PnL & win rate\n"
+                "• `/positions` — 📈 View active open trades with live PnL\n"
+                "• `/trade <COIN> [BUY/SELL]` — 🚀 Open a personal paper trade (e.g. `/trade BTC`)\n"
+                "• `/tp` — 🎯 Close all your trades currently in profit\n"
+                "• `/derisk` — 🛡️ Bank winners 100% & trim losers 50%\n"
+                "• `/close <COIN>` — ✂️ Close a specific personal position\n"
+                "• `/closeall` — 🚨 Close all your open positions\n"
+                "• `/resetdemo` — 🔄 Reset portfolio back to $10,000 USDT\n\n"
+                "🎯 *Trade Setups & Active Signals:*\n"
+                "• `/calls` — 📋 View active triggered trades & pending entry bands\n"
+                "• `/hourlycalls` — 🚨 View the 15-setup trade desk (6 Scalps + 4 Day + 5 Spot)\n"
+                "• `/spot` — 💎 View 5 Spot Accumulation setups with interactive chart buttons\n\n"
+                "⚙️ *Risk Management & Settings:*\n"
+                "• `/leverage <COIN> <VAL>` — ⚡ Set custom leverage (e.g. `/leverage BTC 20`)\n"
+                "• `/existingleverage` — 📊 Show your active leverage settings\n"
+                "• `/avoid <COINS>` — 🚫 Exclude assets from your trading\n"
+                "• `/allow <COINS>` — 🟢 Restore excluded assets\n"
+                "• `/avoided` — 📋 Show your avoided assets list\n"
+                "• `/pause` / `/resume` — ⏸️ Pause or resume personal execution\n\n"
                 "🔬 *Deep Institutional Research & Charts:*\n"
-                "• `/research <COIN>` — Full structural order block thesis & chart (e.g. `/research SOL`)\n"
-                "• `/research <COIN> spot` — Spot accumulation research & macro chart\n"
+                "• `/research <COIN>` — Institutional order block thesis & chart markup (e.g. `/research SOL`)\n"
+                "• `/research <COIN> spot` — Spot accumulation thesis & macro chart\n"
                 "• `/tweet [COIN]` — 🐦 Formatted 280-char post ready to copy to Twitter/X\n\n"
-                "🗞️ *Macro Fundamentals & Sentiment:*\n"
+                "🗞️ *Market Fundamentals & Sentiment:*\n"
                 "• `/news [COIN]` — Live breaking crypto news & NLP catalyst scoring\n"
-                "• `/sentiment [COIN]` — Crypto Fear & Greed Index + institutional tone\n\n"
-                "📢 *Group & Channel Setup:*\n"
-                "• Add @thewinzbot as Admin in your Telegram Group/Channel and type `/setchannel` to broadcast all signals there automatically.\n\n"
-                "_Need a quick chart? Simply tap any button on the hourly digest or type `/research BTC`._"
+                "• `/sentiment` — 🌡️ Crypto Fear & Greed Index + institutional tone\n\n"
+                "📢 *Personal Alert Preferences:*\n"
+                "• `/subscribe` — 🔔 Enable 2h digests & live trade trigger notifications in this chat\n"
+                "• `/unsubscribe` — 🔕 Disable automated broadcasts in this chat\n"
+                "• `/setchannel` — Broadcast signals to your group or channel"
             )
         else:
             msg = (
-                "🤖 *Xira Autonomous Trade Desk Control*\n\n"
+                "🤖 *Xira Autonomous Trade Desk Control (Admin Panel)*\n\n"
                 "• `/watchlist` — 🎯 Best setups to watch right now (Shelves, invalidations & macro context)\n"
                 "• `/status` — Balance, equity, open positions & win stats\n"
                 "• `/positions` — Detailed active positions with live PnL & targets\n"
@@ -170,6 +364,40 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
         return
 
     elif cmd in ("/status", "/balance"):
+        if not is_admin(chat_id):
+            u = user_store.get_user(chat_id)
+            eq = float(u.get("paper_equity", 10000.0))
+            open_pos = u.get("open_positions", {})
+            stats = u.get("session", {})
+            paused = u.get("is_paused", False)
+            pause_str = "⏸ PAUSED" if paused else "🟢 ACTIVE"
+
+            floating_pnl = 0.0
+            from scanner import fetch_live_price
+            for pos in open_pos.values():
+                t = pos.get("ticker", "BTC")
+                side = pos.get("side", "BUY").upper()
+                entry = float(pos.get("entry_price", 0.0))
+                qty = float(pos.get("qty", 1.0))
+                lp = fetch_live_price(t) or entry
+                if entry > 0:
+                    diff = (lp - entry) if side == "BUY" else (entry - lp)
+                    floating_pnl += diff * qty
+
+            net_equity = eq + floating_pnl
+            msg = (
+                f"💼 *Your Personal Trading Desk Status*\n\n"
+                f"• *Execution*: {pause_str}\n"
+                f"• *Demo Equity*: `${eq:,.2f} USDT`\n"
+                f"• *Net Equity (with Floating)*: `${net_equity:,.2f} USDT`\n"
+                f"• *Open Positions*: `{len(open_pos)}`\n"
+                f"• *Session Score*: `{stats.get('wins', 0)}W / {stats.get('losses', 0)}L / {stats.get('breakevens', 0)}BE`\n"
+                f"• *Session Realized PnL*: `${stats.get('total_pnl_usdt', 0.0):+,.2f} USDT`\n\n"
+                f"_Commands: `/positions`, `/trade <COIN>`, `/tp`, `/derisk`, `/close <COIN>`, `/closeall`, `/resetdemo`_"
+            )
+            _reply(chat_id, msg)
+            return
+
         bal = engine.client.get_wallet_balance("USDT")
         eq = bal.get("equity", 0.0) if not engine.client.is_paper else state.get_equity()
         avail = bal.get("available", 0.0) if not engine.client.is_paper else eq
@@ -197,6 +425,48 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
         _reply(chat_id, msg)
 
     elif cmd == "/positions":
+        if not is_admin(chat_id):
+            u = user_store.get_user(chat_id)
+            open_pos = u.get("open_positions", {})
+            if not open_pos:
+                _reply(
+                    chat_id,
+                    "ℹ️ *No open positions in your personal portfolio.*\n\n"
+                    "👉 To open a trade, type `/trade <COIN>` (e.g. `/trade BTC` or `/trade SOL SHORT`).\n"
+                    "👉 Or view high-conviction setups with `/calls` or `/hourlycalls`."
+                )
+                return
+
+            from scanner import fetch_live_price
+            lines = ["📈 *Your Personal Active Positions:*", ""]
+            for pid, p in open_pos.items():
+                t = p.get("ticker", "BTC").upper()
+                side = p.get("side", "BUY").upper()
+                entry = float(p.get("entry_price", 0.0))
+                lev = int(p.get("leverage", 10))
+                qty = float(p.get("qty", 1.0))
+                lp = fetch_live_price(t) or entry
+
+                if entry > 0:
+                    raw_pct = ((lp - entry) / entry) if side == "BUY" else ((entry - lp) / entry)
+                    pnl_pct = raw_pct * lev * 100.0
+                    u_pnl = raw_pct * entry * qty
+                else:
+                    pnl_pct = 0.0
+                    u_pnl = 0.0
+
+                pnl_str = f"${u_pnl:+,.2f} ({pnl_pct:+.2f}%)"
+                derisked_tag = " [50% Trimmed]" if p.get("derisked") else ""
+                lines.append(
+                    f"• *{t}* `{side}` ({lev}x){derisked_tag}\n"
+                    f"  Entry: ${entry:,.4f} | Live: ${lp:,.4f}\n"
+                    f"  Floating PnL: *{pnl_str}*\n"
+                )
+
+            lines.append("\n_Commands: `/tp` (take profit), `/derisk`, `/close <COIN>`, `/closeall`_")
+            _reply(chat_id, "\n".join(lines))
+            return
+
         open_pos = state.get_open_positions()
         if not open_pos:
             _reply(chat_id, "ℹ️ No open positions right now.")
@@ -227,6 +497,17 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
         _reply(chat_id, "\n".join(lines))
 
     elif cmd == "/pause":
+        if not is_admin(chat_id):
+            user_store.set_user_paused(chat_id, True)
+            _reply(
+                chat_id,
+                "⏸ *Your personal trading execution is PAUSED.*\n\n"
+                "• Your open positions remain active.\n"
+                "• Automated signal fills will be ignored.\n"
+                "• Type `/resume` anytime to unpause."
+            )
+            return
+
         state.set_paused(True)
         _reply(
             chat_id,
@@ -237,6 +518,16 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
         )
 
     elif cmd == "/resume":
+        if not is_admin(chat_id):
+            user_store.set_user_paused(chat_id, False)
+            _reply(
+                chat_id,
+                "🟢 *Your personal trading execution is RESUMED.*\n\n"
+                "• Personal trade setups and signals are active.\n"
+                "• Type `/status` to review your portfolio."
+            )
+            return
+
         state.set_paused(False)
         _reply(chat_id, "🟢 *Automated execution RESUMED.* Triggering immediate market scan and order placement now...")
         if scan_trigger_fn:
@@ -271,6 +562,38 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
             _reply(chat_id, f"Scan will execute on next scheduled cycle.{_paused_footer()}")
 
     elif cmd == "/close":
+        if not is_admin(chat_id):
+            if not args:
+                _reply(chat_id, "⚠️ Specify ticker to close: e.g. `/close BTC`")
+                return
+            target_ticker = args[0].upper().replace("USDT", "")
+            u = user_store.get_user(chat_id)
+            open_pos = u.get("open_positions", {})
+            matched_pid = None
+            for pid, pos in open_pos.items():
+                if pos.get("ticker", "").upper().replace("USDT", "") == target_ticker:
+                    matched_pid = pid
+                    break
+
+            if not matched_pid:
+                _reply(chat_id, f"❌ No open personal position found for {target_ticker}.")
+                return
+
+            from scanner import fetch_live_price
+            lp = fetch_live_price(target_ticker) or float(open_pos[matched_pid].get("entry_price", 0.0))
+            closed = user_store.close_user_position(chat_id, matched_pid, lp, reason="USER_CLOSE")
+            if closed:
+                pnl = closed.get("pnl_usdt", 0.0)
+                pnl_pct = closed.get("pnl_pct", 0.0)
+                _reply(
+                    chat_id,
+                    f"✅ *Closed your personal {target_ticker} position:*\n\n"
+                    f"• Exit Price: `${lp:,.4f}`\n"
+                    f"• Realized PnL: *${pnl:+,.2f} USDT ({pnl_pct:+.2f}%)*\n"
+                    f"• Updated Demo Equity: `${user_store.get_user_equity(chat_id):,.2f} USDT`"
+                )
+            return
+
         if not args:
             _reply(chat_id, "⚠️ Specify ticker to close: e.g. `/close HYPE`")
             return
@@ -292,6 +615,24 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
             _reply(chat_id, f"❌ Failed to close {target_ticker} on Bybit. Check logs.{_paused_footer()}")
 
     elif cmd in ("/closeall", "/panic"):
+        if not is_admin(chat_id):
+            from scanner import fetch_live_price
+            closed = user_store.close_all_user_positions(chat_id, fetch_price_fn=fetch_live_price, reason="USER_CLOSEALL")
+            if not closed:
+                _reply(chat_id, "ℹ️ No open positions in your personal portfolio to close.")
+                return
+
+            total_pnl = sum(float(c.get("pnl_usdt", 0.0)) for c in closed)
+            lines = [
+                f"🚨 *Market closed {len(closed)} personal positions.*",
+                f"💰 Total PnL: *${total_pnl:+,.2f} USDT*",
+                f"💼 Updated Demo Equity: `${user_store.get_user_equity(chat_id):,.2f} USDT`\n"
+            ]
+            for c in closed:
+                lines.append(f"• *{c.get('ticker')}* `{c.get('side')}`: ${c.get('pnl_usdt', 0.0):+,.2f} USDT")
+            _reply(chat_id, "\n".join(lines))
+            return
+
         active = engine.client.get_active_positions()
         if not active:
             _reply(chat_id, f"ℹ️ No active linear positions to close on Bybit.{_paused_footer()}")
@@ -309,6 +650,24 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
         engine._sync_with_bybit()
 
     elif cmd in ("/tp", "/takeprofit", "/closeprofit", "/closeinprofit"):
+        if not is_admin(chat_id):
+            from scanner import fetch_live_price
+            closed = user_store.tp_user_positions(chat_id, fetch_price_fn=fetch_live_price)
+            if not closed:
+                _reply(chat_id, "ℹ️ None of your personal open positions are currently in profit to close.")
+                return
+
+            total_profit = sum(float(c.get("pnl_usdt", 0.0)) for c in closed)
+            lines = [
+                f"🎯 *Personal Take Profit Executed ({len(closed)} closed)*",
+                f"💰 *Total Profit Banked*: `+${total_profit:,.2f} USDT`",
+                f"💼 *Updated Equity*: `${user_store.get_user_equity(chat_id):,.2f} USDT`\n"
+            ]
+            for c in closed:
+                lines.append(f"• *{c.get('ticker')}* `{c.get('side')}`: +${c.get('pnl_usdt', 0.0):,.2f} USDT ({c.get('pnl_pct', 0.0):+.2f}%)")
+            _reply(chat_id, "\n".join(lines))
+            return
+
         target_tickers = {a.upper().replace("USDT", "") for a in args} if args else set()
 
         if engine.client.is_paper:
@@ -418,6 +777,30 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
         _reply(chat_id, "\n".join(lines) + _paused_footer())
 
     elif cmd in ("/derisk", "/harvest"):
+        if not is_admin(chat_id):
+            from scanner import fetch_live_price
+            winners, trimmed = user_store.derisk_user_positions(chat_id, fetch_price_fn=fetch_live_price)
+            if not winners and not trimmed:
+                _reply(chat_id, "ℹ️ No open positions to derisk in your personal portfolio.")
+                return
+
+            lines = ["🛡️ *Personal Portfolio Derisk Summary:*", ""]
+            if winners:
+                tot_w = sum(float(c.get("pnl_usdt", 0.0)) for c in winners)
+                lines.append(f"💰 *Banked in Profit (+${tot_w:,.2f} USDT):*")
+                for c in winners:
+                    lines.append(f"• *{c.get('ticker')}* `{c.get('side')}`: +${c.get('pnl_usdt', 0.0):,.2f} USDT")
+                lines.append("")
+            if trimmed:
+                lines.append("✂️ *Trimmed 50% Position Size:*")
+                for p in trimmed:
+                    lines.append(f"• *{p.get('ticker')}* `{p.get('side')}`: Remaining qty {p.get('qty')}")
+                lines.append("")
+
+            lines.append(f"💼 *Current Demo Equity*: `${user_store.get_user_equity(chat_id):,.2f} USDT`")
+            _reply(chat_id, "\n".join(lines))
+            return
+
         active = engine.client.get_active_positions(category="linear")
         if not active:
             _reply(chat_id, f"ℹ️ No active linear positions on Bybit to derisk.{_paused_footer()}")
@@ -483,6 +866,14 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
         _reply(chat_id, "\n".join(lines) + _paused_footer())
 
     elif cmd in ("/avoid", "/block"):
+        if not is_admin(chat_id):
+            if not args:
+                _reply(chat_id, "⚠️ Specify tickers to avoid in your personal alerts: e.g. `/avoid DOGE PEPE`")
+                return
+            avoided = user_store.add_user_avoid(chat_id, args)
+            _reply(chat_id, f"🚫 *Added to your personal Avoid List:*\n`{', '.join(avoided)}`")
+            return
+
         if not args:
             _reply(chat_id, f"⚠️ Specify tickers to avoid: e.g. `/avoid DOGE PEPE XLM`{_paused_footer()}")
             return
@@ -490,6 +881,15 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
         _reply(chat_id, f"🚫 *Added to Avoid List.* Scanner will ignore:\n`{', '.join(avoided)}`{_paused_footer()}")
 
     elif cmd in ("/allow", "/unavoid", "/unblock"):
+        if not is_admin(chat_id):
+            if not args:
+                _reply(chat_id, "⚠️ Specify tickers to allow in your personal alerts: e.g. `/allow DOGE PEPE`")
+                return
+            avoided = user_store.remove_user_avoid(chat_id, args)
+            current_str = f"`{', '.join(avoided)}`" if avoided else "_None (all assets allowed)_"
+            _reply(chat_id, f"✅ *Removed from your personal Avoid List.* Currently avoided:\n{current_str}")
+            return
+
         if not args:
             _reply(chat_id, f"⚠️ Specify tickers to allow: e.g. `/allow DOGE PEPE`{_paused_footer()}")
             return
@@ -498,6 +898,14 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
         _reply(chat_id, f"✅ *Removed from Avoid List.* Currently avoided:\n{current_str}{_paused_footer()}")
 
     elif cmd in ("/avoided", "/blacklist"):
+        if not is_admin(chat_id):
+            avoided = user_store.get_user_avoid_list(chat_id)
+            if not avoided:
+                _reply(chat_id, "ℹ️ Your personal avoid list is empty. All assets are eligible for your trades.")
+            else:
+                _reply(chat_id, f"🚫 *Your Personal Avoided Assets ({len(avoided)}):*\n`{', '.join(avoided)}`\n\n_Use `/allow <TICKER>` to re-enable._")
+            return
+
         current = state.get_avoid_list()
         quar_dict = state.get_quarantine_list()
         prob_dict = state.get_probation_list()
@@ -604,6 +1012,28 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
         _reply(chat_id, f"✂️ *Dropped {target_ticker}:* {close_msg}Added to Avoid List.{_paused_footer()}")
 
     elif cmd == "/leverage":
+        if not is_admin(chat_id):
+            if len(args) < 2:
+                _reply(chat_id, "⚠️ Usage: `/leverage <TICKER> <VALUE>`\nExample: `/leverage BTC 10`")
+                return
+            ticker = args[0].upper().replace("USDT", "")
+            try:
+                val = int(args[1])
+                if val < 1 or val > 50:
+                    _reply(chat_id, "❌ Personal leverage must be an integer between 1 and 50.")
+                    return
+            except ValueError:
+                _reply(chat_id, f"❌ Invalid leverage value: `{args[1]}`. Must be an integer.")
+                return
+
+            set_val = user_store.set_user_leverage(chat_id, ticker, val)
+            _reply(
+                chat_id,
+                f"⚡ *Personal leverage for {ticker} set to {set_val}x!*\n\n"
+                f"• Future trades on {ticker} will size at `{set_val}x` margin."
+            )
+            return
+
         if len(args) < 2:
             _reply(chat_id, f"⚠️ Usage: `/leverage <TICKER> <VALUE>`\nExample: `/leverage BTC 10`{_paused_footer()}")
             return
@@ -642,6 +1072,23 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
         )
 
     elif cmd in ("/existingleverage", "/leverages"):
+        if not is_admin(chat_id):
+            lev_map = user_store.get_user_leverage(chat_id)
+            if args:
+                t = args[0].upper().replace("USDT", "")
+                lev = lev_map.get(t, 10) if isinstance(lev_map, dict) else 10
+                _reply(chat_id, f"📊 *Your Personal Leverage for {t}:* `{lev}x`")
+                return
+            if not lev_map or not isinstance(lev_map, dict):
+                _reply(chat_id, "📊 *Personal Leverage:* All assets currently set to default `10x`.\n\n_Change with `/leverage <TICKER> <VALUE>`_")
+                return
+            lines = ["📊 *Your Personal Custom Leverages:*", ""]
+            for t, l in sorted(lev_map.items()):
+                lines.append(f"• *{t}*: `{l}x`")
+            lines.append("\n_Change with `/leverage <TICKER> <VALUE>`_")
+            _reply(chat_id, "\n".join(lines))
+            return
+
         if args:
             ticker = args[0].upper().replace("USDT", "")
             sym = bybit_linear_symbol(ticker)
@@ -788,6 +1235,32 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
             bot_token=_current_bot_token,
         )
 
+    elif cmd in ("/subscribe", "/sub"):
+        state.add_call_bot_chat(chat_id)
+        chat_type_str = "Group / Channel" if str(chat_id).startswith("-") else "Private DM"
+        _reply(
+            chat_id,
+            f"🔔 *Subscribed to Winz Signals & Alerts! ({chat_type_str})*\n\n"
+            "You are now active to receive:\n"
+            "• 🚨 *2-Hour Trade Desk Digests* (4 Scalps + 3 Day Trades with interactive charts)\n"
+            "• 💎 *Spot Accumulation Desk* (5 high-conviction macro spots)\n"
+            "• 🟢 *Live Trade Trigger & Milestone Alerts* (Triggered & Active, TP1, TP2, Trailing Stops, Macro Reversals)\n\n"
+            "_Tip: You can use `/calls` or `/research <COIN>` anytime, or type `/unsubscribe` to stop alerts._",
+            bot_token=_current_bot_token,
+        )
+
+    elif cmd in ("/unsubscribe", "/unsub"):
+        state.remove_call_bot_chat(chat_id)
+        chat_type_str = "Group / Channel" if str(chat_id).startswith("-") else "Private DM"
+        _reply(
+            chat_id,
+            f"🔕 *Unsubscribed from Broadcasts ({chat_type_str})*\n\n"
+            "Automated scheduled digests and milestone alerts have been turned off for this chat.\n\n"
+            "• You can still use on-demand interactive tools: `/calls`, `/research <COIN>`, `/news`, `/sentiment`.\n"
+            "• To re-enable automated alerts anytime, simply type `/subscribe`.",
+            bot_token=_current_bot_token,
+        )
+
     elif cmd in ("/news", "/sentiment", "/fng"):
         target_ticker = args[0].upper().replace("USDT", "") if args else "BTC"
         _reply(chat_id, f"🗞 *Gathering Institutional Sentiment & Live Breaking News for ${target_ticker}...*", bot_token=_current_bot_token)
@@ -810,6 +1283,83 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
             f"To change master destination:\n`/setcallbot <BOT_TOKEN> <CHAT_ID>`\n"
             f"To dispatch 15 calls now:\n`/hourlycalls`"
         )
+
+    elif cmd in ("/trade", "/papertrade", "/buy", "/sell", "/long", "/short"):
+        if not args:
+            _reply(
+                chat_id,
+                "⚠️ *Usage:* `/trade <COIN> [BUY/SELL]`\n\n"
+                "Examples:\n"
+                "• `/trade BTC` (defaults to BUY/LONG)\n"
+                "• `/trade SOL SHORT` or `/trade SOL SELL`\n"
+                "• `/trade ETH BUY`",
+                bot_token=_current_bot_token,
+            )
+            return
+
+        ticker = args[0].upper().replace("USDT", "")
+        side = "BUY"
+        if len(args) > 1:
+            s_arg = args[1].upper()
+            if s_arg in ("SELL", "SHORT"):
+                side = "SELL"
+            elif s_arg in ("BUY", "LONG"):
+                side = "BUY"
+        elif cmd in ("/sell", "/short"):
+            side = "SELL"
+
+        from scanner import fetch_live_price
+        lp = fetch_live_price(ticker)
+        if not lp or lp <= 0:
+            _reply(chat_id, f"❌ Unable to fetch live price for `{ticker}`. Please check ticker symbol.", bot_token=_current_bot_token)
+            return
+
+        u = user_store.get_user(chat_id)
+        lev = int(user_store.get_user_leverage(chat_id, ticker) or 10)
+        # Sizing: $1,000 notional margin per demo trade or 10% of equity
+        trade_margin = min(1000.0, max(100.0, float(u.get("paper_equity", 10000.0)) * 0.10))
+        notional = trade_margin * lev
+        qty = round(notional / lp, 6)
+
+        pos = {
+            "ticker": ticker,
+            "side": side,
+            "entry_price": lp,
+            "qty": qty,
+            "leverage": lev,
+            "margin_usdt": trade_margin,
+            "source": "MANUAL",
+        }
+        user_store.open_user_position(chat_id, pos)
+        _reply(
+            chat_id,
+            f"🚀 *Opened Personal Demo Trade!*\n\n"
+            f"• *Asset*: `{ticker}`\n"
+            f"• *Side*: `{side}`\n"
+            f"• *Entry Price*: `${lp:,.4f}`\n"
+            f"• *Leverage*: `{lev}x`\n"
+            f"• *Size*: `{qty} contracts` (~${notional:,.2f} notional)\n"
+            f"• *Margin Used*: `${trade_margin:,.2f} USDT`\n\n"
+            f"_Track via `/positions` or take profit with `/tp`._",
+            bot_token=_current_bot_token,
+        )
+
+    elif cmd in ("/resetdemo", "/reset"):
+        user_store.reset_user_demo(chat_id)
+        _reply(
+            chat_id,
+            "🔄 *Personal Demo Portfolio Reset!*\n\n"
+            "• Demo Equity restored to: `$10,000.00 USDT`\n"
+            "• Open positions cleared.\n"
+            "• Session score reset to 0W / 0L / 0BE.\n\n"
+            "Type `/status` or `/trade <COIN>` to start fresh!",
+            bot_token=_current_bot_token,
+        )
+
+    elif cmd in ("/calls", "/activecalls", "/tracked"):
+        summary_text, inline_keyboard = format_active_calls_summary()
+        markup = {"inline_keyboard": inline_keyboard} if inline_keyboard else None
+        _reply(chat_id, summary_text, bot_token=_current_bot_token, reply_markup=markup)
 
     elif cmd in ("/hourlycalls", "/sendcalls"):
         _reply(chat_id, "🚀 *Generating and Dispatching 2-Hour Calls Digest (4 Scalps + 3 Day Trades with Interactive Buttons)...*")
@@ -1238,6 +1788,7 @@ BOT_COMMANDS = [
     {"command": "hourlyreport", "description": "⏱️ Hourly analytics breakdown & chart"},
     {"command": "weeklyreport", "description": "📆 Weekly 7d analytics report & chart"},
     {"command": "monthlyreport", "description": "🗓️ Monthly 30d analytics report & chart"},
+    {"command": "calls", "description": "📋 View active triggered trades & pending setups"},
     {"command": "hourlycalls", "description": "🎯 Dispatch 15 hourly manual calls (6 scalp + 4 day + 5 spot)"},
     {"command": "spot", "description": "💎 Dispatch 5 spot accumulation setups with buttons"},
     {"command": "news", "description": "🗞️ Live breaking crypto news & macro sentiment"},
@@ -1270,48 +1821,86 @@ BOT_COMMANDS = [
 ]
 
 
+WINZ_PUBLIC_COMMANDS = [
+    {"command": "calls", "description": "📋 View active triggered trades & pending setups"},
+    {"command": "hourlycalls", "description": "🎯 View 15 trade desk calls (6 scalp + 4 day + 5 spot)"},
+    {"command": "spot", "description": "💎 View 5 spot accumulation setups with buttons"},
+    {"command": "status", "description": "📊 View your personal $10,000 demo portfolio"},
+    {"command": "positions", "description": "📈 View your personal active positions"},
+    {"command": "trade", "description": "🚀 Open a personal paper trade (e.g. /trade BTC)"},
+    {"command": "tp", "description": "🎯 Bank profits on all winning positions"},
+    {"command": "derisk", "description": "🛡️ Bank winners 100% & trim losers 50%"},
+    {"command": "close", "description": "✂️ Close a specific personal position"},
+    {"command": "closeall", "description": "🚨 Close all your personal positions"},
+    {"command": "resetdemo", "description": "🔄 Reset demo equity to $10,000"},
+    {"command": "leverage", "description": "⚡ Set custom leverage for a coin"},
+    {"command": "existingleverage", "description": "📊 View active leverage settings"},
+    {"command": "avoid", "description": "🚫 Blacklist coins from your trades"},
+    {"command": "allow", "description": "🟢 Restore blacklisted coins"},
+    {"command": "avoided", "description": "📋 Show your avoided coins"},
+    {"command": "pause", "description": "⏸️ Pause your personal trading"},
+    {"command": "resume", "description": "🟢 Resume your personal trading"},
+    {"command": "research", "description": "🔬 Deep thesis & chart markup (e.g. /research BTC)"},
+    {"command": "tweet", "description": "🐦 Convert research into 280-char Twitter/X post"},
+    {"command": "news", "description": "🗞️ Live breaking crypto news & macro sentiment"},
+    {"command": "sentiment", "description": "🌡️ Crypto Fear & Greed Index + tone analysis"},
+    {"command": "subscribe", "description": "🔔 Enable automated digests & milestone alerts in this chat"},
+    {"command": "unsubscribe", "description": "🔕 Disable automated broadcast alerts in this chat"},
+    {"command": "setchannel", "description": "📢 Register current group/channel for Winz calls"},
+    {"command": "help", "description": "Show command guide and help"},
+]
+
+
 def register_bot_commands() -> bool:
     """
     Register bot commands with Telegram so typing '/' pops up the autocomplete command menu.
-    Registers on both primary bot and secondary feedback bot (if configured).
+    Registers public commands on Winz bot and full administrative commands on master bots.
     """
-    tokens = []
-    if cfg.telegram_token:
-        tokens.append(cfg.telegram_token)
+    call_cfg = state.get_call_bot_config()
+    c_tok = call_cfg.get("token")
+
+    # 1. Register Winz Bot commands (Public default + Admin scope)
+    if c_tok:
+        url = f"https://api.telegram.org/bot{c_tok}/setMyCommands"
+        try:
+            # Default public scope
+            requests.post(url, json={"commands": WINZ_PUBLIC_COMMANDS, "scope": {"type": "default"}}, timeout=10)
+            # Admin chat scope (if admin chat configured)
+            if cfg.telegram_chat_id:
+                try:
+                    admin_chat_int = int(cfg.telegram_chat_id)
+                    requests.post(url, json={"commands": BOT_COMMANDS, "scope": {"type": "chat", "chat_id": admin_chat_int}}, timeout=10)
+                except Exception:
+                    pass
+            menu_btn_url = f"https://api.telegram.org/bot{c_tok}/setChatMenuButton"
+            requests.post(menu_btn_url, json={"menu_button": {"type": "commands"}}, timeout=10)
+            log.info("Registered %d public commands on Winz bot %s...", len(WINZ_PUBLIC_COMMANDS), c_tok[:10])
+        except Exception as exc:
+            log.warning("Telegram setMyCommands error for Winz bot %s: %s", c_tok[:10], exc)
+
+    # 2. Register master admin bot commands
+    other_tokens = []
+    if cfg.telegram_token and cfg.telegram_token != c_tok:
+        other_tokens.append(cfg.telegram_token)
     try:
         fb_cfg = state.get_feedback_bot_config()
         fb_tok = fb_cfg.get("token")
-        if fb_tok and fb_tok not in tokens:
-            tokens.append(fb_tok)
-    except Exception:
-        pass
-    try:
-        call_cfg = state.get_call_bot_config()
-        c_tok = call_cfg.get("token")
-        if c_tok and c_tok not in tokens:
-            tokens.append(c_tok)
+        if fb_tok and fb_tok not in other_tokens and fb_tok != c_tok:
+            other_tokens.append(fb_tok)
     except Exception:
         pass
 
-    if not tokens:
-        return False
-
-    all_success = True
-    for token in tokens:
+    for token in other_tokens:
         url = f"https://api.telegram.org/bot{token}/setMyCommands"
         try:
-            r = requests.post(url, json={"commands": BOT_COMMANDS}, timeout=10)
-            if r.status_code == 200 and r.json().get("ok"):
-                log.info("Registered %d Telegram commands with setMyCommands on %s...", len(BOT_COMMANDS), token[:10])
-                menu_btn_url = f"https://api.telegram.org/bot{token}/setChatMenuButton"
-                requests.post(menu_btn_url, json={"menu_button": {"type": "commands"}}, timeout=10)
-            else:
-                log.warning("Telegram setMyCommands failed for %s...: %s", token[:10], r.text)
-                all_success = False
+            requests.post(url, json={"commands": BOT_COMMANDS}, timeout=10)
+            menu_btn_url = f"https://api.telegram.org/bot{token}/setChatMenuButton"
+            requests.post(menu_btn_url, json={"menu_button": {"type": "commands"}}, timeout=10)
+            log.info("Registered %d admin commands on bot %s...", len(BOT_COMMANDS), token[:10])
         except Exception as exc:
-            log.warning("Telegram setMyCommands error for %s...: %s", token[:10], exc)
-            all_success = False
-    return all_success
+            log.warning("Telegram setMyCommands error for bot %s: %s", token[:10], exc)
+
+    return True
 
 
 def start_telegram_listener(scan_trigger_fn=None) -> None:

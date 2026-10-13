@@ -42,6 +42,20 @@ def _load_raw() -> Dict[str, Any]:
 
 
 def _default_state() -> Dict[str, Any]:
+    call_chat = str(cfg.call_bot_chat_id or "").strip()
+    user_chat = str(cfg.telegram_chat_id or "").strip()
+    extra_chats = []
+    if call_chat:
+        extra_chats.append(call_chat)
+    if user_chat and user_chat not in extra_chats:
+        extra_chats.append(user_chat)
+
+    call_bot_entry = {
+        "token": cfg.call_bot_token or cfg.telegram_token,
+        "chat_id": call_chat or user_chat,
+        "extra_chats": extra_chats,
+        "updated_at": _now(),
+    }
     return {
         "mode": cfg.trade_mode,
         "paper_equity": cfg.paper_equity,
@@ -61,6 +75,7 @@ def _default_state() -> Dict[str, Any]:
         "high_water_mark": cfg.paper_equity,
         "custom_leverage": {},
         "spot_enabled": False,
+        "call_bot": call_bot_entry,
         "created_at": _now(),
         "updated_at": _now(),
     }
@@ -271,13 +286,17 @@ def get_session_stats() -> dict:
         return _load_raw()["session"]
 
 
-def reset_state(keep_equity: bool = False) -> None:
+def reset_state(keep_equity: bool = False, keep_configs: bool = True) -> None:
     """Reset state to defaults. Use for fresh session or mode switch."""
     with _lock:
+        existing = _load_raw()
         fresh = _default_state()
         if keep_equity:
-            existing = _load_raw()
             fresh["paper_equity"] = existing.get("paper_equity", cfg.paper_equity)
+        if keep_configs:
+            for k in ("call_bot", "feedback_bot", "tracked_calls", "last_dispatch_time"):
+                if k in existing and existing[k] is not None:
+                    fresh[k] = existing[k]
         _save(fresh)
         log.info("State reset. Equity: %.2f", fresh["paper_equity"])
 
@@ -666,16 +685,28 @@ def set_feedback_bot_config(token: str, chat_id: str) -> Dict[str, str]:
 def get_call_bot_config() -> Dict[str, Any]:
     with _lock:
         s = _load_raw()
-        cfg_custom = s.get("call_bot", {})
+        cfg_custom = s.get("call_bot") or {}
         token = cfg_custom.get("token") or cfg.call_bot_token or cfg.feedback_bot_token or cfg.telegram_token
         chat_id = cfg_custom.get("chat_id") or cfg.call_bot_chat_id or cfg.feedback_chat_id or cfg.telegram_chat_id
         extra_chats = list(cfg_custom.get("extra_chats", []))
         all_chats = []
         if chat_id:
-            all_chats.append(str(chat_id))
+            all_chats.append(str(chat_id).strip())
         for ec in extra_chats:
-            if str(ec) not in all_chats:
-                all_chats.append(str(ec))
+            ec_str = str(ec).strip()
+            if ec_str and ec_str not in all_chats:
+                all_chats.append(ec_str)
+        # Guarantee configured group and personal chats from env are included
+        for env_cid in (cfg.call_bot_chat_id, cfg.telegram_chat_id):
+            cid_str = str(env_cid or "").strip()
+            if cid_str and cid_str not in all_chats:
+                all_chats.append(cid_str)
+
+        # Filter out any chat that explicitly unsubscribed
+        unsubscribed = set(str(u).strip() for u in cfg_custom.get("unsubscribed_chats", []))
+        if unsubscribed:
+            all_chats = [c for c in all_chats if c not in unsubscribed]
+
         return {
             "token": token,
             "chat_id": str(chat_id) if chat_id else "",
@@ -705,23 +736,62 @@ def add_call_bot_chat(chat_id: str) -> List[str]:
     with _lock:
         s = _load_raw()
         cid_str = str(chat_id).strip()
-        if "call_bot" not in s:
+        if not s.get("call_bot"):
+            call_chat = str(cfg.call_bot_chat_id or "").strip()
+            user_chat = str(cfg.telegram_chat_id or "").strip()
+            initial_chats = [cid_str]
+            for c in (call_chat, user_chat):
+                if c and c not in initial_chats:
+                    initial_chats.append(c)
             s["call_bot"] = {
                 "token": cfg.call_bot_token or cfg.telegram_token,
-                "chat_id": cid_str,
-                "extra_chats": [cid_str],
+                "chat_id": call_chat or cid_str,
+                "extra_chats": initial_chats,
+                "unsubscribed_chats": [],
                 "updated_at": _now(),
             }
         else:
             extras = s["call_bot"].setdefault("extra_chats", [])
             if cid_str not in extras:
                 extras.append(cid_str)
-            # If it's a negative chat_id (group/channel), promote it to primary chat_id
-            if cid_str.startswith("-"):
+            # Remove from unsubscribed_chats if present
+            unsub = s["call_bot"].setdefault("unsubscribed_chats", [])
+            if cid_str in unsub:
+                unsub.remove(cid_str)
+            if not s["call_bot"].get("chat_id"):
                 s["call_bot"]["chat_id"] = cid_str
             s["call_bot"]["updated_at"] = _now()
         _save(s)
         return list(s["call_bot"].get("extra_chats", []))
+
+
+def remove_call_bot_chat(chat_id: str) -> bool:
+    """Remove a chat_id from the broadcast list (unsubscribe)."""
+    with _lock:
+        s = _load_raw()
+        cid_str = str(chat_id).strip()
+        if not s.get("call_bot"):
+            return False
+        cb = s["call_bot"]
+        extras = cb.setdefault("extra_chats", [])
+        unsub = cb.setdefault("unsubscribed_chats", [])
+        changed = False
+        if cid_str in extras:
+            extras.remove(cid_str)
+            changed = True
+        if cid_str not in unsub:
+            unsub.append(cid_str)
+            changed = True
+        if changed:
+            cb["updated_at"] = _now()
+            _save(s)
+        return changed
+
+
+def is_call_bot_subscribed(chat_id: str) -> bool:
+    cid_str = str(chat_id).strip()
+    call_cfg = get_call_bot_config()
+    return cid_str in call_cfg.get("all_chats", [])
 
 
 def record_learning_event(event: dict) -> None:
