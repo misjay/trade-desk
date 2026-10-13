@@ -236,6 +236,49 @@ def create_access_code(
     return True, f"Access code `{clean_code}` created successfully.", record
 
 
+def create_batch_access_codes(
+    count: int = 1000,
+    max_uses: int = 1,
+    label: str = "VIP Genesis Batch",
+    created_by: str = "admin",
+) -> List[dict]:
+    """
+    Generate and persist a batch of unique access codes with specified max_uses.
+    Uses unambiguous alphanumeric character set (no 0/O or 1/I confusion).
+    """
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    new_records = []
+    with _lock:
+        data = _load_data()
+        codes = data.setdefault("codes", {})
+        existing = set(codes.keys())
+        generated_count = 0
+        while generated_count < count:
+            part1 = "".join(secrets.choice(alphabet) for _ in range(4))
+            part2 = "".join(secrets.choice(alphabet) for _ in range(4))
+            candidate = f"WINZ-{part1}-{part2}"
+            if candidate in existing:
+                continue
+            existing.add(candidate)
+            rec = {
+                "code": candidate,
+                "max_uses": max(0, int(max_uses)),
+                "used_count": 0,
+                "is_active": True,
+                "label": label.strip() or "VIP Batch",
+                "created_at": _now(),
+                "created_by": str(created_by),
+                "redeemed_by": [],
+            }
+            codes[candidate] = rec
+            new_records.append(rec)
+            generated_count += 1
+        _save_data(data)
+
+    log.info("Batch created %d access codes (max_uses=%d) by %s", len(new_records), max_uses, created_by)
+    return new_records
+
+
 def revoke_access_code(code_str: str) -> Tuple[bool, str]:
     """Revoke/deactivate an access code."""
     clean_code = code_str.strip().upper()
