@@ -18,6 +18,7 @@ from notifier import send_text, fmt_dollar
 import state
 import user_store
 import exchange_manager
+import access_manager
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +34,11 @@ MASTER_DESK_ONLY_COMMANDS = {
     "/dailyreport", "/hourlyreport", "/weeklyreport", "/monthlyreport",
     "/feedback", "/dailyfeedback", "/learning",
     "/setcallbot", "/setfeedbackbot", "/callbot", "/feedbackbot",
+    "/gencode", "/createcode", "/newcode",
+    "/codes", "/listcodes",
+    "/revokecode",
+    "/grant", "/revokeuser",
+    "/users", "/accessusers",
 }
 ADMIN_COMMANDS = MASTER_DESK_ONLY_COMMANDS
 
@@ -263,6 +269,99 @@ def handle_command(
     call_cfg = state.get_call_bot_config()
     is_winz_bot = bool(bot_token and bot_token == call_cfg.get("token"))
 
+    # ── 1. Access Code Redemption Handling ────────────────────────────────────
+    if cmd in ("/access", "/code", "/invite"):
+        if not args:
+            _reply(
+                chat_id,
+                "🔑 *Winz Access Code Activation*\n\n"
+                "To unlock Winz Autonomous Trading Desk, please enter your access code:\n"
+                "👉 Usage: `/access <YOUR_CODE>`\n"
+                "_Example: `/access WINZ2026`_\n\n"
+                "ℹ️ Contact the desk administrator to request an invite code.",
+                bot_token=_current_bot_token,
+            )
+            return
+
+        code_arg = args[0].strip()
+        ok, msg_text = access_manager.redeem_access_code(chat_id, code_arg)
+        if ok:
+            if is_winz_bot:
+                state.add_call_bot_chat(chat_id)
+            _reply(
+                chat_id,
+                "🎉 *Access Granted! Welcome to Winz Trading Desk.*\n\n"
+                "Your access code has been activated successfully.\n"
+                "You now have full access to:\n"
+                "• 💼 *Personal Trading Desk* ($10,000 Starting Demo Portfolio)\n"
+                "• 🔐 *CEX / Bybit Live Automation* (`/connect bybit`)\n"
+                "• 📋 *Active Calls & 2-Hour A+ Quality Signals* (`/calls`)\n"
+                "• 💎 *Spot Accumulation Setups & Charts* (`/spot`)\n"
+                "• 🔬 *Institutional Order Block Thesis* (`/research`)\n\n"
+                "👉 Type `/help` or `/calls` to explore your trading desk!",
+                bot_token=_current_bot_token,
+            )
+        else:
+            _reply(
+                chat_id,
+                f"❌ *Access Code Failed*\n\n"
+                f"{msg_text}\n\n"
+                f"Please verify your code or contact the desk administrator to request access.",
+                bot_token=_current_bot_token,
+            )
+        return
+
+    # Direct redemption via /start <CODE> (e.g. t.me/thewinzbot?start=CODE)
+    if cmd == "/start" and args:
+        code_arg = args[0].strip()
+        ok, msg_text = access_manager.redeem_access_code(chat_id, code_arg)
+        if ok:
+            if is_winz_bot:
+                state.add_call_bot_chat(chat_id)
+            _reply(
+                chat_id,
+                "🎉 *Access Granted! Welcome to Winz Trading Desk.*\n\n"
+                "Your invite link has been activated successfully!\n\n"
+                "👉 Type `/help` to view all available commands or `/calls` for live trade setups.",
+                bot_token=_current_bot_token,
+            )
+            return
+        else:
+            _reply(
+                chat_id,
+                f"❌ *Invalid Access Code / Invite Link*\n\n"
+                f"{msg_text}\n\n"
+                f"To activate manually:\n"
+                f"👉 `/access <YOUR_CODE>`",
+                bot_token=_current_bot_token,
+            )
+            return
+
+    # ── 2. Access Authorization Gate for Public Users ─────────────────────────
+    if not access_manager.is_user_authorized(chat_id):
+        if cmd in ("/start", "/help"):
+            _reply(
+                chat_id,
+                "🔒 *Winz Trading Desk — Access Code Required*\n\n"
+                "Welcome to *Winz* — Autonomous Algorithmic Trade Desk & Market Intelligence Hub.\n\n"
+                "Winz is currently running in exclusive private access mode. To unlock your personal trading desk, market signals, and Bybit execution:\n\n"
+                "👉 *Activate your access:*\n"
+                "`/access <YOUR_CODE>`\n"
+                "_Example: `/access WINZ2026`_\n\n"
+                "ℹ️ *Don't have an access code?* Contact the desk administrator to request an invite code.",
+                bot_token=_current_bot_token,
+            )
+        else:
+            _reply(
+                chat_id,
+                "🔒 *Access Restricted*\n\n"
+                "You need an active access code to use Winz Trading Desk.\n\n"
+                "👉 Type `/access <YOUR_CODE>` to unlock all features.\n"
+                "_Example: `/access WINZ2026`_",
+                bot_token=_current_bot_token,
+            )
+        return
+
     # Auto-register this chat into Winz calls distribution list on /start or subscribe
     if is_winz_bot and cmd in ("/start", "/subscribe", "/sub"):
         state.add_call_bot_chat(chat_id)
@@ -299,6 +398,7 @@ def handle_command(
             bot_token=_current_bot_token,
         )
         return
+
 
     if cmd in ("/start", "/help"):
         if is_winz_bot or not is_admin(chat_id):
@@ -1813,8 +1913,122 @@ def handle_command(
         
         threading.Thread(target=_do_watchlist_scan, daemon=True, name="tg-watchlist-scan").start()
 
+    elif cmd in ("/gencode", "/createcode", "/newcode"):
+        if not is_admin(chat_id):
+            return
+        custom_code = None
+        max_uses = 0
+        label = "Admin Generated"
+        if args:
+            first = args[0].strip()
+            if first.isdigit():
+                max_uses = int(first)
+                if len(args) > 1:
+                    label = " ".join(args[1:])
+            else:
+                custom_code = first
+                if len(args) > 1 and args[1].isdigit():
+                    max_uses = int(args[1])
+                    if len(args) > 2:
+                        label = " ".join(args[2:])
+                elif len(args) > 1:
+                    label = " ".join(args[1:])
+
+        ok, resp_msg, rec = access_manager.create_access_code(
+            code=custom_code,
+            max_uses=max_uses,
+            label=label,
+            created_by=chat_id,
+        )
+        if ok:
+            lim_str = f"{rec['max_uses']} redemptions" if rec['max_uses'] > 0 else "Unlimited"
+            _reply(
+                chat_id,
+                f"🔑 *New Winz Access Code Generated!*\n\n"
+                f"• *Code:* `{rec['code']}`\n"
+                f"• *Usage Limit:* `{lim_str}`\n"
+                f"• *Label:* `{rec['label']}`\n"
+                f"• *Created At:* `{rec['created_at'][:19].replace('T', ' ')} UTC`\n\n"
+                f"Share with user:\n"
+                f"👉 `/access {rec['code']}`\n"
+                f"Direct Link: `https://t.me/thewinzbot?start={rec['code']}`",
+                bot_token=_current_bot_token,
+            )
+        else:
+            _reply(chat_id, f"❌ {resp_msg}", bot_token=_current_bot_token)
+
+    elif cmd in ("/codes", "/listcodes"):
+        if not is_admin(chat_id):
+            return
+        all_codes = access_manager.list_access_codes()
+        if not all_codes:
+            _reply(chat_id, "ℹ️ No access codes configured yet.", bot_token=_current_bot_token)
+            return
+        lines = [
+            "📋 *Winz Configured Access Codes*",
+            f"Total Codes: `{len(all_codes)}`",
+            "",
+        ]
+        for c_name, c_info in all_codes.items():
+            status_icon = "🟢 Active" if c_info.get("is_active", True) else "🔴 Revoked"
+            max_u = c_info.get("max_uses", 0)
+            used_u = c_info.get("used_count", 0)
+            usage_str = f"{used_u}/{max_u}" if max_u > 0 else f"{used_u}/∞"
+            lbl = c_info.get("label", "Standard")
+            lines.append(f"• `{c_name}` — {status_icon} | Uses: `{usage_str}` | _{lbl}_")
+        _reply(chat_id, "\n".join(lines), bot_token=_current_bot_token)
+
+    elif cmd in ("/revokecode",):
+        if not is_admin(chat_id):
+            return
+        if not args:
+            _reply(chat_id, "Usage: `/revokecode <CODE>`", bot_token=_current_bot_token)
+            return
+        ok, resp_msg = access_manager.revoke_access_code(args[0])
+        _reply(chat_id, f"✅ {resp_msg}" if ok else f"❌ {resp_msg}", bot_token=_current_bot_token)
+
+    elif cmd in ("/grant",):
+        if not is_admin(chat_id):
+            return
+        if not args:
+            _reply(chat_id, "Usage: `/grant <CHAT_ID> [LABEL]`", bot_token=_current_bot_token)
+            return
+        target_cid = args[0].strip()
+        lbl = " ".join(args[1:]) if len(args) > 1 else "Direct Admin Grant"
+        access_manager.grant_user_access(target_cid, label=lbl)
+        _reply(chat_id, f"✅ Access granted directly to `{target_cid}`.", bot_token=_current_bot_token)
+
+    elif cmd in ("/revokeuser",):
+        if not is_admin(chat_id):
+            return
+        if not args:
+            _reply(chat_id, "Usage: `/revokeuser <CHAT_ID>`", bot_token=_current_bot_token)
+            return
+        target_cid = args[0].strip()
+        access_manager.revoke_user_access(target_cid)
+        _reply(chat_id, f"🚫 Access revoked for user `{target_cid}`.", bot_token=_current_bot_token)
+
+    elif cmd in ("/accessusers", "/users"):
+        if not is_admin(chat_id):
+            return
+        users = access_manager.list_authorized_users()
+        lines = [
+            "👥 *Winz Authorized Users List*",
+            f"Total Users: `{len(users)}`",
+            "",
+        ]
+        if not users:
+            lines.append("ℹ️ No authorized users in database yet.")
+        else:
+            for u_cid, u_info in users.items():
+                st = "🟢 Active" if u_info.get("is_authorized", True) else "🔴 Revoked"
+                c_used = u_info.get("code", "N/A")
+                lines.append(f"• `{u_cid}`: {st} | Code: `{c_used}`")
+        _reply(chat_id, "\n".join(lines), bot_token=_current_bot_token)
+
     else:
         _reply(chat_id, f"Unknown command: `{cmd}`. Type `/help` for available commands.")
+
 
 
 def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_trigger_fn=None) -> None:
@@ -1867,6 +2081,22 @@ def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_tri
                         cb_data = cb_query.get("data", "")
                         from_user = cb_query.get("from", {})
                         cb_chat_id = str(cb_query.get("message", {}).get("chat", {}).get("id") or from_user.get("id"))
+
+                        if not access_manager.is_user_authorized(cb_chat_id):
+                            try:
+                                ack_url = f"https://api.telegram.org/bot{token}/answerCallbackQuery"
+                                requests.post(
+                                    ack_url,
+                                    json={
+                                        "callback_query_id": cb_id,
+                                        "text": "🔒 Access code required! Type /access <CODE> in chat to unlock.",
+                                        "show_alert": True,
+                                    },
+                                    timeout=6,
+                                )
+                            except Exception:
+                                pass
+                            continue
 
                         # Acknowledge callback query to Telegram
                         try:
@@ -1926,7 +2156,7 @@ def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_tri
                         or ("research" in lower_text and "(" in lower_text and ")" in lower_text)
                         or "scan the market" in lower_text
                         or "best setups" in lower_text
-                        or "watchlist" in lower_raw
+                        or "watchlist" in lower_text
                     )
                     if is_cmd:
                         msg_id = msg.get("message_id")
@@ -2043,11 +2273,18 @@ BOT_COMMANDS = [
     {"command": "cancelallorders", "description": "Cancel all resting orders on Bybit"},
     {"command": "close", "description": "Market close a specific ticker"},
     {"command": "closeall", "description": "Emergency close all positions"},
+    {"command": "gencode", "description": "🔑 Generate new access code"},
+    {"command": "codes", "description": "📋 List access codes & usage stats"},
+    {"command": "revokecode", "description": "🚫 Revoke an access code"},
+    {"command": "grant", "description": "🟢 Directly authorize a user/group"},
+    {"command": "revokeuser", "description": "🔴 Revoke access for a user"},
+    {"command": "users", "description": "👥 List all authorized users"},
     {"command": "help", "description": "Show command guide and help"},
 ]
 
 
 WINZ_PUBLIC_COMMANDS = [
+    {"command": "access", "description": "🔑 Activate or verify your access code"},
     {"command": "calls", "description": "📋 View active triggered trades & pending setups"},
     {"command": "hourlycalls", "description": "🎯 View 15 trade desk calls (6 scalp + 4 day + 5 spot)"},
     {"command": "spot", "description": "💎 View 5 spot accumulation setups with buttons"},

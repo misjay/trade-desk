@@ -21,6 +21,7 @@ class TestTelegramBot(unittest.TestCase):
         import state
         import user_store
         import exchange_manager
+        import access_manager
         cls.temp_dir = tempfile.mkdtemp()
         cls.orig_state_file = state._STATE_FILE
         state._STATE_FILE = Path(cls.temp_dir) / "test_state.json"
@@ -29,6 +30,8 @@ class TestTelegramBot(unittest.TestCase):
         cls.orig_secret_file = exchange_manager._SECRET_KEY_FILE
         exchange_manager._SECRET_KEY_FILE = Path(cls.temp_dir) / ".test_secret.key"
         exchange_manager._fernet_instance = None
+        cls.orig_access_file = access_manager._ACCESS_FILE
+        access_manager._ACCESS_FILE = Path(cls.temp_dir) / "test_access_codes.json"
 
     @classmethod
     def tearDownClass(cls):
@@ -36,17 +39,25 @@ class TestTelegramBot(unittest.TestCase):
         import state
         import user_store
         import exchange_manager
+        import access_manager
         state._STATE_FILE = cls.orig_state_file
         user_store._USERS_FILE = cls.orig_users_file
         exchange_manager._SECRET_KEY_FILE = cls.orig_secret_file
         exchange_manager._fernet_instance = None
+        access_manager._ACCESS_FILE = cls.orig_access_file
         shutil.rmtree(cls.temp_dir, ignore_errors=True)
 
     def setUp(self):
         import state
         from config import cfg
+        import access_manager
+        import user_store
         cfg.telegram_chat_id = "12345"
         state.set_paused(False)
+        if access_manager._ACCESS_FILE.exists():
+            access_manager._ACCESS_FILE.unlink()
+        if user_store._USERS_FILE.exists():
+            user_store._USERS_FILE.unlink()
 
     def test_help_command(self):
         import telegram_bot
@@ -512,6 +523,16 @@ class TestTelegramBot(unittest.TestCase):
 
     def test_non_admin_blocked_from_master_desk_commands(self):
         import telegram_bot
+        # 1. Unauthenticated stranger blocked by access code gate
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/scan", "99999_stranger")
+            mock_reply.assert_called_once()
+            self.assertIn("Access Restricted", mock_reply.call_args[0][1])
+
+        # 2. Authenticated public user blocked by master desk admin gate
+        with patch.object(telegram_bot, "_reply"):
+            telegram_bot.handle_command("/access WINZ2026", "99999_stranger")
+
         with patch.object(telegram_bot, "_reply") as mock_reply:
             telegram_bot.handle_command("/scan", "99999_stranger")
             mock_reply.assert_called_once()
@@ -523,6 +544,16 @@ class TestTelegramBot(unittest.TestCase):
         import state
 
         stranger_id = "88888_trader"
+
+        # 0. Unauthenticated user is blocked before entering access code
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/status", stranger_id)
+            self.assertIn("Access Restricted", mock_reply.call_args[0][1])
+
+        # Activate access code
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/access WINZ2026", stranger_id)
+            self.assertIn("Access Granted", mock_reply.call_args[0][1])
 
         # 1. /status for public user shows personal portfolio, does NOT call engine Bybit
         with patch.object(telegram_bot, "_reply") as mock_reply:
@@ -591,6 +622,7 @@ class TestTelegramBot(unittest.TestCase):
         import telegram_bot
         import state
         with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/access WINZ2026", "77777_user")
             telegram_bot.handle_command("/subscribe", "77777_user")
             self.assertTrue(state.is_call_bot_subscribed("77777_user"))
             self.assertIn("Subscribed to Winz Signals & Alerts", mock_reply.call_args[0][1])
@@ -601,15 +633,28 @@ class TestTelegramBot(unittest.TestCase):
 
     def test_public_user_help_menu(self):
         import telegram_bot
+        # 1. Before activation, help prompts for access code
         with patch.object(telegram_bot, "_reply") as mock_reply:
             telegram_bot.handle_command("/help", "99999_stranger")
             mock_reply.assert_called_once()
+            self.assertIn("Access Code Required", mock_reply.call_args[0][1])
+
+        # 2. After activation, help shows full public desk guide
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/access WINZ2026", "99999_stranger")
+            telegram_bot.handle_command("/help", "99999_stranger")
+            self.assertIn("Winz Trading Desk & Market Intelligence Hub", mock_reply.call_args[0][1])
+            self.assertIn("/status", mock_reply.call_args[0][1])
+
     def test_cex_connection_telegram_commands(self):
         import telegram_bot
         import user_store
         import exchange_manager
 
         user_id = "55555_trader"
+        # Activate access code first
+        with patch.object(telegram_bot, "_reply"):
+            telegram_bot.handle_command("/access WINZ2026", user_id)
 
         # 1. /myexchange when not connected
         with patch.object(telegram_bot, "_reply") as mock_reply:
@@ -643,8 +688,68 @@ class TestTelegramBot(unittest.TestCase):
             self.assertIn("Exchange Disconnected", mock_reply.call_args[0][1])
             self.assertFalse(user_store.get_user_exchange(user_id)["connected"])
 
+    def test_access_code_telegram_commands(self):
+        import telegram_bot
+        import access_manager
+
+        stranger = "66666_tester"
+
+        # 1. /access without args shows usage
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/access", stranger)
+            self.assertIn("Winz Access Code Activation", mock_reply.call_args[0][1])
+
+        # 2. /access with invalid code fails
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/access BADCODE123", stranger)
+            self.assertIn("Access Code Failed", mock_reply.call_args[0][1])
+            self.assertFalse(access_manager.is_user_authorized(stranger))
+
+        # 3. /start <CODE> redeems code directly
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/start WINZ2026", stranger)
+            self.assertIn("Access Granted", mock_reply.call_args[0][1])
+            self.assertTrue(access_manager.is_user_authorized(stranger))
+
+        # 4. Admin commands (from admin chat_id "12345")
+        admin_id = "12345"
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            # Generate code
+            telegram_bot.handle_command("/gencode VIPPASS 5 VIP Promo", admin_id)
+            self.assertIn("New Winz Access Code Generated", mock_reply.call_args[0][1])
+            self.assertIn("VIPPASS", mock_reply.call_args[0][1])
+
+            # List codes
+            telegram_bot.handle_command("/codes", admin_id)
+            self.assertIn("Winz Configured Access Codes", mock_reply.call_args[0][1])
+            self.assertIn("VIPPASS", mock_reply.call_args[0][1])
+
+            # Revoke code
+            telegram_bot.handle_command("/revokecode VIPPASS", admin_id)
+            self.assertIn("revoked", mock_reply.call_args[0][1])
+
+            # Direct grant
+            telegram_bot.handle_command("/grant 444555 VIP Direct", admin_id)
+            self.assertIn("Access granted directly", mock_reply.call_args[0][1])
+            self.assertTrue(access_manager.is_user_authorized("444555"))
+
+            # Direct revoke user
+            telegram_bot.handle_command("/revokeuser 444555", admin_id)
+            self.assertIn("Access revoked", mock_reply.call_args[0][1])
+            self.assertFalse(access_manager.is_user_authorized("444555"))
+
+            # List users
+            telegram_bot.handle_command("/users", admin_id)
+            self.assertIn("Winz Authorized Users List", mock_reply.call_args[0][1])
+
+        # 5. Non-admin blocked from /gencode
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/gencode SNEAKY 1", stranger)
+            self.assertIn("Access Restricted: Master Desk Command", mock_reply.call_args[0][1])
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

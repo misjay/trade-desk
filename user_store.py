@@ -84,6 +84,9 @@ def _default_user_state(chat_id: str) -> Dict[str, Any]:
         },
         "avoid_list": [],
         "custom_leverage": {},
+        "has_access": False,
+        "access_code": None,
+        "access_granted_at": None,
         "exchange": {
             "connected": False,
             "name": "bybit",
@@ -437,4 +440,23 @@ def get_all_auto_trade_users() -> List[Tuple[str, dict]]:
             if ex.get("auto_trade"):
                 active.append((cid, u))
         return active
+
+
+# ── Access Authorization ───────────────────────────────────────────────────────
+
+def is_user_has_access(chat_id: Union[str, int]) -> bool:
+    """Return True if user has been granted access in their profile."""
+    return bool(get_user(chat_id).get("has_access", False))
+
+
+def set_user_has_access(chat_id: Union[str, int], has_access: bool, code: Optional[str] = None) -> None:
+    """Update user access authorization state."""
+    u = get_user(chat_id)
+    u["has_access"] = bool(has_access)
+    if has_access:
+        u["access_code"] = code
+        u["access_granted_at"] = _now()
+    else:
+        u["access_revoked_at"] = _now()
+    _save_user(chat_id, u)
 

@@ -9,5 +9,7 @@ __pycache__/
 *.png
 charts/
 .users_data.json
+users_state.json
+access_codes.json
 .exchange_key.secret
 *.secret
