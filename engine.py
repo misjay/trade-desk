@@ -713,6 +713,30 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
         notify_entry_filled(pos_perp)
     log.info("Opened PERP order: %s %s @$%.4f qty=%.6f lev=%dx status=%s", ticker, side, entry_mid, perp_qty, lev, pos_perp["status"])
 
+    # Dispatch to connected live Bybit users in parallel
+    try:
+        import exchange_manager
+        sig_payload = {
+            "ticker": ticker,
+            "side": side,
+            "live_price": entry_mid,
+            "trigger_price": entry_mid,
+            "sl": sl,
+            "tp1": tp1,
+            "tp2": tp2,
+            "tf": trade_type,
+        }
+        call_cfg = state.get_call_bot_config()
+        c_tok = call_cfg.get("token") or cfg.call_bot_token or cfg.telegram_token
+        threading.Thread(
+            target=exchange_manager.dispatch_triggered_trade_to_users,
+            args=(sig_payload,),
+            kwargs={"bot_token": c_tok},
+            daemon=True,
+        ).start()
+    except Exception as exc:
+        log.warning("Could not dispatch master order to live connected users: %s", exc)
+
     # ── 2. Execute SPOT Block ────────────────────────────────────────────────
     # Check if spot trading is enabled via /onspot (disabled via /offspot)
     execute_spot = state.is_spot_enabled()

@@ -277,6 +277,17 @@ def execute_trade_for_user(
         if q_qty < min_qty:
             q_qty = min_qty
 
+        # Safety Guard for Small Wallets: prevent over-leveraging
+        required_margin = (q_qty * live_price) / lev
+        try:
+            wb = client.get_wallet_balance("USDT")
+            avail_bal = float(wb.get("available", 0.0))
+            if avail_bal > 0 and required_margin > (avail_bal * 0.60):
+                log.info("Skipping trade %s for user %s: required margin $%.2f exceeds 60%% of available balance ($%.2f)", sym, cid, required_margin, avail_bal)
+                return False, f"Requires ${required_margin:.2f} margin (exceeds safe buffer for ${avail_bal:.2f} available balance). Skipped to protect small wallet."
+        except Exception as e_bal:
+            log.debug("Balance check exception for user %s: %s", cid, e_bal)
+
         # C. Place Market Order with exchange-native TP1 and SL
         order_side = "Buy" if side_clean == "BUY" else "Sell"
         res = client.place_order(
