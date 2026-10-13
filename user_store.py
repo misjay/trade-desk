@@ -96,7 +96,7 @@ def _default_user_state(chat_id: str) -> Dict[str, Any]:
             "encrypted_api_key": "",
             "encrypted_api_secret": "",
             "is_testnet": False,
-            "auto_trade": True,
+            "auto_trade": False,
             "risk_per_trade_usdt": 50.0,
             "connected_at": None,
         },
@@ -445,7 +445,7 @@ def set_user_exchange(
     api_secret_enc: str,
     api_key_masked: str,
     is_testnet: bool = False,
-    auto_trade: bool = True,
+    auto_trade: bool = False,
     risk_per_trade: float = 50.0,
 ) -> dict:
     """Save encrypted exchange credentials into user's profile."""
@@ -515,15 +515,21 @@ def set_user_risk_per_trade(chat_id: Union[str, int], risk_usdt: float) -> float
 
 
 def get_all_auto_trade_users(trade_type: str = "scalp") -> List[Tuple[str, dict]]:
-    """Return all users who have auto_trade enabled and are not paused for this trade_type."""
+    """Return all authorized users who have explicitly enabled auto_trade and are not paused for this trade_type."""
+    import access_manager
     with _lock:
         all_users = _load_all()
         active = []
         for cid, u in all_users.items():
+            # Must be authorized to use Winz desk
+            if not access_manager.is_user_authorized(cid):
+                continue
+            # Must not be paused for this trade type
             if is_user_paused_for_type(cid, trade_type):
                 continue
             ex = u.get("exchange", {})
-            if ex.get("auto_trade"):
+            # Must have explicitly set auto_trade to True
+            if ex.get("auto_trade") is True:
                 active.append((cid, u))
         return active
 

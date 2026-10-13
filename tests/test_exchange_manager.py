@@ -136,6 +136,7 @@ class TestExchangeManager(unittest.TestCase):
         self.assertIn("avoid list", msg2.lower())
 
     def test_dispatch_triggered_trade_to_users(self):
+        user_store.set_user_has_access("user_auto_1", True)
         user_store.set_user_exchange(
             chat_id="user_auto_1",
             exchange_name="bybit",

@@ -113,7 +113,7 @@ def verify_and_connect_bybit(
     api_secret: str,
     is_testnet: bool = False,
     risk_per_trade: float = 50.0,
-    auto_trade: bool = True,
+    auto_trade: bool = False,
 ) -> Tuple[bool, str, float]:
     """
     Verify user's Bybit API credentials by querying account balance.

@@ -138,9 +138,84 @@ def is_user_authorized(chat_id: Union[str, int]) -> bool:
     return False
 
 
+def extract_and_normalize_code(raw_input: str) -> str:
+    """
+    Extracts and normalizes a candidate access code from free-form user input:
+    - Extracts start parameter if a Telegram URL was pasted (e.g. https://t.me/thewinzbot?start=CODE)
+    - Strips command/conversational prefixes: '/access', '/code', '/invite', 'code:', 'access:', 'invite:'
+    - Strips surrounding quotes, markdown characters, and whitespace
+    - Normalizes uppercase
+    """
+    if not raw_input:
+        return ""
+    s = raw_input.strip()
+
+    # If full URL pasted (e.g. https://t.me/thewinzbot?start=WINZ-XXXX or t.me/thewinzbot?start=WINZ-XXXX)
+    if "start=" in s:
+        s = s.split("start=", 1)[1].split("&")[0].split()[0]
+    elif "t.me/" in s:
+        s = s.split("/")[-1].split("?")[0]
+
+    # Strip command or conversational prefixes
+    for prefix in (
+        "/access", "/code", "/invite", "/start",
+        "access:", "access ", "code:", "code ", "invite:", "invite ",
+        "my code is:", "my code is ", "my code:", "my code ",
+    ):
+        if s.lower().startswith(prefix):
+            s = s[len(prefix):].strip()
+
+    # Strip surrounding formatting quotes/brackets
+    s = s.strip("\"'`<>[]()# \t\r\n")
+    return s.upper()
+
+
+def find_matching_code(clean_code: str, codes_dict: Dict[str, dict]) -> Optional[str]:
+    """
+    Tolerantly matches user-entered code against the registered codes database:
+    1. Exact match (case-insensitive)
+    2. Match ignoring hyphens, underscores, and spaces (e.g. WINZ9AQUCMML matches WINZ-9AQU-CMML)
+    3. Match with or without 'WINZ' prefix (e.g. 9AQU-CMML matches WINZ-9AQU-CMML)
+    4. Tolerant prefix match if only 1 code matches (e.g. WINZ-V8T2-VPY -> WINZ-V8T2-VPYE)
+    """
+    if not clean_code or not codes_dict:
+        return None
+
+    # 1. Exact match
+    for k in codes_dict:
+        if k.upper() == clean_code:
+            return k
+
+    # 2. Match ignoring hyphens, underscores, and whitespace
+    alpha_clean = clean_code.replace("-", "").replace("_", "").replace(" ", "").upper()
+    for k in codes_dict:
+        k_alpha = k.replace("-", "").replace("_", "").replace(" ", "").upper()
+        if alpha_clean == k_alpha:
+            return k
+
+    # 3. Match with or without 'WINZ' prefix
+    target_no_winz = alpha_clean[4:] if alpha_clean.startswith("WINZ") else alpha_clean
+    for k in codes_dict:
+        k_alpha = k.replace("-", "").replace("_", "").replace(" ", "").upper()
+        k_no_winz = k_alpha[4:] if k_alpha.startswith("WINZ") else k_alpha
+        if target_no_winz and target_no_winz == k_no_winz:
+            return k
+
+    # 4. Tolerant prefix match for single cut-off character (minimum 8 chars)
+    if len(alpha_clean) >= 8:
+        matches = [
+            k for k in codes_dict
+            if k.replace("-", "").replace("_", "").replace(" ", "").upper().startswith(alpha_clean)
+        ]
+        if len(matches) == 1:
+            return matches[0]
+
+    return None
+
+
 def redeem_access_code(chat_id: Union[str, int], code_str: str) -> Tuple[bool, str]:
     """
-    Redeem an access code for a given chat_id.
+    Redeem an access code for a given chat_id with smart extraction and tolerant matching.
     Returns (success, message).
     """
     cid = str(chat_id).strip()
@@ -150,7 +225,9 @@ def redeem_access_code(chat_id: Union[str, int], code_str: str) -> Tuple[bool, s
     if not code_str:
         return False, "Please provide an access code. Usage: `/access <YOUR_CODE>`"
 
-    clean_code = code_str.strip().upper()
+    clean_code = extract_and_normalize_code(code_str)
+    if not clean_code:
+        return False, "Please enter a valid access code."
 
     with _lock:
         data = _load_data()
@@ -159,17 +236,18 @@ def redeem_access_code(chat_id: Union[str, int], code_str: str) -> Tuple[bool, s
             return True, "You already have active authorized access to Winz Trading Desk!"
 
         codes = data.setdefault("codes", {})
-        if clean_code not in codes:
+        matched_key = find_matching_code(clean_code, codes)
+        if not matched_key:
             return False, f"Invalid access code `{clean_code}`. Please check the code and try again."
 
-        code_meta = codes[clean_code]
+        code_meta = codes[matched_key]
         if not code_meta.get("is_active", True):
-            return False, f"Access code `{clean_code}` has been deactivated or revoked."
+            return False, f"Access code `{matched_key}` has been deactivated or revoked."
 
         max_uses = int(code_meta.get("max_uses", 0))
         used_count = int(code_meta.get("used_count", 0))
         if max_uses > 0 and used_count >= max_uses:
-            return False, f"Access code `{clean_code}` has reached its maximum redemption limit ({max_uses}/{max_uses})."
+            return False, f"Access code `{matched_key}` has reached its maximum redemption limit ({max_uses}/{max_uses})."
 
         # Grant access
         code_meta["used_count"] = used_count + 1
@@ -179,7 +257,7 @@ def redeem_access_code(chat_id: Union[str, int], code_str: str) -> Tuple[bool, s
 
         users[cid] = {
             "chat_id": cid,
-            "code": clean_code,
+            "code": matched_key,
             "granted_at": _now(),
             "is_authorized": True,
         }
@@ -187,12 +265,12 @@ def redeem_access_code(chat_id: Union[str, int], code_str: str) -> Tuple[bool, s
 
     try:
         import user_store
-        user_store.set_user_has_access(cid, True, code=clean_code)
+        user_store.set_user_has_access(cid, True, code=matched_key)
     except Exception as exc:
         log.debug("Failed syncing access to user_store: %s", exc)
 
-    log.info("User %s successfully redeemed access code %s", cid, clean_code)
-    return True, f"Access code `{clean_code}` activated successfully! Welcome to Winz."
+    log.info("User %s successfully redeemed access code %s", cid, matched_key)
+    return True, f"Access code `{matched_key}` activated successfully! Welcome to Winz."
 
 
 # ── Admin Code Management ──────────────────────────────────────────────────────

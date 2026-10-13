@@ -806,6 +806,71 @@ class TestTelegramBot(unittest.TestCase):
             telegram_bot.handle_command("/resume", user_id)
             self.assertIn("ALL ACTIVE", user_store.get_user_execution_mode_status(user_id))
 
+    def test_access_code_redemption_variations(self):
+        import telegram_bot
+        import access_manager
+        import user_store
+
+        # Create test code
+        access_manager.create_access_code(code="WINZ-9AQU-CMML", max_uses=10)
+
+        # 1. Direct paste without slash
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("WINZ-9AQU-CMML", "user_direct_1")
+            self.assertTrue(access_manager.is_user_authorized("user_direct_1"))
+            self.assertIn("Access Granted", mock_reply.call_args[0][1])
+            self.assertIn("Automated Trading is currently OFF by default", mock_reply.call_args[0][1])
+
+        # 2. Direct paste without hyphens
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("WINZ9AQUCMML", "user_direct_2")
+            self.assertTrue(access_manager.is_user_authorized("user_direct_2"))
+            self.assertIn("Access Granted", mock_reply.call_args[0][1])
+
+        # 3. Direct paste without WINZ prefix
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("9AQU-CMML", "user_direct_3")
+            self.assertTrue(access_manager.is_user_authorized("user_direct_3"))
+            self.assertIn("Access Granted", mock_reply.call_args[0][1])
+
+        # 4. Paste full URL link
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("https://t.me/thewinzbot?start=WINZ-9AQU-CMML", "user_direct_4")
+            self.assertTrue(access_manager.is_user_authorized("user_direct_4"))
+            self.assertIn("Access Granted", mock_reply.call_args[0][1])
+
+    def test_autotrade_opt_in_defaults(self):
+        import telegram_bot
+        import access_manager
+        import user_store
+
+        cid = "user_auto_test_55"
+        access_manager.grant_user_access(cid, label="Auto Test")
+
+        # Newly authorized user must have auto_trade == False
+        ex = user_store.get_user_exchange(cid)
+        self.assertFalse(ex.get("auto_trade", True))
+
+        # Check /status output shows 🔴 OFF
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/status", cid)
+            self.assertIn("Automated Trading", mock_reply.call_args[0][1])
+            self.assertIn("🔴 OFF", mock_reply.call_args[0][1])
+
+        # Enable autotrade
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/autotrade on", cid)
+            self.assertIn("Automated Execution ENABLED", mock_reply.call_args[0][1])
+            ex = user_store.get_user_exchange(cid)
+            self.assertTrue(ex.get("auto_trade"))
+
+        # Natural language shortcut
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("autotrade off", cid)
+            self.assertIn("Automated Execution DISABLED", mock_reply.call_args[0][1])
+            ex = user_store.get_user_exchange(cid)
+            self.assertFalse(ex.get("auto_trade"))
+
     def test_admin_broadcast_and_signal(self):
         import telegram_bot
         import access_manager

@@ -312,6 +312,10 @@ def handle_command(
         parts = ["/resumeday"]
     elif lower_raw in ("resume all", "resume both", "trade all", "trade both", "resume scalp and day", "trade scalp and day"):
         parts = ["/resume", "all"]
+    elif lower_raw in ("autotrade on", "auto on", "enable autotrade", "start autotrade", "turn on autotrade", "start auto trade", "enable auto trade"):
+        parts = ["/autotrade", "on"]
+    elif lower_raw in ("autotrade off", "auto off", "disable autotrade", "stop autotrade", "turn off autotrade", "pause autotrade", "stop auto trade", "disable auto trade"):
+        parts = ["/autotrade", "off"]
     elif "how are we doing" in lower_raw or "performance today" in lower_raw or "what is the drawdown" in lower_raw or "show positions" in lower_raw:
         parts = ["/status"]
     else:
@@ -335,8 +339,8 @@ def handle_command(
                 chat_id,
                 "🔑 *Winz Access Code Activation*\n\n"
                 "To unlock Winz Autonomous Trading Desk, please enter your access code:\n"
-                "👉 Usage: `/access <YOUR_CODE>`\n"
-                "_Example: `/access WINZ2026`_\n\n"
+                "👉 Usage: `/access <YOUR_CODE>` or simply paste your code directly.\n"
+                "_Example: `WINZ-9AQU-CMML`_\n\n"
                 "ℹ️ Contact the desk administrator to request an invite code.",
                 bot_token=_current_bot_token,
             )
@@ -357,6 +361,8 @@ def handle_command(
                 "• 📋 *Active Calls & 2-Hour A+ Quality Signals* (`/calls`)\n"
                 "• 💎 *Spot Accumulation Setups & Charts* (`/spot`)\n"
                 "• 🔬 *Institutional Order Block Thesis* (`/research`)\n\n"
+                "🛡️ *Automated Trading is currently OFF by default.*\n"
+                "When you are ready for autonomous execution, type `/autotrade on`.\n\n"
                 "👉 Type `/help` or `/calls` to explore your trading desk!",
                 bot_token=_current_bot_token,
             )
@@ -381,6 +387,8 @@ def handle_command(
                 chat_id,
                 "🎉 *Access Granted! Welcome to Winz Trading Desk.*\n\n"
                 "Your invite link has been activated successfully!\n\n"
+                "🛡️ *Automated Trading is currently OFF by default.*\n"
+                "When you are ready for autonomous execution, type `/autotrade on`.\n\n"
                 "👉 Type `/help` to view all available commands or `/calls` for live trade setups.",
                 bot_token=_current_bot_token,
             )
@@ -391,13 +399,47 @@ def handle_command(
                 f"❌ *Invalid Access Code / Invite Link*\n\n"
                 f"{msg_text}\n\n"
                 f"To activate manually:\n"
-                f"👉 `/access <YOUR_CODE>`",
+                f"👉 Paste your code directly or type `/access <YOUR_CODE>`",
                 bot_token=_current_bot_token,
             )
             return
 
     # ── 2. Access Authorization Gate for Public Users ─────────────────────────
     if not access_manager.is_user_authorized(chat_id):
+        # Inspect un-slashed messages to see if user pasted a raw access code or invite link
+        if not raw_text.startswith("/"):
+            candidate = access_manager.extract_and_normalize_code(raw_text)
+            if candidate:
+                ok, msg_text = access_manager.redeem_access_code(chat_id, raw_text)
+                if ok:
+                    if is_winz_bot:
+                        state.add_call_bot_chat(chat_id)
+                    _reply(
+                        chat_id,
+                        "🎉 *Access Granted! Welcome to Winz Trading Desk.*\n\n"
+                        "Your access code has been activated successfully.\n"
+                        "You now have full access to:\n"
+                        "• 💼 *Personal Trading Desk* ($10,000 Starting Demo Portfolio)\n"
+                        "• 🔐 *CEX / Bybit Live Automation* (`/connect bybit`)\n"
+                        "• 📋 *Active Calls & 2-Hour A+ Quality Signals* (`/calls`)\n"
+                        "• 💎 *Spot Accumulation Setups & Charts* (`/spot`)\n"
+                        "• 🔬 *Institutional Order Block Thesis* (`/research`)\n\n"
+                        "🛡️ *Automated Trading is currently OFF by default.*\n"
+                        "When you are ready for autonomous execution, type `/autotrade on`.\n\n"
+                        "👉 Type `/help` or `/calls` to explore your trading desk!",
+                        bot_token=_current_bot_token,
+                    )
+                    return
+                elif candidate.startswith("WINZ") or "-" in candidate or "_" in candidate:
+                    _reply(
+                        chat_id,
+                        f"❌ *Access Code Failed*\n\n"
+                        f"{msg_text}\n\n"
+                        f"Please verify your code or contact the desk administrator to request a new code.",
+                        bot_token=_current_bot_token,
+                    )
+                    return
+
         if cmd in ("/start", "/help"):
             _reply(
                 chat_id,
@@ -405,8 +447,9 @@ def handle_command(
                 "Welcome to *Winz* — Autonomous Algorithmic Trade Desk & Market Intelligence Hub.\n\n"
                 "Winz is currently running in exclusive private access mode. To unlock your personal trading desk, market signals, and Bybit execution:\n\n"
                 "👉 *Activate your access:*\n"
+                "Simply paste your access code directly here or type:\n"
                 "`/access <YOUR_CODE>`\n"
-                "_Example: `/access WINZ2026`_\n\n"
+                "_Example: `/access WINZ-9AQU-CMML`_\n\n"
                 "ℹ️ *Don't have an access code?* Contact the desk administrator to request an invite code.",
                 bot_token=_current_bot_token,
             )
@@ -415,8 +458,8 @@ def handle_command(
                 chat_id,
                 "🔒 *Access Restricted*\n\n"
                 "You need an active access code to use Winz Trading Desk.\n\n"
-                "👉 Type `/access <YOUR_CODE>` to unlock all features.\n"
-                "_Example: `/access WINZ2026`_",
+                "👉 Simply paste your access code directly here or type `/access <YOUR_CODE>` to unlock all features.\n"
+                "_Example: `WINZ-9AQU-CMML`_",
                 bot_token=_current_bot_token,
             )
         return
@@ -564,6 +607,9 @@ def handle_command(
             open_pos = u.get("open_positions", {})
             stats = u.get("session", {})
             pause_str = user_store.get_user_execution_mode_status(chat_id)
+            ex = user_store.get_user_exchange(chat_id)
+            auto_trade_enabled = bool(ex and ex.get("auto_trade"))
+            auto_str = "🟢 ON (Autonomous)" if auto_trade_enabled else "🔴 OFF (Type /autotrade on to enable)"
 
             floating_pnl = 0.0
             from scanner import fetch_live_price
@@ -578,15 +624,21 @@ def handle_command(
                     floating_pnl += diff * qty
 
             net_equity = eq + floating_pnl
+            acct_info = ""
+            if ex and ex.get("connected"):
+                acct_info = f"• *Connected Account*: `Bybit` ({ex.get('api_key_masked')})\n"
+
             msg = (
                 f"💼 *Your Personal Trading Desk Status*\n\n"
+                f"{acct_info}"
                 f"• *Execution*: {pause_str}\n"
+                f"• *Automated Trading*: {auto_str}\n"
                 f"• *Demo Equity*: `${eq:,.2f} USDT`\n"
                 f"• *Net Equity (with Floating)*: `${net_equity:,.2f} USDT`\n"
                 f"• *Open Positions*: `{len(open_pos)}`\n"
                 f"• *Session Score*: `{stats.get('wins', 0)}W / {stats.get('losses', 0)}L / {stats.get('breakevens', 0)}BE`\n"
                 f"• *Session Realized PnL*: `${stats.get('total_pnl_usdt', 0.0):+,.2f} USDT`\n\n"
-                f"_Commands: `/positions`, `/trade <COIN>`, `/tp`, `/derisk`, `/close <COIN>`, `/closeall`, `/resetdemo`_"
+                f"_Commands: `/autotrade on/off`, `/positions`, `/trade <COIN>`, `/tp`, `/derisk`, `/close <COIN>`, `/closeall`, `/resetdemo`_"
             )
             _reply(chat_id, msg)
             return
@@ -1891,7 +1943,7 @@ def handle_command(
             api_secret=api_secret,
             is_testnet=is_testnet,
             risk_per_trade=50.0,
-            auto_trade=True,
+            auto_trade=False,
         )
 
         if not success:
@@ -1915,14 +1967,14 @@ def handle_command(
             f"• *Account Balance*: `${equity:,.2f} USDT`\n"
             f"• *Linked API Key*: `{masked}`\n"
             f"• *Execution Mode*: `{mode_str}`\n"
-            f"• *Automated Trading*: `🟢 ON (Active)`\n"
+            f"• *Automated Trading*: `🔴 OFF (Type /autotrade on to enable)`\n"
             f"• *Risk per Trade*: `$50.00 USDT` margin\n"
             f"• *Security*: `AES-256 Authenticated Fernet Encryption`\n\n"
-            f"🚀 *Winz is now armed to trade on your Bybit account!*\n"
-            f"Every trade will execute with strict exchange-native TP & SL protection.\n\n"
+            f"🛡️ *Safety First:* Automated trading is OFF by default.\n"
+            f"When you are ready for Winz to place trades autonomously, type `/autotrade on`.\n\n"
             f"⚙️ *Helpful Controls:*\n"
+            f"• `/autotrade on` — Enable automated trade execution\n"
             f"• `/risk <USDT>` — Change margin size per trade (e.g. `/risk 100`)\n"
-            f"• `/autotrade off` — Turn off auto-trading (use manual alerts)\n"
             f"• `/myexchange` — View real wallet balance & settings\n"
             f"• `/disconnect` — Remove your API keys and unlink",
             bot_token=_current_bot_token,
@@ -2503,8 +2555,11 @@ def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_tri
 
                     raw_text = text.strip()
                     lower_text = raw_text.lower()
+                    is_dm = not (chat_id.startswith("-") or chat_id.startswith("-100"))
+                    is_unauthorized = not access_manager.is_user_authorized(chat_id)
                     is_cmd = (
                         raw_text.startswith("/")
+                        or (is_dm and is_unauthorized)
                         or "convert to twitter" in lower_text
                         or "tweet" in lower_text
                         or ("research" in lower_text and "(" in lower_text and ")" in lower_text)
