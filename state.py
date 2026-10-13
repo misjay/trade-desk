@@ -75,6 +75,9 @@ def _default_state() -> Dict[str, Any]:
         "high_water_mark": cfg.paper_equity,
         "custom_leverage": {},
         "spot_enabled": False,
+        "is_paused": False,
+        "is_scalp_paused": False,
+        "is_day_paused": False,
         "call_bot": call_bot_entry,
         "created_at": _now(),
         "updated_at": _now(),
@@ -129,14 +132,105 @@ def set_equity(new_equity: float) -> None:
 
 def is_paused() -> bool:
     with _lock:
-        return bool(_load_raw().get("is_paused", False))
+        s = _load_raw()
+        return bool(s.get("is_paused", False) or (s.get("is_scalp_paused", False) and s.get("is_day_paused", False)))
 
 
-def set_paused(paused: bool) -> None:
+def is_scalp_paused() -> bool:
     with _lock:
         s = _load_raw()
-        s["is_paused"] = paused
+        return bool(s.get("is_paused", False) or s.get("is_scalp_paused", False))
+
+
+def is_day_paused() -> bool:
+    with _lock:
+        s = _load_raw()
+        return bool(s.get("is_paused", False) or s.get("is_day_paused", False))
+
+
+def is_paused_for_type(trade_type: str = "scalp") -> bool:
+    tt = str(trade_type).lower()
+    if tt in ("scalp", "15m", "15", "quick"):
+        return is_scalp_paused()
+    return is_day_paused()
+
+
+def set_paused(paused: bool, mode: str = "all") -> None:
+    with _lock:
+        s = _load_raw()
+        m = str(mode).lower()
+        if m in ("scalp", "scalping"):
+            s["is_scalp_paused"] = bool(paused)
+            if not paused and not s.get("is_day_paused"):
+                s["is_paused"] = False
+            elif paused and s.get("is_day_paused"):
+                s["is_paused"] = True
+            else:
+                s["is_paused"] = False
+        elif m in ("day", "daytrade", "swing", "4h"):
+            s["is_day_paused"] = bool(paused)
+            if not paused and not s.get("is_scalp_paused"):
+                s["is_paused"] = False
+            elif paused and s.get("is_scalp_paused"):
+                s["is_paused"] = True
+            else:
+                s["is_paused"] = False
+        else:
+            s["is_paused"] = bool(paused)
+            s["is_scalp_paused"] = bool(paused)
+            s["is_day_paused"] = bool(paused)
         _save(s)
+
+
+def set_execution_mode(mode: str) -> Tuple[bool, str]:
+    """
+    Set execution mode: 'day_only', 'scalp_only', 'all', 'pause_all'.
+    """
+    with _lock:
+        s = _load_raw()
+        m = str(mode).lower()
+        if m in ("day_only", "onlyday", "dayonly", "only_day", "day", "daytrade", "daytrades", "swing"):
+            s["is_scalp_paused"] = True
+            s["is_day_paused"] = False
+            s["is_paused"] = False
+            _save(s)
+            return True, "🟡 *DAY TRADES ONLY Mode Activated.*\nAutomated 15m scalps are PAUSED. 4H day trades are ACTIVE."
+        elif m in ("scalp_only", "onlyscalp", "scalponly", "only_scalp", "scalp", "scalps", "scalping", "quick"):
+            s["is_scalp_paused"] = False
+            s["is_day_paused"] = True
+            s["is_paused"] = False
+            _save(s)
+            return True, "🟡 *SCALP ONLY Mode Activated.*\nAutomated 4H day trades are PAUSED. 15m scalps are ACTIVE."
+        elif m in ("all", "resume", "both", "resume_all"):
+            s["is_scalp_paused"] = False
+            s["is_day_paused"] = False
+            s["is_paused"] = False
+            _save(s)
+            return True, "🟢 *ALL TRADING ACTIVE.*\nBoth 15m scalps and 4H day trades are RUNNING automatically."
+        elif m in ("pause", "pause_all", "freeze"):
+            s["is_scalp_paused"] = True
+            s["is_day_paused"] = True
+            s["is_paused"] = True
+            _save(s)
+            return True, "⏸ *ALL TRADING PAUSED.*\nBoth scalps and day trades are FROZEN."
+        else:
+            return False, f"Unknown mode `{mode}`. Available: `day_only`, `scalp_only`, `all`, `pause_all`."
+
+
+def get_execution_mode_status() -> str:
+    with _lock:
+        s = _load_raw()
+        paused = s.get("is_paused", False)
+        sc_p = s.get("is_scalp_paused", False)
+        day_p = s.get("is_day_paused", False)
+        if paused or (sc_p and day_p):
+            return "⏸ ALL PAUSED (Both Scalps & Day Trades Frozen)"
+        elif sc_p:
+            return "🟡 DAY TRADES ONLY (15m Scalps Paused, 4H Day Active)"
+        elif day_p:
+            return "🟡 SCALPS ONLY (4H Day Paused, 15m Scalps Active)"
+        else:
+            return "🟢 ALL ACTIVE (Both Scalps & Day Trades Running)"
 
 
 def save_signal(sig: dict) -> None:

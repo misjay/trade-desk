@@ -747,6 +747,106 @@ class TestTelegramBot(unittest.TestCase):
             telegram_bot.handle_command("/gencode SNEAKY 1", stranger)
             self.assertIn("Access Restricted: Master Desk Command", mock_reply.call_args[0][1])
 
+    def test_granular_mode_switching(self):
+        import telegram_bot
+        import state
+        import user_store
+        import access_manager
+
+        admin_id = "12345"
+        user_id = "777888"
+        access_manager.grant_user_access(user_id, label="Test Grant")
+
+        # 1. Admin Master Desk mode switching
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/onlyday", admin_id)
+            self.assertIn("DAY TRADES ONLY", state.get_execution_mode_status())
+            self.assertTrue(state.is_scalp_paused())
+            self.assertFalse(state.is_day_paused())
+            self.assertIn("DAY TRADES ONLY", mock_reply.call_args[0][1])
+
+            # Vice versa: only scalp
+            telegram_bot.handle_command("/onlyscalp", admin_id)
+            self.assertIn("SCALPS ONLY", state.get_execution_mode_status())
+            self.assertFalse(state.is_scalp_paused())
+            self.assertTrue(state.is_day_paused())
+            self.assertIn("SCALPS ONLY", mock_reply.call_args[0][1])
+
+            # Natural language: "pause automated scalp and trade only day trade"
+            telegram_bot.handle_command("pause automated scalp and trade only day trade", admin_id)
+            self.assertIn("DAY TRADES ONLY", state.get_execution_mode_status())
+
+            # Natural language: "pause day trade and trade only scalp"
+            telegram_bot.handle_command("pause day trade and trade only scalp", admin_id)
+            self.assertIn("SCALPS ONLY", state.get_execution_mode_status())
+
+            # Natural language: "trade only day"
+            telegram_bot.handle_command("trade only day", admin_id)
+            self.assertIn("DAY TRADES ONLY", state.get_execution_mode_status())
+
+            # Resume all
+            telegram_bot.handle_command("/resume", admin_id)
+            self.assertIn("ALL ACTIVE", state.get_execution_mode_status())
+            self.assertFalse(state.is_scalp_paused())
+            self.assertFalse(state.is_day_paused())
+
+        # 2. Public User mode switching
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("pause automated scalp and trade only day trade", user_id)
+            self.assertIn("DAY TRADES ONLY", user_store.get_user_execution_mode_status(user_id))
+            self.assertTrue(user_store.is_user_scalp_paused(user_id))
+            self.assertFalse(user_store.is_user_day_paused(user_id))
+            self.assertIn("DAY TRADES ONLY", mock_reply.call_args[0][1])
+
+            telegram_bot.handle_command("pause day trade and trade only scalp", user_id)
+            self.assertIn("SCALPS ONLY", user_store.get_user_execution_mode_status(user_id))
+            self.assertFalse(user_store.is_user_scalp_paused(user_id))
+            self.assertTrue(user_store.is_user_day_paused(user_id))
+
+            telegram_bot.handle_command("/resume", user_id)
+            self.assertIn("ALL ACTIVE", user_store.get_user_execution_mode_status(user_id))
+
+    def test_admin_broadcast_and_signal(self):
+        import telegram_bot
+        import access_manager
+        import user_store
+        import requests
+
+        admin_id = "12345"
+        stranger = "999888"
+
+        # Non-admin cannot broadcast
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/broadcast Hello everyone", stranger)
+            self.assertIn("Access Restricted", mock_reply.call_args[0][1])
+
+        # Admin broadcast without args gives usage
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/broadcast", admin_id)
+            self.assertIn("Winz Broadcast Desk", mock_reply.call_args[0][1])
+
+        # Add authorized users and recipients
+        access_manager.grant_user_access("10101", label="User A")
+        access_manager.grant_user_access("20202", label="User B")
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"ok": True}
+
+        with patch("requests.post", return_value=mock_resp) as mock_post, \
+             patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/signal 🚀 LONG BTCUSDT @ $68,400 TP: $70k SL: $67k", admin_id)
+
+            # Check that post was made to recipients
+            posted_chats = [call[1].get("json", {}).get("chat_id") for call in mock_post.call_args_list if "chat_id" in call[1].get("json", {})]
+            self.assertIn("10101", posted_chats)
+            self.assertIn("20202", posted_chats)
+
+            # Admin received receipt
+            receipt_msg = mock_reply.call_args_list[-1][0][1]
+            self.assertIn("Broadcast Dispatched Successfully", receipt_msg)
+            self.assertIn("Trade Signal", receipt_msg)
+
 
 if __name__ == "__main__":
     unittest.main()

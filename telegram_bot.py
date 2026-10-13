@@ -39,6 +39,7 @@ MASTER_DESK_ONLY_COMMANDS = {
     "/revokecode",
     "/grant", "/revokeuser",
     "/users", "/accessusers",
+    "/broadcast", "/signal",
 }
 ADMIN_COMMANDS = MASTER_DESK_ONLY_COMMANDS
 
@@ -93,10 +94,22 @@ def _delete_message(chat_id: str, message_id: Optional[int], bot_token: Optional
         log.debug("Telegram deleteMessage failed: %s", exc)
 
 
-def _paused_footer() -> str:
-    """Returns a footer reminder if automated execution is currently paused."""
+def _paused_footer(chat_id: Optional[str] = None) -> str:
+    """Returns a footer reminder if automated execution is currently paused or in single-mode."""
+    if chat_id and not is_admin(chat_id):
+        if user_store.is_user_paused(chat_id):
+            return "\n\n_(⏸ Personal execution is PAUSED. Will NOT resume automatically until you type `/resume`.)_"
+        elif user_store.is_user_scalp_paused(chat_id):
+            return "\n\n_(🟡 Scalp execution is PAUSED | Day Trades ONLY active. Type `/resume` to trade all.)_"
+        elif user_store.is_user_day_paused(chat_id):
+            return "\n\n_(🟡 Day trade execution is PAUSED | Scalps ONLY active. Type `/resume` to trade all.)_"
+        return ""
     if state.is_paused():
         return "\n\n_(⏸ Execution remains PAUSED. Will NOT resume automatically until you type `/resume`.)_"
+    elif state.is_scalp_paused():
+        return "\n\n_(🟡 Master Desk: Scalp execution is PAUSED | Day Trades ONLY active. Type `/resume` to trade all.)_"
+    elif state.is_day_paused():
+        return "\n\n_(🟡 Master Desk: Day trade execution is PAUSED | Scalps ONLY active. Type `/resume` to trade all.)_"
     return ""
 
 
@@ -253,6 +266,52 @@ def handle_command(
                 parts.append(ticker_arg)
         else:
             parts = raw_text.split()
+    elif any(k in lower_raw for k in [
+        "pause automated scalp and trade only day",
+        "pause automated scalps and trade only day",
+        "pause scalp and trade only day",
+        "pause scalps and trade only day",
+        "pause scalp trade only day",
+        "trade only day trade",
+        "trade only day trades",
+        "trade only day",
+        "trade day only",
+        "day trade only",
+        "day trades only",
+        "day only",
+    ]):
+        parts = ["/onlyday"]
+    elif any(k in lower_raw for k in [
+        "pause day trade and trade only scalp",
+        "pause day trades and trade only scalp",
+        "pause automated day trade and trade only scalp",
+        "pause automated day trades and trade only scalp",
+        "pause day and trade only scalp",
+        "pause day trade and trade only automated scalp",
+        "trade only scalp",
+        "trade only scalps",
+        "trade only automated scalp",
+        "trade scalp only",
+        "scalp only",
+        "scalps only",
+    ]):
+        parts = ["/onlyscalp"]
+    elif lower_raw in (
+        "pause automated scalp", "pause automated scalps",
+        "pause scalp", "pause scalps", "stop scalp", "stop scalps"
+    ):
+        parts = ["/pausescalp"]
+    elif lower_raw in (
+        "pause automated day trade", "pause automated day trades",
+        "pause day trade", "pause day trades", "pause day", "stop day", "stop day trade"
+    ):
+        parts = ["/pauseday"]
+    elif lower_raw in ("resume scalp", "resume scalps", "resume automated scalp", "unpause scalp", "unpause scalps"):
+        parts = ["/resumescalp"]
+    elif lower_raw in ("resume day", "resume day trade", "resume day trades", "unpause day"):
+        parts = ["/resumeday"]
+    elif lower_raw in ("resume all", "resume both", "trade all", "trade both", "resume scalp and day", "trade scalp and day"):
+        parts = ["/resume", "all"]
     elif "how are we doing" in lower_raw or "performance today" in lower_raw or "what is the drawdown" in lower_raw or "show positions" in lower_raw:
         parts = ["/status"]
     else:
@@ -432,7 +491,10 @@ def handle_command(
                 "• `/avoid <COINS>` — 🚫 Exclude assets from your trading\n"
                 "• `/allow <COINS>` — 🟢 Restore excluded assets\n"
                 "• `/avoided` — 📋 Show your avoided assets list\n"
-                "• `/pause` / `/resume` — ⏸️ Pause or resume personal execution\n\n"
+                "• `/pause` / `/resume` — ⏸️ Pause or resume personal execution\n"
+                "• `/onlyday` / `/onlyscalp` — 🟡 Trade Day trades only or Scalps only\n"
+                "• `/pausescalp` / `/pauseday` — ⏸️ Pause individual execution modes\n"
+                "• `/resumescalp` / `/resumeday` — 🟢 Resume individual execution modes\n\n"
                 "🔬 *Deep Institutional Research & Charts:*\n"
                 "• `/research <COIN>` — Institutional order block thesis & chart markup (e.g. `/research SOL`)\n"
                 "• `/research <COIN> spot` — Spot accumulation thesis & macro chart\n"
@@ -448,6 +510,8 @@ def handle_command(
         else:
             msg = (
                 "🤖 *Xira Autonomous Trade Desk Control (Admin Panel)*\n\n"
+                "• `/broadcast <MSG>` — 📢 Broadcast announcement to all users & channels\n"
+                "• `/signal <CALL>` — 🎯 Broadcast official trade call to all users & channels\n"
                 "• `/watchlist` — 🎯 Best setups to watch right now (Shelves, invalidations & macro context)\n"
                 "• `/status` — Balance, equity, open positions & win stats\n"
                 "• `/positions` — Detailed active positions with live PnL & targets\n"
@@ -476,6 +540,9 @@ def handle_command(
                 "• `/avoided` — 📋 Show all currently avoided assets\n"
                 "• `/drop <COIN>` — ✂️ Close position & immediately add to avoid list\n"
                 "• `/scan` — Trigger an immediate market scalp scan\n"
+                "• `/onlyday` / `/onlyscalp` — 🟡 Trade day trades only or scalps only\n"
+                "• `/pausescalp` / `/pauseday` — ⏸️ Pause scalp or day trade cycle\n"
+                "• `/resumescalp` / `/resumeday` — 🟢 Resume scalp or day trade cycle\n"
                 "• `/pause` — Pause opening new orders\n"
                 "• `/resume` — Resume automatic order execution\n"
                 "• `/onspot` — 🟢 Enable Spot order execution\n"
@@ -496,8 +563,7 @@ def handle_command(
             eq = float(u.get("paper_equity", 10000.0))
             open_pos = u.get("open_positions", {})
             stats = u.get("session", {})
-            paused = u.get("is_paused", False)
-            pause_str = "⏸ PAUSED" if paused else "🟢 ACTIVE"
+            pause_str = user_store.get_user_execution_mode_status(chat_id)
 
             floating_pnl = 0.0
             from scanner import fetch_live_price
@@ -531,11 +597,10 @@ def handle_command(
         open_pos = state.get_open_positions()
         active_count = len(open_pos)
         stats = state.get_session_stats()
-        paused = state.is_paused()
         spot_on = state.is_spot_enabled()
 
         mode_str = cfg.trade_mode.upper()
-        pause_str = "⏸ PAUSED" if paused else "🟢 ACTIVE"
+        pause_str = state.get_execution_mode_status()
         spot_str = "🟢 ON (Dual-Venue)" if spot_on else "🔴 OFF (Perps Only)"
 
         msg = (
@@ -623,42 +688,331 @@ def handle_command(
 
         _reply(chat_id, "\n".join(lines))
 
-    elif cmd == "/pause":
+    elif cmd in ("/onlyday", "/dayonly"):
         if not is_admin(chat_id):
-            user_store.set_user_paused(chat_id, True)
+            user_store.set_user_execution_mode(chat_id, "day")
+            _reply(
+                chat_id,
+                "🟡 *Mode Updated: DAY TRADES ONLY*\n\n"
+                "• 15m automated scalps are now PAUSED.\n"
+                "• 4h day trade setups and swing signals remain ACTIVE.\n"
+                "• Existing positions remain protected by exchange TP & SL.\n"
+                "• Type `/resume` anytime to re-enable both scalps and day trades.",
+                bot_token=_current_bot_token,
+            )
+            return
+
+        state.set_execution_mode("day")
+        _reply(
+            chat_id,
+            "🟡 *Master Desk Updated: DAY TRADES ONLY*\n\n"
+            "• Automated 15m scalp cycle is now PAUSED.\n"
+            "• 4h day trade cycle and swing setups remain ACTIVE.\n"
+            "• Open positions remain protected by exchange TP & SL.\n"
+            "• Type `/resume` to re-enable scalping.",
+            bot_token=_current_bot_token,
+        )
+
+    elif cmd in ("/onlyscalp", "/scalponly"):
+        if not is_admin(chat_id):
+            user_store.set_user_execution_mode(chat_id, "scalp")
+            _reply(
+                chat_id,
+                "🟡 *Mode Updated: SCALPS ONLY*\n\n"
+                "• 4h day trade execution is now PAUSED.\n"
+                "• 15m automated scalps remain ACTIVE.\n"
+                "• Existing positions remain protected by exchange TP & SL.\n"
+                "• Type `/resume` anytime to re-enable both scalps and day trades.",
+                bot_token=_current_bot_token,
+            )
+            return
+
+        state.set_execution_mode("scalp")
+        _reply(
+            chat_id,
+            "🟡 *Master Desk Updated: SCALPS ONLY*\n\n"
+            "• 4h day trade execution is now PAUSED.\n"
+            "• 15m automated scalp cycle remains ACTIVE.\n"
+            "• Open positions remain protected by exchange TP & SL.\n"
+            "• Type `/resume` to re-enable day trades.",
+            bot_token=_current_bot_token,
+        )
+
+    elif cmd == "/pausescalp":
+        if not is_admin(chat_id):
+            user_store.set_user_paused(chat_id, True, mode="scalp")
+            _reply(
+                chat_id,
+                "⏸ *Personal Scalp Trading PAUSED*\n\n"
+                "• 15m automated scalp execution is paused.\n"
+                "• Day trade execution remains active.\n"
+                "• Type `/resumescalp` or `/resume` to restart.",
+                bot_token=_current_bot_token,
+            )
+            return
+
+        state.set_paused(True, mode="scalp")
+        _reply(
+            chat_id,
+            "⏸ *Master Desk Scalp Trading PAUSED*\n\n"
+            "• 15m automated scalp scan & order placement is paused.\n"
+            "• 4h day trade cycle remains active.\n"
+            "• Type `/resumescalp` or `/resume` to reactivate.",
+            bot_token=_current_bot_token,
+        )
+
+    elif cmd == "/pauseday":
+        if not is_admin(chat_id):
+            user_store.set_user_paused(chat_id, True, mode="day")
+            _reply(
+                chat_id,
+                "⏸ *Personal Day Trading PAUSED*\n\n"
+                "• Day trade execution is paused.\n"
+                "• 15m scalp execution remains active.\n"
+                "• Type `/resumeday` or `/resume` to restart.",
+                bot_token=_current_bot_token,
+            )
+            return
+
+        state.set_paused(True, mode="day")
+        _reply(
+            chat_id,
+            "⏸ *Master Desk Day Trading PAUSED*\n\n"
+            "• 4h day trade cycle is paused.\n"
+            "• 15m scalp cycle remains active.\n"
+            "• Type `/resumeday` or `/resume` to reactivate.",
+            bot_token=_current_bot_token,
+        )
+
+    elif cmd == "/resumescalp":
+        if not is_admin(chat_id):
+            user_store.set_user_paused(chat_id, False, mode="scalp")
+            _reply(
+                chat_id,
+                "🟢 *Personal Scalp Trading RESUMED*\n\n"
+                "• 15m automated scalps are now active.",
+                bot_token=_current_bot_token,
+            )
+            return
+
+        state.set_paused(False, mode="scalp")
+        _reply(
+            chat_id,
+            "🟢 *Master Desk Scalp Trading RESUMED*\n\n"
+            "• 15m automated scalp scan & execution is now active.",
+            bot_token=_current_bot_token,
+        )
+        if scan_trigger_fn:
+            threading.Thread(target=scan_trigger_fn, daemon=True).start()
+
+    elif cmd == "/resumeday":
+        if not is_admin(chat_id):
+            user_store.set_user_paused(chat_id, False, mode="day")
+            _reply(
+                chat_id,
+                "🟢 *Personal Day Trading RESUMED*\n\n"
+                "• 4h day trade execution is now active.",
+                bot_token=_current_bot_token,
+            )
+            return
+
+        state.set_paused(False, mode="day")
+        _reply(
+            chat_id,
+            "🟢 *Master Desk Day Trading RESUMED*\n\n"
+            "• 4h day trade execution is now active.",
+            bot_token=_current_bot_token,
+        )
+
+    elif cmd == "/pause":
+        sub_arg = args[0].lower() if args else ""
+        if sub_arg in ("scalp", "scalps", "15m", "quick"):
+            if not is_admin(chat_id):
+                user_store.set_user_paused(chat_id, True, mode="scalp")
+                _reply(chat_id, "⏸ *Personal Scalp Trading PAUSED.*\n\nDay trades remain active. Type `/resumescalp` or `/resume` to restart.", bot_token=_current_bot_token)
+                return
+            state.set_paused(True, mode="scalp")
+            _reply(chat_id, "⏸ *Master Desk Scalp Trading PAUSED.*\n\nDay trades remain active. Type `/resumescalp` or `/resume` to reactivate.", bot_token=_current_bot_token)
+            return
+        elif sub_arg in ("day", "daytrade", "days", "swing", "4h"):
+            if not is_admin(chat_id):
+                user_store.set_user_paused(chat_id, True, mode="day")
+                _reply(chat_id, "⏸ *Personal Day Trading PAUSED.*\n\nScalps remain active. Type `/resumeday` or `/resume` to restart.", bot_token=_current_bot_token)
+                return
+            state.set_paused(True, mode="day")
+            _reply(chat_id, "⏸ *Master Desk Day Trading PAUSED.*\n\nScalps remain active. Type `/resumeday` or `/resume` to reactivate.", bot_token=_current_bot_token)
+            return
+
+        # Default: pause all
+        if not is_admin(chat_id):
+            user_store.set_user_paused(chat_id, True, mode="all")
             _reply(
                 chat_id,
                 "⏸ *Your personal trading execution is PAUSED.*\n\n"
                 "• Your open positions remain active.\n"
                 "• Automated signal fills will be ignored.\n"
-                "• Type `/resume` anytime to unpause."
+                "• Type `/resume` anytime to unpause.",
+                bot_token=_current_bot_token,
             )
             return
 
-        state.set_paused(True)
+        state.set_paused(True, mode="all")
         _reply(
             chat_id,
             "⏸ *Automated execution PAUSED.*\n\n"
             "• Existing positions remain protected by exchange TP/SL.\n"
             "• You can execute any manual instruction (`/scan`, `/tp`, `/derisk`, `/close`, `/cancelorder`, etc.) while paused.\n"
-            "• Automated scanning & new order placement will NOT resume automatically until you explicitly type `/resume`."
+            "• Automated scanning & new order placement will NOT resume automatically until you explicitly type `/resume`.",
+            bot_token=_current_bot_token,
         )
 
     elif cmd == "/resume":
+        sub_arg = args[0].lower() if args else ""
+        if sub_arg in ("scalp", "scalps", "15m", "quick"):
+            if not is_admin(chat_id):
+                user_store.set_user_paused(chat_id, False, mode="scalp")
+                _reply(chat_id, "🟢 *Personal Scalp Trading RESUMED.*", bot_token=_current_bot_token)
+                return
+            state.set_paused(False, mode="scalp")
+            _reply(chat_id, "🟢 *Master Desk Scalp Trading RESUMED.*", bot_token=_current_bot_token)
+            if scan_trigger_fn:
+                threading.Thread(target=scan_trigger_fn, daemon=True).start()
+            return
+        elif sub_arg in ("day", "daytrade", "days", "swing", "4h"):
+            if not is_admin(chat_id):
+                user_store.set_user_paused(chat_id, False, mode="day")
+                _reply(chat_id, "🟢 *Personal Day Trading RESUMED.*", bot_token=_current_bot_token)
+                return
+            state.set_paused(False, mode="day")
+            _reply(chat_id, "🟢 *Master Desk Day Trading RESUMED.*", bot_token=_current_bot_token)
+            return
+
+        # Default: resume all
         if not is_admin(chat_id):
-            user_store.set_user_paused(chat_id, False)
+            user_store.set_user_paused(chat_id, False, mode="all")
             _reply(
                 chat_id,
                 "🟢 *Your personal trading execution is RESUMED.*\n\n"
                 "• Personal trade setups and signals are active.\n"
-                "• Type `/status` to review your portfolio."
+                "• Type `/status` to review your portfolio.",
+                bot_token=_current_bot_token,
             )
             return
 
-        state.set_paused(False)
-        _reply(chat_id, "🟢 *Automated execution RESUMED.* Triggering immediate market scan and order placement now...")
+        state.set_paused(False, mode="all")
+        _reply(chat_id, "🟢 *Automated execution RESUMED.* Triggering immediate market scan and order placement now...", bot_token=_current_bot_token)
         if scan_trigger_fn:
             threading.Thread(target=scan_trigger_fn, daemon=True).start()
+
+    elif cmd in ("/broadcast", "/signal"):
+        if not is_admin(chat_id):
+            _reply(
+                chat_id,
+                "⛔ *Access Restricted: Administrator Only*\n\n"
+                "Only Master Desk administrators are authorized to broadcast calls and messages to all users.",
+                bot_token=_current_bot_token,
+            )
+            return
+
+        if not args:
+            _reply(
+                chat_id,
+                "📢 *Winz Broadcast Desk*\n\n"
+                "Dispatch an instant announcement or official trade call to all subscribed users, groups, and channels.\n\n"
+                "• *Usage:* `/broadcast <MESSAGE>` or `/signal <TRADE_CALL>`\n\n"
+                "• *Examples:*\n"
+                "  `/broadcast 🚀 Market volatility expected ahead of CPI release at 12:30 UTC. Keep stops tight!`\n"
+                "  `/signal 🚀 LONG BTCUSDT @ $68,400 | TP: $70,200 | SL: $67,500 | High Conviction Breakout!`",
+                bot_token=_current_bot_token,
+            )
+            return
+
+        broadcast_msg = raw_text.split(None, 1)[1].strip()
+        call_cfg = state.get_call_bot_config()
+        tok = call_cfg.get("token") or _current_bot_token or cfg.telegram_token
+
+        # Gather deduplicated recipients
+        all_destinations = set()
+        for c in call_cfg.get("all_chats", []):
+            if c:
+                all_destinations.add(str(c).strip())
+        if call_cfg.get("chat_id"):
+            all_destinations.add(str(call_cfg["chat_id"]).strip())
+        for u_cid in access_manager.list_authorized_users().keys():
+            all_destinations.add(str(u_cid).strip())
+        for u_cid in user_store.get_all_users().keys():
+            all_destinations.add(str(u_cid).strip())
+
+        # Exclude unsubscribed chats
+        unsub = set(str(c).strip() for c in call_cfg.get("unsubscribed_chats", []))
+        recipients = [c for c in all_destinations if c and c not in unsub]
+
+        if not recipients:
+            _reply(
+                chat_id,
+                "⚠️ *No active broadcast recipients found.*\n\nUsers and groups are registered when they redeem access codes or use `/subscribe`.",
+                bot_token=_current_bot_token,
+            )
+            return
+
+        is_trade_signal = (cmd == "/signal")
+        if is_trade_signal:
+            header = "🎯 *WINZ OFFICIAL SIGNAL / CALL* 🎯\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            footer = "\n\n━━━━━━━━━━━━━━━━━━━━━━━\n🛡️ _Dispatched by Winz Master Trading Desk_"
+        else:
+            header = "📢 *WINZ DESK ANNOUNCEMENT* 📢\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            footer = "\n\n━━━━━━━━━━━━━━━━━━━━━━━\n_Winz Autonomous Trading Desk_"
+
+        formatted_broadcast = f"{header}{broadcast_msg}{footer}"
+
+        _reply(chat_id, f"📡 *Dispatching {cmd} to {len(recipients)} destinations across Telegram and Discord...*", bot_token=_current_bot_token)
+
+        sent_count = 0
+        failed_count = 0
+
+        for target_cid in recipients:
+            url = f"https://api.telegram.org/bot{tok}/sendMessage"
+            payload = {
+                "chat_id": target_cid,
+                "text": formatted_broadcast,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True,
+            }
+            try:
+                res = requests.post(url, json=payload, timeout=8)
+                if res.status_code == 200 and res.json().get("ok"):
+                    sent_count += 1
+                else:
+                    payload["parse_mode"] = None
+                    res_fallback = requests.post(url, json=payload, timeout=8)
+                    if res_fallback.status_code == 200 and res_fallback.json().get("ok"):
+                        sent_count += 1
+                    else:
+                        failed_count += 1
+            except Exception as exc:
+                failed_count += 1
+                log.warning("Broadcast send failed for %s: %s", target_cid, exc)
+
+        # Discord dispatch
+        discord_sent = False
+        try:
+            import winz_discord
+            winz_discord.broadcast_discord_message(formatted_broadcast)
+            discord_sent = True
+        except Exception as exc:
+            log.debug("Discord broadcast error: %s", exc)
+
+        discord_status_str = " + Discord ✅" if discord_sent else ""
+        receipt = (
+            f"✅ *Broadcast Dispatched Successfully!*{discord_status_str}\n\n"
+            f"• *Type*: `{'Trade Signal' if is_trade_signal else 'Desk Announcement'}`\n"
+            f"• *Delivered*: `{sent_count} / {len(recipients)}` Telegram chats\n"
+            f"• *Failed*: `{failed_count}`\n\n"
+            f"Preview of dispatched text:\n"
+            f"_{broadcast_msg}_"
+        )
+        _reply(chat_id, receipt, bot_token=_current_bot_token)
+        return
 
     elif cmd in ("/onspot", "/spoton"):
         state.set_spot_enabled(True)
@@ -2265,6 +2619,14 @@ BOT_COMMANDS = [
     {"command": "allow", "description": "Restore asset to active trading"},
     {"command": "avoided", "description": "List currently avoided assets"},
     {"command": "drop", "description": "Close position & blacklist coin"},
+    {"command": "broadcast", "description": "📢 Broadcast announcement/update to all users"},
+    {"command": "signal", "description": "🎯 Broadcast official trade call to all users"},
+    {"command": "onlyday", "description": "🟡 Trade day trades only (pause scalps)"},
+    {"command": "onlyscalp", "description": "🟡 Trade scalps only (pause day trades)"},
+    {"command": "pausescalp", "description": "⏸ Pause automated scalp cycle"},
+    {"command": "pauseday", "description": "⏸ Pause day trade cycle"},
+    {"command": "resumescalp", "description": "🟢 Resume automated scalp cycle"},
+    {"command": "resumeday", "description": "🟢 Resume day trade cycle"},
     {"command": "pause", "description": "Pause automated order execution"},
     {"command": "resume", "description": "Resume automated execution"},
     {"command": "onspot", "description": "🟢 Enable Spot trade execution"},
@@ -2301,6 +2663,12 @@ WINZ_PUBLIC_COMMANDS = [
     {"command": "avoid", "description": "🚫 Blacklist coins from your trades"},
     {"command": "allow", "description": "🟢 Restore blacklisted coins"},
     {"command": "avoided", "description": "📋 Show your avoided coins"},
+    {"command": "onlyday", "description": "🟡 Trade day trades only (pause scalps)"},
+    {"command": "onlyscalp", "description": "🟡 Trade scalps only (pause day trades)"},
+    {"command": "pausescalp", "description": "⏸ Pause personal scalp execution"},
+    {"command": "pauseday", "description": "⏸ Pause personal day trade execution"},
+    {"command": "resumescalp", "description": "🟢 Resume personal scalp execution"},
+    {"command": "resumeday", "description": "🟢 Resume personal day trade execution"},
     {"command": "pause", "description": "⏸️ Pause your personal trading"},
     {"command": "resume", "description": "🟢 Resume your personal trading"},
     {"command": "research", "description": "🔬 Deep thesis & chart markup (e.g. /research BTC)"},

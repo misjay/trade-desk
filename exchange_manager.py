@@ -219,8 +219,8 @@ def execute_trade_for_user(
     side_clean = side.upper()
 
     # 1. Check user pause status
-    if user_store.is_user_paused(cid):
-        return False, "User trading execution is paused."
+    if user_store.is_user_paused_for_type(cid, timeframe):
+        return False, f"User trading execution is paused for {timeframe}."
 
     # 2. Check user avoid list
     avoid_list = user_store.get_user_avoid_list(cid)
@@ -338,11 +338,12 @@ def dispatch_triggered_trade_to_users(
         return 0
 
     from telegram_bot import _reply
-    auto_users = user_store.get_all_auto_trade_users()
+    trade_type = "scalp" if str(tf).lower() in ("15m", "15") else "day"
+    auto_users = user_store.get_all_auto_trade_users(trade_type=trade_type)
     if not auto_users:
         return 0
 
-    log.info("Dispatching auto-trade signal %s %s to %d active users...", ticker, side, len(auto_users))
+    log.info("Dispatching %s auto-trade signal %s %s to %d active users...", trade_type, ticker, side, len(auto_users))
     executed_count = 0
 
     for cid, user_data in auto_users:

@@ -154,9 +154,9 @@ def _start_http_server(port: int = 8765):
 
 # ── Scan & Execution Cycle ──────────────────────────────────────────────────
 def run_scan_cycle(trade_type: str = "scalp", manual: bool = False):
-    is_paused = state.is_paused()
+    is_paused = state.is_paused_for_type(trade_type)
     if is_paused and not manual:
-        log.info("Xira automated execution is PAUSED via Telegram command. Skipping scheduled %s scan cycle.", trade_type)
+        log.info("Xira automated execution is PAUSED for %s via Telegram command. Skipping scheduled %s scan cycle.", trade_type, trade_type)
         return
 
     log.info("=== Running %s cycle (manual=%s, paused=%s) ===", trade_type.upper(), manual, is_paused)

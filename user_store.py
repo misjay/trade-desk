@@ -74,6 +74,8 @@ def _default_user_state(chat_id: str) -> Dict[str, Any]:
         "paper_equity_start": 10000.0,
         "high_water_mark": 10000.0,
         "is_paused": False,
+        "is_scalp_paused": False,
+        "is_day_paused": False,
         "open_positions": {},      # key: pos_id -> dict
         "closed_positions": [],
         "session": {
@@ -136,13 +138,97 @@ def set_user_equity(chat_id: Union[str, int], equity: float) -> None:
 
 
 def is_user_paused(chat_id: Union[str, int]) -> bool:
-    return bool(get_user(chat_id).get("is_paused", False))
-
-
-def set_user_paused(chat_id: Union[str, int], paused: bool) -> None:
     u = get_user(chat_id)
-    u["is_paused"] = paused
+    return bool(u.get("is_paused", False) or (u.get("is_scalp_paused", False) and u.get("is_day_paused", False)))
+
+
+def is_user_scalp_paused(chat_id: Union[str, int]) -> bool:
+    u = get_user(chat_id)
+    return bool(u.get("is_paused", False) or u.get("is_scalp_paused", False))
+
+
+def is_user_day_paused(chat_id: Union[str, int]) -> bool:
+    u = get_user(chat_id)
+    return bool(u.get("is_paused", False) or u.get("is_day_paused", False))
+
+
+def is_user_paused_for_type(chat_id: Union[str, int], trade_type: str = "scalp") -> bool:
+    tt = str(trade_type).lower()
+    if tt in ("scalp", "15m", "15", "quick"):
+        return is_user_scalp_paused(chat_id)
+    return is_user_day_paused(chat_id)
+
+
+def set_user_paused(chat_id: Union[str, int], paused: bool, mode: str = "all") -> None:
+    u = get_user(chat_id)
+    m = str(mode).lower()
+    if m in ("scalp", "scalping"):
+        u["is_scalp_paused"] = bool(paused)
+        if not paused and not u.get("is_day_paused"):
+            u["is_paused"] = False
+        elif paused and u.get("is_day_paused"):
+            u["is_paused"] = True
+        else:
+            u["is_paused"] = False
+    elif m in ("day", "daytrade", "swing", "4h"):
+        u["is_day_paused"] = bool(paused)
+        if not paused and not u.get("is_scalp_paused"):
+            u["is_paused"] = False
+        elif paused and u.get("is_scalp_paused"):
+            u["is_paused"] = True
+        else:
+            u["is_paused"] = False
+    else:
+        u["is_paused"] = bool(paused)
+        u["is_scalp_paused"] = bool(paused)
+        u["is_day_paused"] = bool(paused)
     _save_user(chat_id, u)
+
+
+def set_user_execution_mode(chat_id: Union[str, int], mode: str) -> Tuple[bool, str]:
+    u = get_user(chat_id)
+    m = str(mode).lower()
+    if m in ("day_only", "onlyday", "dayonly", "only_day", "day", "daytrade", "daytrades", "swing"):
+        u["is_scalp_paused"] = True
+        u["is_day_paused"] = False
+        u["is_paused"] = False
+        _save_user(chat_id, u)
+        return True, "🟡 *DAY TRADES ONLY Mode Activated.*\nYour 15m scalps are PAUSED. 4H day trades are ACTIVE."
+    elif m in ("scalp_only", "onlyscalp", "scalponly", "only_scalp", "scalp", "scalps", "scalping", "quick"):
+        u["is_scalp_paused"] = False
+        u["is_day_paused"] = True
+        u["is_paused"] = False
+        _save_user(chat_id, u)
+        return True, "🟡 *SCALP ONLY Mode Activated.*\nYour 4H day trades are PAUSED. 15m scalps are ACTIVE."
+    elif m in ("all", "resume", "both", "resume_all"):
+        u["is_scalp_paused"] = False
+        u["is_day_paused"] = False
+        u["is_paused"] = False
+        _save_user(chat_id, u)
+        return True, "🟢 *ALL TRADING ACTIVE.*\nBoth 15m scalps and 4H day trades are RUNNING on your account."
+    elif m in ("pause", "pause_all", "freeze"):
+        u["is_scalp_paused"] = True
+        u["is_day_paused"] = True
+        u["is_paused"] = True
+        _save_user(chat_id, u)
+        return True, "⏸ *ALL TRADING PAUSED.*\nBoth scalps and day trades are FROZEN on your account."
+    else:
+        return False, f"Unknown mode `{mode}`."
+
+
+def get_user_execution_mode_status(chat_id: Union[str, int]) -> str:
+    u = get_user(chat_id)
+    paused = u.get("is_paused", False)
+    sc_p = u.get("is_scalp_paused", False)
+    day_p = u.get("is_day_paused", False)
+    if paused or (sc_p and day_p):
+        return "⏸ ALL PAUSED (Both Scalps & Day Trades Frozen)"
+    elif sc_p:
+        return "🟡 DAY TRADES ONLY (15m Scalps Paused, 4H Day Active)"
+    elif day_p:
+        return "🟡 SCALPS ONLY (4H Day Paused, 15m Scalps Active)"
+    else:
+        return "🟢 ALL ACTIVE (Both Scalps & Day Trades Running)"
 
 
 # ── Positions ─────────────────────────────────────────────────────────────────
@@ -428,18 +514,24 @@ def set_user_risk_per_trade(chat_id: Union[str, int], risk_usdt: float) -> float
     return val
 
 
-def get_all_auto_trade_users() -> List[Tuple[str, dict]]:
-    """Return all users who have auto_trade enabled and are not paused."""
+def get_all_auto_trade_users(trade_type: str = "scalp") -> List[Tuple[str, dict]]:
+    """Return all users who have auto_trade enabled and are not paused for this trade_type."""
     with _lock:
         all_users = _load_all()
         active = []
         for cid, u in all_users.items():
-            if u.get("is_paused"):
+            if is_user_paused_for_type(cid, trade_type):
                 continue
             ex = u.get("exchange", {})
             if ex.get("auto_trade"):
                 active.append((cid, u))
         return active
+
+
+def get_all_users() -> Dict[str, dict]:
+    """Return dict of all registered users."""
+    with _lock:
+        return dict(_load_all())
 
 
 # ── Access Authorization ───────────────────────────────────────────────────────

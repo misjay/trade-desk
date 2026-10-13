@@ -163,10 +163,9 @@ class TestCallTracker(unittest.TestCase):
              patch("call_tracker._send_alert") as mock_alert:
             call_tracker.check_tracked_calls_once()
             # Must trigger notification!
-            self.assertTrue(mock_alert.called)
-            # Alert message should mention (Called 3d ago)
-            alert_text = mock_alert.call_args[0][0]
-            self.assertIn("TARGET 1 REACHED", alert_text)
+            # Alert message should mention TARGET 1 REACHED
+            all_alerts = [c[0][0] for c in mock_alert.call_args_list]
+            self.assertTrue(any("TARGET 1 REACHED" in a for a in all_alerts))
     def test_trade_trigger_sends_active_notification(self):
         call = {
             "ticker": "ADA",
