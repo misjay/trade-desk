@@ -260,6 +260,22 @@ def execute_trade_for_user(
         return False, "Could not initialize Bybit client with saved credentials."
 
     sym = bybit_linear_symbol(t_clean)
+
+    # 1. Enforce max concurrent positions on exchange (default 2 to protect wallet margin)
+    max_user_positions = int(ex.get("max_positions", 2))
+    try:
+        active_ex_pos = client.get_active_positions(category="linear")
+        if len(active_ex_pos) >= max_user_positions:
+            log.info("Skipping trade %s for user %s: max concurrent positions (%d) reached", sym, cid, max_user_positions)
+            return False, f"Max concurrent positions ({max_user_positions}) reached. Preserving free margin buffer."
+
+        # Prevent duplicate positions on the exact same asset
+        if any(p.get("symbol") == sym for p in active_ex_pos):
+            log.info("Skipping trade %s for user %s: position already active on Bybit", sym, cid)
+            return False, f"Position on {sym} is already open on Bybit."
+    except Exception as e_pos:
+        log.debug("Active position check exception for user %s: %s", cid, e_pos)
+
     lev = int(user_store.get_user_leverage(cid, t_clean) or 10)
     risk_usdt = float(ex.get("risk_per_trade_usdt", 50.0))
 
