@@ -1128,24 +1128,39 @@ def _sync_with_bybit() -> None:
         if cfg.enable_ratchet_trail and not matched_pos.get("tp2_hit"):
             curr_r = (b_mark - b_entry) / risk_dist if b_side == "BUY" else (b_entry - b_mark) / risk_dist
 
-            # Level 3 Ratchet: at +1.75R progress, lock in +0.75R guaranteed profit on Bybit
-            if curr_r >= 1.75 and not matched_pos.get("ratchet_l3"):
-                lock_p = round(b_entry + (risk_dist * 0.75) if b_side == "BUY" else b_entry - (risk_dist * 0.75), 8)
-                log.info("Ratchet Level 3 (+1.75R) reached on Bybit for %s %s! Locking +0.75R @%.4f", ticker, b_side, lock_p)
+            # Level 4 Ratchet: at +1.75R progress, lock in +0.80R guaranteed profit on Bybit
+            if curr_r >= 1.75 and not matched_pos.get("ratchet_l4"):
+                lock_p = round(b_entry + (risk_dist * 0.80) if b_side == "BUY" else b_entry - (risk_dist * 0.80), 8)
+                log.info("Ratchet Level 4 (+1.75R) reached on Bybit for %s %s! Locking +0.80R @%.4f", ticker, b_side, lock_p)
+                state.update_open_position(matched_id, {"ratchet_l4": True, "ratchet_l3": True, "be_trailed": True, "sl": lock_p})
+                matched_pos["ratchet_l4"] = True
+                matched_pos["sl"] = lock_p
+                be_sl = lock_p * 1000.0 if ticker == "PEPE" else lock_p
+                client.set_trading_stop(sym, stop_loss=be_sl)
+                notifier.send_text(
+                    f"🔒 *Super Profit Lock Active: {ticker}*\n\n"
+                    f"• *Current Gain*: +{curr_r:.2f}R (`{fmt_dollar(b_mark)}`)\n"
+                    f"• *Action*: Exchange Stop Loss shifted to **+{0.80:.2f}R** profit (`{fmt_dollar(lock_p)}`)\n"
+                    f"• *Status*: Trade guaranteed to close in green."
+                )
+            # Level 3 Ratchet: at +1.10R progress, lock in +0.35R guaranteed profit on Bybit
+            elif curr_r >= 1.10 and not matched_pos.get("ratchet_l3"):
+                lock_p = round(b_entry + (risk_dist * 0.35) if b_side == "BUY" else b_entry - (risk_dist * 0.35), 8)
+                log.info("Ratchet Level 3 (+1.10R) reached on Bybit for %s %s! Locking +0.35R @%.4f", ticker, b_side, lock_p)
                 state.update_open_position(matched_id, {"ratchet_l3": True, "be_trailed": True, "sl": lock_p})
                 matched_pos["ratchet_l3"] = True
                 matched_pos["sl"] = lock_p
                 be_sl = lock_p * 1000.0 if ticker == "PEPE" else lock_p
                 client.set_trading_stop(sym, stop_loss=be_sl)
                 notifier.send_text(
-                    f"🔒 *Profit Lock Ratchet Active: {ticker}*\n\n"
+                    f"🔒 *Guaranteed Profit Lock Active: {ticker}*\n\n"
                     f"• *Current Gain*: +{curr_r:.2f}R (`{fmt_dollar(b_mark)}`)\n"
-                    f"• *Action*: Exchange Stop Loss shifted to **+{0.75:.2f}R** profit (`{fmt_dollar(lock_p)}`)\n"
-                    f"• *Status*: Trade guaranteed to close in green."
+                    f"• *Action*: Exchange Stop Loss shifted to **+{0.35:.2f}R** profit (`{fmt_dollar(lock_p)}`)\n"
+                    f"• *Status*: Adverse reversal profit lock engaged."
                 )
-            # Level 2 Ratchet: at +1.0R progress, move to Break-Even on Bybit
-            elif curr_r >= 1.0 and not matched_pos.get("be_trailed"):
-                log.info("Early +1R reached for %s %s! Trailing SL to Break-Even @%.4f", ticker, b_side, b_entry)
+            # Level 2 Ratchet: at +0.60R progress (~1.2%–1.5% gain), move to Break-Even on Bybit immediately
+            elif curr_r >= 0.60 and not matched_pos.get("be_trailed"):
+                log.info("Early +0.60R reached for %s %s! Trailing SL to Break-Even @%.4f", ticker, b_side, b_entry)
                 state.update_open_position(matched_id, {"be_trailed": True, "sl": b_entry})
                 matched_pos["be_trailed"] = True
                 matched_pos["sl"] = b_entry
@@ -1157,10 +1172,10 @@ def _sync_with_bybit() -> None:
                     f"• *Action*: Exchange Stop Loss shifted to Break-Even (`{fmt_dollar(b_entry)}`)\n"
                     f"• *Downside Risk*: **$0.00** (Risk-free trade)"
                 )
-            # Level 1 Ratchet: at +0.70R progress, cut max loss by 50% (-0.5R)
-            elif curr_r >= 0.70 and not matched_pos.get("ratchet_l1") and not matched_pos.get("be_trailed"):
+            # Level 1 Ratchet: at +0.35R progress, cut max loss by 50% (-0.5R)
+            elif curr_r >= 0.35 and not matched_pos.get("ratchet_l1") and not matched_pos.get("be_trailed"):
                 half_sl = round(b_entry - (risk_dist * 0.50) if b_side == "BUY" else b_entry + (risk_dist * 0.50), 8)
-                log.info("Ratchet Level 1 (+0.70R) reached on Bybit for %s %s! Reduced risk to -0.5R @%.4f", ticker, b_side, half_sl)
+                log.info("Ratchet Level 1 (+0.35R) reached on Bybit for %s %s! Reduced risk to -0.5R @%.4f", ticker, b_side, half_sl)
                 state.update_open_position(matched_id, {"ratchet_l1": True, "sl": half_sl})
                 matched_pos["ratchet_l1"] = True
                 matched_pos["sl"] = half_sl

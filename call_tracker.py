@@ -359,20 +359,87 @@ def check_tracked_calls_once() -> None:
         if curr_peak > float(call.get("peak_gain_pct", 0.0)):
             updates["peak_gain_pct"] = round(curr_peak, 2)
 
-        # ── 6. Check Stop-Loss / Breakeven Exit ──────────────────────────────
+        # ── 6. Check Early Profit Protection & Ratchet Profit Locking ─────
+        be_trailed = call.get("be_trailed", False)
+        risk_dist = abs(entry_mid - sl) if sl and abs(entry_mid - sl) > 0 else (entry_mid * 0.015)
+        curr_r = gain_pct / ((risk_dist / entry_mid) * 100.0) if risk_dist > 0 else 0.0
+
+        # Level 4 Ratchet: at +1.75R, lock +0.80R guaranteed profit
+        if curr_r >= 1.75 and not call.get("ratchet_l4"):
+            lock_p = round(entry_mid + (risk_dist * 0.80) if side == "BUY" else entry_mid - (risk_dist * 0.80), 8)
+            updates["ratchet_l4"] = True
+            updates["ratchet_l3"] = True
+            updates["be_trailed"] = True
+            updates["locked_sl"] = lock_p
+            updates["sl"] = lock_p
+            call["ratchet_l4"] = True
+            call["locked_sl"] = lock_p
+            call["sl"] = lock_p
+            _send_alert(
+                f"🔒 *{type_prefix}SUPER PROFIT LOCK ACTIVE: ${ticker}* 🔒\n\n"
+                f"• *Current Gain*: `+{gain_pct:.1f}%` (+{curr_r:.2f}R @ `{fmt_dollar(live_price)}`)\n"
+                f"• *Action*: Trailing Stop shifted to **+0.80R** guaranteed profit (`{fmt_dollar(lock_p)}`)\n"
+                f"• *Status*: Trade locked in solid green profit! Downside risk eliminated."
+            )
+        # Level 3 Ratchet: at +1.10R, lock +0.35R guaranteed profit
+        elif curr_r >= 1.10 and not call.get("ratchet_l3"):
+            lock_p = round(entry_mid + (risk_dist * 0.35) if side == "BUY" else entry_mid - (risk_dist * 0.35), 8)
+            updates["ratchet_l3"] = True
+            updates["be_trailed"] = True
+            updates["locked_sl"] = lock_p
+            updates["sl"] = lock_p
+            call["ratchet_l3"] = True
+            call["locked_sl"] = lock_p
+            call["sl"] = lock_p
+            _send_alert(
+                f"🔒 *{type_prefix}GUARANTEED PROFIT LOCK ACTIVE: ${ticker}* 🔒\n\n"
+                f"• *Current Gain*: `+{gain_pct:.1f}%` (+{curr_r:.2f}R @ `{fmt_dollar(live_price)}`)\n"
+                f"• *Action*: Trailing Stop shifted to **+0.35R** profit (`{fmt_dollar(lock_p)}`)\n"
+                f"• *Status*: Adverse reversal profit lock engaged. Guaranteed green exit."
+            )
+        # Level 2 Ratchet: If gain touches +0.60R or >= +1.5% profit, snap Stop-Loss to Breakeven automatically
+        elif not be_trailed and not call.get("tp1_hit") and (curr_r >= 0.60 or gain_pct >= 1.5):
+            updates["be_trailed"] = True
+            updates["sl"] = entry_mid
+            call["be_trailed"] = True
+            call["sl"] = entry_mid
+            _send_alert(
+                f"🛡️ *{type_prefix}EARLY CAPITAL PROTECTION ACTIVE: ${ticker}* 🛡️\n\n"
+                f"• *Current Gain*: `+{gain_pct:.1f}%` (+{curr_r:.2f}R @ `{fmt_dollar(live_price)}`)\n"
+                f"• *Action*: Stop Loss trailed to Entry Breakeven (`{fmt_dollar(entry_mid)}`)\n"
+                f"• *Status*: Trade is now **100% RISK-FREE**. Downside loss eliminated!"
+            )
+
+        # ── 6b. Check Stop Exits (Locked Profit / Breakeven / Original SL) ─
+        locked_sl = call.get("locked_sl")
+        if locked_sl is not None:
+            lock_exit = (live_price <= float(locked_sl)) if side == "BUY" else (live_price >= float(locked_sl))
+            if lock_exit:
+                updates["sl_hit"] = True
+                updates["is_closed"] = True
+                updates["status"] = "CLOSED_PROFIT_LOCK"
+                _send_alert(
+                    f"🔒 *{type_prefix}PROFIT LOCK STOP TRIGGERED* 🔒\n\n"
+                    f"• *Asset*: `${ticker}` ({tf} {side}){age_str}\n"
+                    f"• *Exit Price*: `{fmt_dollar(live_price)}` (+{gain_pct:.1f}%)\n\n"
+                    f"💡 *Outcome:* Favorable profit was protected by trailing stop. Position closed in guaranteed profit! Capital and gains secured."
+                )
+                state.update_tracked_call(cid, updates)
+                continue
+
         tp1_hit = call.get("tp1_hit", False)
-        if tp1_hit:
-            # Trailing Stop to Entry Breakeven
+        if tp1_hit or be_trailed:
+            # Trailing Stop to Entry Breakeven Exit
             be_triggered = (live_price <= entry_mid) if side == "BUY" else (live_price >= entry_mid)
             if be_triggered:
                 updates["sl_hit"] = True
                 updates["is_closed"] = True
                 updates["status"] = "CLOSED_BREAKEVEN"
                 _send_alert(
-                    f"🛡 *{type_prefix}BREAKEVEN STOP TRIGGERED* 🛡\n\n"
+                    f"🛡️ *{type_prefix}BREAKEVEN STOP TRIGGERED* 🛡️\n\n"
                     f"• *Asset*: `${ticker}` ({tf} {side}){age_str}\n"
                     f"• *Exit Price*: `{fmt_dollar(live_price)}`\n\n"
-                    f"💡 *Outcome:* TP1 profit (+50%) was locked in earlier. Remaining 50% exited at breakeven without risk. Trade finalized!"
+                    f"💡 *Outcome:* Trade floated into profit and trailed stop protected capital. Position exited at Breakeven ($0.00 loss). Capital fully preserved!"
                 )
                 state.update_tracked_call(cid, updates)
                 continue
