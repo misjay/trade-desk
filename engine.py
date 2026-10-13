@@ -1158,9 +1158,33 @@ def _sync_with_bybit() -> None:
                     f"• *Action*: Exchange Stop Loss shifted to **+{0.35:.2f}R** profit (`{fmt_dollar(lock_p)}`)\n"
                     f"• *Status*: Adverse reversal profit lock engaged."
                 )
-            # Level 2 Ratchet: at +0.60R progress (~1.2%–1.5% gain), move to Break-Even on Bybit immediately
-            elif curr_r >= 0.60 and not matched_pos.get("be_trailed"):
-                log.info("Early +0.60R reached for %s %s! Trailing SL to Break-Even @%.4f", ticker, b_side, b_entry)
+            # Level 2 Ratchet (TP0 Micro Scale-Out & Break-Even): at +0.50R progress or >= +1.5% gain, bank 33% profit into cash and move SL to Break-Even
+            elif (curr_r >= 0.50 or abs((b_mark - b_entry) / b_entry) >= 0.015) and not matched_pos.get("tp0_hit"):
+                log.info("TP0 reached for %s %s (+%.2fR)! Executing 33%% micro scale-out and trailing SL to Break-Even @%.4f", ticker, b_side, curr_r, b_entry)
+                tp0_qty = client.quantize_qty(sym, b_qty * 0.33, category="linear")
+                close_side = "Sell" if b_side == "BUY" else "Buy"
+                if tp0_qty > 0 and not client.is_paper:
+                    try:
+                        client.close_position_market(sym, side=close_side, qty=tp0_qty, category="linear")
+                    except Exception as e_tp0:
+                        log.warning("TP0 market scale-out attempt failed: %s", e_tp0)
+                
+                state.update_open_position(matched_id, {"tp0_hit": True, "be_trailed": True, "sl": b_entry, "tp0_closed_qty": tp0_qty})
+                matched_pos["tp0_hit"] = True
+                matched_pos["be_trailed"] = True
+                matched_pos["sl"] = b_entry
+                be_sl = b_entry * 1000.0 if ticker == "PEPE" else b_entry
+                client.set_trading_stop(sym, stop_loss=be_sl)
+                gain_pct = ((b_mark - b_entry) / b_entry * 100.0) if b_side == "BUY" else ((b_entry - b_mark) / b_entry * 100.0)
+                notifier.send_text(
+                    f"💰 *TP0 Early Profit Banked: {ticker}* 💰\n\n"
+                    f"• *Progress*: +{curr_r:.2f}R (+{gain_pct:.1f}%) at `{fmt_dollar(b_mark)}`\n"
+                    f"• *Action*: Realized **33%** profit ({tp0_qty} contracts banked into balance)!\n"
+                    f"• *Exchange Stop Loss*: Snapped to Break-Even (`{fmt_dollar(b_entry)}`)\n"
+                    f"• *Downside Risk*: **$0.00** (Remaining 67% position is 100% Risk-Free!)"
+                )
+            elif curr_r >= 0.50 and not matched_pos.get("be_trailed"):
+                log.info("Early +0.50R reached for %s %s! Trailing SL to Break-Even @%.4f", ticker, b_side, b_entry)
                 state.update_open_position(matched_id, {"be_trailed": True, "sl": b_entry})
                 matched_pos["be_trailed"] = True
                 matched_pos["sl"] = b_entry

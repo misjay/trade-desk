@@ -397,8 +397,22 @@ def check_tracked_calls_once() -> None:
                 f"• *Action*: Trailing Stop shifted to **+0.35R** profit (`{fmt_dollar(lock_p)}`)\n"
                 f"• *Status*: Adverse reversal profit lock engaged. Guaranteed green exit."
             )
-        # Level 2 Ratchet: If gain touches +0.60R or >= +1.5% profit, snap Stop-Loss to Breakeven automatically
-        elif not be_trailed and not call.get("tp1_hit") and (curr_r >= 0.60 or gain_pct >= 1.5):
+        # Level 2 Ratchet (TP0 Micro-Scaleout & Break-Even): at +0.50R or >= +1.5% profit, bank 33% profit and snap to BE
+        elif not call.get("tp0_hit") and not call.get("tp1_hit") and (curr_r >= 0.50 or gain_pct >= 1.5):
+            updates["tp0_hit"] = True
+            updates["be_trailed"] = True
+            updates["sl"] = entry_mid
+            call["tp0_hit"] = True
+            call["be_trailed"] = True
+            call["sl"] = entry_mid
+            _send_alert(
+                f"💰 *{type_prefix}TP0 EARLY PROFIT BANKED: ${ticker}* 💰\n\n"
+                f"• *Current Gain*: `+{gain_pct:.1f}%` (+{curr_r:.2f}R @ `{fmt_dollar(live_price)}`)\n"
+                f"• *Action*: Bank **33%** profit now at market!\n"
+                f"• *Stop Loss*: Trailed to Entry Break-Even (`{fmt_dollar(entry_mid)}`)\n"
+                f"• *Status*: First profit slice secured into cash. Remaining 67% is **100% RISK-FREE** running toward TP1 & TP2!"
+            )
+        elif not be_trailed and not call.get("tp1_hit") and (curr_r >= 0.50 or gain_pct >= 1.5):
             updates["be_trailed"] = True
             updates["sl"] = entry_mid
             call["be_trailed"] = True
@@ -427,19 +441,21 @@ def check_tracked_calls_once() -> None:
                 state.update_tracked_call(cid, updates)
                 continue
 
+        tp0_hit = call.get("tp0_hit", False)
         tp1_hit = call.get("tp1_hit", False)
-        if tp1_hit or be_trailed:
+        if tp1_hit or tp0_hit or be_trailed:
             # Trailing Stop to Entry Breakeven Exit
             be_triggered = (live_price <= entry_mid) if side == "BUY" else (live_price >= entry_mid)
             if be_triggered:
                 updates["sl_hit"] = True
                 updates["is_closed"] = True
                 updates["status"] = "CLOSED_BREAKEVEN"
+                profit_note = "TP0 (33%) profit was secured in cash earlier" if tp0_hit else ("TP1 (50%) profit was secured earlier" if tp1_hit else "Trade floated into profit and trailed stop protected capital")
                 _send_alert(
                     f"🛡️ *{type_prefix}BREAKEVEN STOP TRIGGERED* 🛡️\n\n"
                     f"• *Asset*: `${ticker}` ({tf} {side}){age_str}\n"
                     f"• *Exit Price*: `{fmt_dollar(live_price)}`\n\n"
-                    f"💡 *Outcome:* Trade floated into profit and trailed stop protected capital. Position exited at Breakeven ($0.00 loss). Capital fully preserved!"
+                    f"💡 *Outcome:* {profit_note}. Remaining position exited at Breakeven ($0.00 loss). Net trade ended green/risk-free and capital is fully preserved!"
                 )
                 state.update_tracked_call(cid, updates)
                 continue
