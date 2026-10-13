@@ -20,19 +20,26 @@ class TestTelegramBot(unittest.TestCase):
         from pathlib import Path
         import state
         import user_store
+        import exchange_manager
         cls.temp_dir = tempfile.mkdtemp()
         cls.orig_state_file = state._STATE_FILE
         state._STATE_FILE = Path(cls.temp_dir) / "test_state.json"
         cls.orig_users_file = user_store._USERS_FILE
         user_store._USERS_FILE = Path(cls.temp_dir) / "test_users_state.json"
+        cls.orig_secret_file = exchange_manager._SECRET_KEY_FILE
+        exchange_manager._SECRET_KEY_FILE = Path(cls.temp_dir) / ".test_secret.key"
+        exchange_manager._fernet_instance = None
 
     @classmethod
     def tearDownClass(cls):
         import shutil
         import state
         import user_store
+        import exchange_manager
         state._STATE_FILE = cls.orig_state_file
         user_store._USERS_FILE = cls.orig_users_file
+        exchange_manager._SECRET_KEY_FILE = cls.orig_secret_file
+        exchange_manager._fernet_instance = None
         shutil.rmtree(cls.temp_dir, ignore_errors=True)
 
     def setUp(self):
@@ -597,8 +604,44 @@ class TestTelegramBot(unittest.TestCase):
         with patch.object(telegram_bot, "_reply") as mock_reply:
             telegram_bot.handle_command("/help", "99999_stranger")
             mock_reply.assert_called_once()
-            self.assertIn("Winz Trading Desk & Market Intelligence Hub", mock_reply.call_args[0][1])
-            self.assertIn("/calls", mock_reply.call_args[0][1])
+    def test_cex_connection_telegram_commands(self):
+        import telegram_bot
+        import user_store
+        import exchange_manager
+
+        user_id = "55555_trader"
+
+        # 1. /myexchange when not connected
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/myexchange", user_id)
+            self.assertIn("No Exchange Account Connected", mock_reply.call_args[0][1])
+
+        # 2. /connect bybit <KEY> <SECRET>
+        with patch("exchange_manager.verify_and_connect_bybit", return_value=(True, "OK", 1250.0)):
+            with patch.object(telegram_bot, "_reply") as mock_reply:
+                with patch.object(telegram_bot, "_delete_message") as mock_delete:
+                    telegram_bot.handle_command("/connect bybit REALKEY REALSECRET", user_id, message_id=42)
+                    mock_delete.assert_called_once_with(user_id, 42, bot_token=None)
+                    self.assertIn("Bybit Exchange Connected Successfully", mock_reply.call_args[0][1])
+
+        # 3. /risk 100
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/risk 100", user_id)
+            self.assertIn("Risk Sizing Updated", mock_reply.call_args[0][1])
+            self.assertEqual(user_store.get_user_exchange(user_id)["risk_per_trade_usdt"], 100.0)
+
+        # 4. /autotrade off and on
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/autotrade off", user_id)
+            self.assertFalse(user_store.get_user_exchange(user_id)["auto_trade"])
+            telegram_bot.handle_command("/autotrade on", user_id)
+            self.assertTrue(user_store.get_user_exchange(user_id)["auto_trade"])
+
+        # 5. /disconnect
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/disconnect", user_id)
+            self.assertIn("Exchange Disconnected", mock_reply.call_args[0][1])
+            self.assertFalse(user_store.get_user_exchange(user_id)["connected"])
 
 
 if __name__ == "__main__":

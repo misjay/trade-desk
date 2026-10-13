@@ -84,6 +84,17 @@ def _default_user_state(chat_id: str) -> Dict[str, Any]:
         },
         "avoid_list": [],
         "custom_leverage": {},
+        "exchange": {
+            "connected": False,
+            "name": "bybit",
+            "api_key_masked": "",
+            "encrypted_api_key": "",
+            "encrypted_api_secret": "",
+            "is_testnet": False,
+            "auto_trade": True,
+            "risk_per_trade_usdt": 50.0,
+            "connected_at": None,
+        },
         "created_at": _now(),
         "updated_at": _now(),
     }
@@ -334,3 +345,96 @@ def reset_user_demo(chat_id: Union[str, int]) -> dict:
     _save_user(chat_id, fresh)
     log.info("Reset user %s demo portfolio to default $10,000", chat_id)
     return fresh
+
+
+# ── Exchange Configuration & Auto-Trade ──────────────────────────────────────
+
+def set_user_exchange(
+    chat_id: Union[str, int],
+    exchange_name: str,
+    api_key_enc: str,
+    api_secret_enc: str,
+    api_key_masked: str,
+    is_testnet: bool = False,
+    auto_trade: bool = True,
+    risk_per_trade: float = 50.0,
+) -> dict:
+    """Save encrypted exchange credentials into user's profile."""
+    u = get_user(chat_id)
+    u["exchange"] = {
+        "connected": True,
+        "name": exchange_name.lower().strip(),
+        "api_key_masked": api_key_masked,
+        "encrypted_api_key": api_key_enc,
+        "encrypted_api_secret": api_secret_enc,
+        "is_testnet": is_testnet,
+        "auto_trade": auto_trade,
+        "risk_per_trade_usdt": max(5.0, float(risk_per_trade)),
+        "connected_at": _now(),
+    }
+    _save_user(chat_id, u)
+    return u["exchange"]
+
+
+def get_user_exchange(chat_id: Union[str, int]) -> dict:
+    """Retrieve user's exchange configuration dictionary."""
+    return dict(get_user(chat_id).get("exchange", {
+        "connected": False,
+        "name": "bybit",
+        "api_key_masked": "",
+        "auto_trade": False,
+        "risk_per_trade_usdt": 50.0,
+    }))
+
+
+def disconnect_user_exchange(chat_id: Union[str, int]) -> bool:
+    """Securely disconnect exchange and wipe all encrypted keys."""
+    u = get_user(chat_id)
+    u["exchange"] = {
+        "connected": False,
+        "name": "bybit",
+        "api_key_masked": "",
+        "encrypted_api_key": "",
+        "encrypted_api_secret": "",
+        "is_testnet": False,
+        "auto_trade": False,
+        "risk_per_trade_usdt": 50.0,
+        "disconnected_at": _now(),
+    }
+    _save_user(chat_id, u)
+    log.info("User %s disconnected their exchange and wiped API keys", chat_id)
+    return True
+
+
+def set_user_auto_trade(chat_id: Union[str, int], enabled: bool) -> bool:
+    """Enable or disable automated signal execution for user."""
+    u = get_user(chat_id)
+    ex = u.setdefault("exchange", {})
+    ex["auto_trade"] = bool(enabled)
+    _save_user(chat_id, u)
+    return ex["auto_trade"]
+
+
+def set_user_risk_per_trade(chat_id: Union[str, int], risk_usdt: float) -> float:
+    """Set the fixed USDT margin allocated per automated trade."""
+    u = get_user(chat_id)
+    ex = u.setdefault("exchange", {})
+    val = max(5.0, min(10000.0, float(risk_usdt)))
+    ex["risk_per_trade_usdt"] = val
+    _save_user(chat_id, u)
+    return val
+
+
+def get_all_auto_trade_users() -> List[Tuple[str, dict]]:
+    """Return all users who have auto_trade enabled and are not paused."""
+    with _lock:
+        all_users = _load_all()
+        active = []
+        for cid, u in all_users.items():
+            if u.get("is_paused"):
+                continue
+            ex = u.get("exchange", {})
+            if ex.get("auto_trade"):
+                active.append((cid, u))
+        return active
+

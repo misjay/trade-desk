@@ -330,6 +330,23 @@ def check_tracked_calls_once() -> None:
                     f"⚡ *Action:* Entry band reached. Position is now ACTIVE and under 24/7 target tracking."
                 )
 
+                # Dispatch automated trade execution to subscribed users
+                try:
+                    import exchange_manager
+                    call_cfg = state.get_call_bot_config()
+                    c_tok = call_cfg.get("token") or cfg.call_bot_token or cfg.telegram_token
+                    sig_payload = dict(call)
+                    sig_payload.update(updates)
+                    sig_payload["live_price"] = live_price
+                    threading.Thread(
+                        target=exchange_manager.dispatch_triggered_trade_to_users,
+                        args=(sig_payload,),
+                        kwargs={"bot_token": c_tok},
+                        daemon=True,
+                    ).start()
+                except Exception as exc:
+                    log.warning("Auto-trade dispatch exception: %s", exc)
+
         # ── 5. Calculate percentage gain / loss from mid entry ────────────────
         if side == "BUY":
             gain_pct = ((live_price - entry_mid) / entry_mid) * 100.0

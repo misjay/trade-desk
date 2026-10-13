@@ -8,3 +8,6 @@ __pycache__/
 .pytest_cache/
 *.png
 charts/
+.users_data.json
+.exchange_key.secret
+*.secret

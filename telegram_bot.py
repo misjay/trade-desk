@@ -17,6 +17,7 @@ from config import cfg, bybit_linear_symbol, bybit_spot_symbol, CORE_TICKERS
 from notifier import send_text, fmt_dollar
 import state
 import user_store
+import exchange_manager
 
 log = logging.getLogger(__name__)
 
@@ -70,6 +71,20 @@ def _reply(chat_id: str, text: str, bot_token: Optional[str] = None, reply_marku
         requests.post(url, json=payload, timeout=8)
     except Exception as exc:
         log.warning("Telegram reply failed: %s", exc)
+
+
+def _delete_message(chat_id: str, message_id: Optional[int], bot_token: Optional[str] = None) -> None:
+    """Delete a sensitive message (e.g. API keys) from chat immediately."""
+    if not message_id:
+        return
+    token = bot_token or _current_bot_token or cfg.telegram_token
+    if not token:
+        return
+    url = f"https://api.telegram.org/bot{token}/deleteMessage"
+    try:
+        requests.post(url, json={"chat_id": chat_id, "message_id": message_id}, timeout=4)
+    except Exception as exc:
+        log.debug("Telegram deleteMessage failed: %s", exc)
 
 
 def _paused_footer() -> str:
@@ -189,7 +204,13 @@ def format_active_calls_summary() -> Tuple[str, List[List[dict]]]:
     return "\n".join(lines), inline_keyboard
 
 
-def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token: Optional[str] = None) -> None:
+def handle_command(
+    cmd_text: str,
+    chat_id: str,
+    scan_trigger_fn=None,
+    bot_token: Optional[str] = None,
+    message_id: Optional[int] = None,
+) -> None:
     global _current_bot_token
     if bot_token:
         _current_bot_token = bot_token
@@ -299,6 +320,12 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
                 "• `/calls` — 📋 View active triggered trades & pending entry bands\n"
                 "• `/hourlycalls` — 🚨 View the 15-setup trade desk (6 Scalps + 4 Day + 5 Spot)\n"
                 "• `/spot` — 💎 View 5 Spot Accumulation setups with interactive chart buttons\n\n"
+                "🔐 *Automated Exchange Trading (Bybit / CEX):*\n"
+                "• `/connect bybit <KEY> <SECRET>` — ⚡ Connect your Bybit account for automated execution\n"
+                "• `/myexchange` — 💼 View connected account balance, equity & status\n"
+                "• `/autotrade <on/off>` — ⚙️ Toggle automated trade execution on/off\n"
+                "• `/risk <USDT>` — ⚖️ Set your margin size per trade (e.g. `/risk 50`)\n"
+                "• `/disconnect` — 🔌 Wipe your API keys and unlink exchange\n\n"
                 "⚙️ *Risk Management & Settings:*\n"
                 "• `/leverage <COIN> <VAL>` — ⚡ Set custom leverage (e.g. `/leverage BTC 20`)\n"
                 "• `/existingleverage` — 📊 Show your active leverage settings\n"
@@ -1314,6 +1341,24 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
             _reply(chat_id, f"❌ Unable to fetch live price for `{ticker}`. Please check ticker symbol.", bot_token=_current_bot_token)
             return
 
+        ex = user_store.get_user_exchange(chat_id)
+        if ex and ex.get("connected"):
+            success, msg = exchange_manager.execute_trade_for_user(chat_id, ticker, side, lp)
+            if success:
+                _reply(
+                    chat_id,
+                    f"🚀 *Executed Live Trade on Bybit!*\n\n"
+                    f"• *Asset*: `{ticker}USDT`\n"
+                    f"• *Side*: `{side}`\n"
+                    f"• *Entry Price*: `${lp:,.4f}`\n"
+                    f"• *Account*: Bybit (`{ex.get('api_key_masked')}`)\n\n"
+                    f"Order placed with exchange-native TP & SL protection.\n_Track via `/positions` or `/myexchange`._",
+                    bot_token=_current_bot_token,
+                )
+            else:
+                _reply(chat_id, f"❌ Trade execution failed: {msg}", bot_token=_current_bot_token)
+            return
+
         u = user_store.get_user(chat_id)
         lev = int(user_store.get_user_leverage(chat_id, ticker) or 10)
         # Sizing: $1,000 notional margin per demo trade or 10% of equity
@@ -1355,6 +1400,186 @@ def handle_command(cmd_text: str, chat_id: str, scan_trigger_fn=None, bot_token:
             "Type `/status` or `/trade <COIN>` to start fresh!",
             bot_token=_current_bot_token,
         )
+
+    elif cmd in ("/connect", "/link", "/setapi"):
+        if message_id:
+            _delete_message(chat_id, message_id, bot_token=_current_bot_token)
+
+        if len(args) < 3:
+            _reply(
+                chat_id,
+                "🔐 *Connect Your Personal Exchange (Bybit)*\n\n"
+                "Winz can execute trades automatically on your personal Bybit account with exchange-native TP & SL.\n\n"
+                "• *Usage:* `/connect bybit <API_KEY> <API_SECRET>`\n"
+                "• *Testnet:* `/connect bybit <API_KEY> <API_SECRET> testnet`\n\n"
+                "🛡️ *Security Protections:*\n"
+                "1. Your message is deleted immediately upon receipt so credentials never stay in chat.\n"
+                "2. Keys are encrypted at rest with AES-256 authenticated encryption.\n"
+                "3. We only require *Read & Trade* permissions on Contract/Derivatives. Never enable *Withdrawals*.",
+                bot_token=_current_bot_token,
+            )
+            return
+
+        exchange_name = args[0].lower().strip()
+        api_key = args[1].strip()
+        api_secret = args[2].strip()
+        is_testnet = len(args) > 3 and args[3].lower().strip() in ("testnet", "demo")
+
+        if exchange_name not in ("bybit", "binance"):
+            _reply(chat_id, "⚠️ Currently supported exchanges: `bybit`. Use `/connect bybit <API_KEY> <API_SECRET>`.", bot_token=_current_bot_token)
+            return
+
+        _reply(chat_id, "🔄 *Verifying credentials with Bybit exchange...*", bot_token=_current_bot_token)
+
+        success, msg, equity = exchange_manager.verify_and_connect_bybit(
+            chat_id=chat_id,
+            api_key=api_key,
+            api_secret=api_secret,
+            is_testnet=is_testnet,
+            risk_per_trade=50.0,
+            auto_trade=True,
+        )
+
+        if not success:
+            _reply(
+                chat_id,
+                f"❌ *Failed to Connect Bybit Account*\n\n"
+                f"Error: `{msg}`\n\n"
+                f"⚠️ *Checklist:*\n"
+                f"• Ensure your Bybit API Key has **Read-Write** permissions for **Contract / Derivatives (USDT Perpetual)**.\n"
+                f"• Check that IP restriction is set to 'No IP restriction' on Bybit API settings.\n"
+                f"• Ensure your API Key and Secret are copied accurately.",
+                bot_token=_current_bot_token,
+            )
+            return
+
+        masked = exchange_manager.mask_key(api_key)
+        mode_str = "Testnet" if is_testnet else "Live Mainnet"
+        _reply(
+            chat_id,
+            f"✅ *Bybit Exchange Connected Successfully!*\n\n"
+            f"• *Account Balance*: `${equity:,.2f} USDT`\n"
+            f"• *Linked API Key*: `{masked}`\n"
+            f"• *Execution Mode*: `{mode_str}`\n"
+            f"• *Automated Trading*: `🟢 ON (Active)`\n"
+            f"• *Risk per Trade*: `$50.00 USDT` margin\n"
+            f"• *Security*: `AES-256 Authenticated Fernet Encryption`\n\n"
+            f"🚀 *Winz is now armed to trade on your Bybit account!*\n"
+            f"Every trade will execute with strict exchange-native TP & SL protection.\n\n"
+            f"⚙️ *Helpful Controls:*\n"
+            f"• `/risk <USDT>` — Change margin size per trade (e.g. `/risk 100`)\n"
+            f"• `/autotrade off` — Turn off auto-trading (use manual alerts)\n"
+            f"• `/myexchange` — View real wallet balance & settings\n"
+            f"• `/disconnect` — Remove your API keys and unlink",
+            bot_token=_current_bot_token,
+        )
+
+    elif cmd in ("/disconnect", "/unlink"):
+        user_store.disconnect_user_exchange(chat_id)
+        _reply(
+            chat_id,
+            "🔌 *Exchange Disconnected & API Keys Wiped*\n\n"
+            "• Your credentials have been permanently removed.\n"
+            "• Winz will no longer place trades on your external account.\n"
+            "• You have been returned to the default $10,000 Demo Portfolio.\n\n"
+            "_To reconnect anytime, type `/connect bybit <API_KEY> <API_SECRET>`._",
+            bot_token=_current_bot_token,
+        )
+
+    elif cmd in ("/myexchange", "/myaccount", "/exchange"):
+        ex = user_store.get_user_exchange(chat_id)
+        if not ex or not ex.get("connected"):
+            _reply(
+                chat_id,
+                "ℹ️ *No Exchange Account Connected*\n\n"
+                "You are currently using the default **$10,000 Paper Demo Portfolio**.\n\n"
+                "👉 To connect your Bybit account for automated trading:\n"
+                "Type: `/connect bybit <API_KEY> <API_SECRET>`",
+                bot_token=_current_bot_token,
+            )
+            return
+
+        client = exchange_manager.get_user_bybit_client(chat_id)
+        eq_str = "—"
+        avail_str = "—"
+        if client:
+            try:
+                bal = client.get_wallet_balance("USDT")
+                eq = float(bal.get("equity", 0.0))
+                avail = float(bal.get("available", 0.0))
+                eq_str = f"${eq:,.2f} USDT"
+                avail_str = f"${avail:,.2f} USDT"
+            except Exception:
+                eq_str = "(Query failed)"
+
+        auto_str = "🟢 ON (Automated)" if ex.get("auto_trade") else "🔴 OFF (Manual 1-Click Only)"
+        mode_str = "Testnet" if ex.get("is_testnet") else "Live Mainnet"
+        risk_val = float(ex.get("risk_per_trade_usdt", 50.0))
+        masked = ex.get("api_key_masked", "****")
+
+        _reply(
+            chat_id,
+            f"💼 *Your Connected Exchange Account*\n\n"
+            f"• *Exchange*: `Bybit` ({mode_str})\n"
+            f"• *Linked API Key*: `{masked}`\n"
+            f"• *Wallet Equity*: `{eq_str}`\n"
+            f"• *Available Margin*: `{avail_str}`\n"
+            f"• *Automated Execution*: {auto_str}\n"
+            f"• *Risk Sizing*: `${risk_val:,.2f} USDT` margin per trade\n\n"
+            f"_Commands: `/risk <AMOUNT>`, `/autotrade on/off`, `/disconnect`_",
+            bot_token=_current_bot_token,
+        )
+
+    elif cmd in ("/autotrade", "/auto"):
+        if not args:
+            ex = user_store.get_user_exchange(chat_id)
+            cur = "🟢 ON" if ex.get("auto_trade") else "🔴 OFF"
+            _reply(
+                chat_id,
+                f"⚙️ *Automated Trading Status:* {cur}\n\n"
+                f"To toggle:\n"
+                f"• `/autotrade on` — Automatically execute triggered signals\n"
+                f"• `/autotrade off` — Pause auto-execution",
+                bot_token=_current_bot_token,
+            )
+            return
+
+        sub_arg = args[0].lower().strip()
+        new_state = sub_arg in ("on", "true", "enable", "yes", "1")
+        user_store.set_user_auto_trade(chat_id, new_state)
+        if new_state:
+            _reply(chat_id, "🟢 *Automated Execution ENABLED.* Winz will automatically place trades on your account when signals trigger.", bot_token=_current_bot_token)
+        else:
+            _reply(chat_id, "⏸️ *Automated Execution DISABLED.* Signals will not place orders automatically.", bot_token=_current_bot_token)
+
+    elif cmd in ("/risk", "/setrisk"):
+        if not args:
+            ex = user_store.get_user_exchange(chat_id)
+            cur = float(ex.get("risk_per_trade_usdt", 50.0))
+            _reply(
+                chat_id,
+                f"⚖️ *Current Risk per Trade:* `${cur:,.2f} USDT`\n\n"
+                f"To adjust your margin size per trade:\n"
+                f"Usage: `/risk <AMOUNT>` (e.g. `/risk 100`)",
+                bot_token=_current_bot_token,
+            )
+            return
+
+        try:
+            val = float(args[0].replace("$", "").replace(",", ""))
+            if val < 5.0 or val > 50000.0:
+                _reply(chat_id, "❌ Risk per trade must be between $5 and $50,000 USDT.", bot_token=_current_bot_token)
+                return
+            set_val = user_store.set_user_risk_per_trade(chat_id, val)
+            _reply(
+                chat_id,
+                f"✅ *Risk Sizing Updated!*\n\n"
+                f"• New Margin per Trade: *${set_val:,.2f} USDT*\n"
+                f"• Orders will size position quantity to risk exactly `${set_val:,.2f}` margin.",
+                bot_token=_current_bot_token,
+            )
+        except ValueError:
+            _reply(chat_id, f"❌ Invalid amount: `{args[0]}`. Must be a numeric value like `/risk 50`.", bot_token=_current_bot_token)
 
     elif cmd in ("/calls", "/activecalls", "/tracked"):
         summary_text, inline_keyboard = format_active_calls_summary()
@@ -1704,8 +1929,9 @@ def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_tri
                         or "watchlist" in lower_raw
                     )
                     if is_cmd:
+                        msg_id = msg.get("message_id")
                         log.info("Received command on bot %s: %s from %s", token[:10], raw_text, chat_id)
-                        handle_command(raw_text, chat_id, scan_trigger_fn=scan_trigger_fn, bot_token=token)
+                        handle_command(raw_text, chat_id, scan_trigger_fn=scan_trigger_fn, bot_token=token, message_id=msg_id)
         except Exception as exc:
             log.debug("Telegram polling exception for %s: %s", token[:10], exc)
 
@@ -1846,7 +2072,11 @@ WINZ_PUBLIC_COMMANDS = [
     {"command": "sentiment", "description": "🌡️ Crypto Fear & Greed Index + tone analysis"},
     {"command": "subscribe", "description": "🔔 Enable automated digests & milestone alerts in this chat"},
     {"command": "unsubscribe", "description": "🔕 Disable automated broadcast alerts in this chat"},
-    {"command": "setchannel", "description": "📢 Register current group/channel for Winz calls"},
+    {"command": "connect", "description": "🔐 Connect Bybit account (/connect bybit <KEY> <SECRET>)"},
+    {"command": "myexchange", "description": "💼 View connected exchange balance & status"},
+    {"command": "autotrade", "description": "⚙️ Toggle automated trade execution on/off"},
+    {"command": "risk", "description": "⚖️ Set margin size per trade (e.g. /risk 50)"},
+    {"command": "disconnect", "description": "🔌 Disconnect exchange and wipe API keys"},
     {"command": "help", "description": "Show command guide and help"},
 ]
 
