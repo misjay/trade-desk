@@ -869,8 +869,18 @@ def get_scheduled_2h_calls() -> List[Dict]:
         except Exception as exc:
             log.debug("Error building candidate for %s: %s", ticker, exc)
 
-    scalp_candidates.sort(key=lambda x: (x.get("conviction", 0), x.get("rr", 0)), reverse=True)
-    day_candidates.sort(key=lambda x: (x.get("conviction", 0), x.get("rr", 0)), reverse=True)
+    def _speed_to_tp_score(s: dict) -> float:
+        conv = float(s.get("conviction", 80.0))
+        live = float(s.get("live_price", 0.0))
+        tp1 = float(s.get("tp1", 0.0))
+        if live > 0 and tp1 > 0:
+            dist_pct = abs(tp1 - live) / live * 100.0
+        else:
+            dist_pct = 2.0
+        return conv / max(dist_pct, 0.4)
+
+    scalp_candidates.sort(key=_speed_to_tp_score, reverse=True)
+    day_candidates.sort(key=_speed_to_tp_score, reverse=True)
 
     top_scalps = []
     seen = set()
@@ -892,7 +902,7 @@ def get_scheduled_2h_calls() -> List[Dict]:
                     all_scalp_avail.append(sig)
             except Exception:
                 pass
-        all_scalp_avail.sort(key=lambda x: x.get("rr", 0), reverse=True)
+        all_scalp_avail.sort(key=_speed_to_tp_score, reverse=True)
         for c in all_scalp_avail:
             top_scalps.append(c)
             seen.add(c["ticker"])
@@ -918,7 +928,7 @@ def get_scheduled_2h_calls() -> List[Dict]:
                     all_day_avail.append(sig)
             except Exception:
                 pass
-        all_day_avail.sort(key=lambda x: x.get("rr", 0), reverse=True)
+        all_day_avail.sort(key=_speed_to_tp_score, reverse=True)
         for c in all_day_avail:
             top_days.append(c)
             seen.add(c["ticker"])
