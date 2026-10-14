@@ -187,7 +187,33 @@ def run_scan_cycle(trade_type: str = "scalp", manual: bool = False):
         log.info("🛡️ Weekend Defense Mode active (Friday 14:00 -> Sunday 22:00 UTC): 15m scalp execution muted. High-timeframe A+ setups only.")
         return
 
-    for sig in all_sigs:
+    # ── Speed-to-Target & Conviction Priority Ranking ────────────────────────
+    # Rank actionable signals by highest conviction and closest distance to TP1
+    def _speed_to_tp_score(s: dict) -> float:
+        conv = float(s.get("conviction", 80.0))
+        live = float(s.get("live_price", 0.0))
+        tp1 = float(s.get("tp1", 0.0))
+        if live > 0 and tp1 > 0:
+            dist_pct = abs(tp1 - live) / live * 100.0
+        else:
+            dist_pct = 2.0
+        # Priority index = Conviction / Distance_to_TP1 (higher is faster & higher probability)
+        return conv / max(dist_pct, 0.4)
+
+    actionable_sigs = [s for s in all_sigs if s.get("side") in ("BUY", "SELL")]
+    wait_sigs = [s for s in all_sigs if s.get("side") not in ("BUY", "SELL")]
+
+    if actionable_sigs:
+        actionable_sigs.sort(key=_speed_to_tp_score, reverse=True)
+        log.info(
+            "Ranked %d actionable setups by Conviction & Speed-to-TP: %s",
+            len(actionable_sigs),
+            ", ".join(f"{s['ticker']} ({s['side']} @ {s.get('conviction', 80)}% conv, speed={_speed_to_tp_score(s):.1f})" for s in actionable_sigs)
+        )
+
+    ordered_sigs = actionable_sigs + wait_sigs
+
+    for sig in ordered_sigs:
         ticker = sig["ticker"]
         side = sig["side"]
 

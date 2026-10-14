@@ -604,6 +604,20 @@ def is_global_circuit_breaker_active() -> Tuple[bool, str]:
     return False, ""
 
 
+def reset_global_circuit_breaker() -> bool:
+    """Manually clear/reset the global daily circuit breaker freeze."""
+    with _lock:
+        s = _load_raw()
+        gcb = s.get("global_circuit_breaker", {})
+        gcb["active"] = False
+        gcb["loss_24h"] = 0.0
+        gcb["expires_at"] = datetime.now(timezone.utc).isoformat()
+        s["global_circuit_breaker"] = gcb
+        _save(s)
+        log.info("Global Daily Loss Circuit Breaker manually reset. Normal trading unblocked.")
+        return True
+
+
 def check_and_trigger_global_daily_circuit_breaker() -> Optional[dict]:
     """
     Check rolling 24-hour total realized loss across all assets.

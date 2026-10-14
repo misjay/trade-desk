@@ -952,9 +952,17 @@ def handle_command(
             return
 
         state.set_paused(False, mode="all")
-        _reply(chat_id, "🟢 *Automated execution RESUMED.* Triggering immediate market scan and order placement now...", bot_token=_current_bot_token)
+        state.reset_global_circuit_breaker()
+        _reply(chat_id, "🟢 *Automated execution RESUMED.* (Circuit breaker cleared). Triggering immediate market scan...", bot_token=_current_bot_token)
         if scan_trigger_fn:
             threading.Thread(target=scan_trigger_fn, daemon=True).start()
+
+    elif cmd in ("/resetcircuit", "/unfreeze"):
+        state.reset_global_circuit_breaker()
+        _reply(chat_id, "🟢 *Global Circuit Breaker RESET.*\n\nTrading cooldown cleared. Immediate scan triggered.", bot_token=_current_bot_token)
+        if scan_trigger_fn:
+            threading.Thread(target=scan_trigger_fn, daemon=True).start()
+        return
 
     elif cmd in ("/broadcast", "/signal"):
         if not is_admin(chat_id):
