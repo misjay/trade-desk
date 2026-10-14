@@ -713,8 +713,8 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
         notify_entry_filled(pos_perp)
     log.info("Opened PERP order: %s %s @$%.4f qty=%.6f lev=%dx status=%s", ticker, side, entry_mid, perp_qty, lev, pos_perp["status"])
 
-    # Dispatch to connected live Bybit users if order filled immediately (market order)
-    if use_market_order:
+    # Dispatch to connected live Bybit users if order is active immediately (paper demo or market order)
+    if pos_perp.get("status") == "OPEN":
         try:
             import exchange_manager
             sig_payload = {
