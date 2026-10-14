@@ -126,8 +126,8 @@ def detect_trade_reversal(
 _recent_sent_hashes: Dict[str, float] = {}
 
 
-def _send_alert(msg: str) -> None:
-    """Send alert to Telegram calls destination and Discord without duplicates."""
+def _send_alert(msg: str, category: str = "milestones") -> None:
+    """Send alert to Telegram calls destination and Discord without duplicates, honoring chat preferences."""
     global _recent_sent_hashes
     now_ts = time.time()
     
@@ -160,12 +160,22 @@ def _send_alert(msg: str) -> None:
     if tok and unique_chats:
         url = f"https://api.telegram.org/bot{tok}/sendMessage"
         for target_chat in unique_chats:
+            # Check if this chat has enabled this alert category
+            if not state.is_chat_alert_enabled(target_chat, category):
+                log.debug("Chat %s has paused alert category '%s'. Skipping alert.", target_chat, category)
+                continue
+
             try:
                 requests.post(url, json={
                     "chat_id": target_chat,
                     "text": msg,
                     "parse_mode": "Markdown",
                     "disable_web_page_preview": True,
+                    "reply_markup": {
+                        "inline_keyboard": [
+                            [{"text": "❌ Close Alert", "callback_data": "close_msg"}]
+                        ]
+                    },
                 }, timeout=8)
             except Exception as exc:
                 log.warning("Telegram call tracker alert failed for chat %s: %s", target_chat, exc)
@@ -287,7 +297,8 @@ def check_tracked_calls_once() -> None:
                     f"• *Planned Entry Band*: `{fmt_dollar(entry_low)} – {fmt_dollar(entry_high)}`\n"
                     f"• *Invalidation Level*: `{fmt_dollar(sl)}`\n"
                     f"• *Current Mark*: `{fmt_dollar(live_price)}`\n\n"
-                    f"🚫 *Outcome:* Price blew past structure before entry was filled. Setup cancelled and removed from active tracking."
+                    f"🚫 *Outcome:* Price blew past structure before entry was filled. Setup cancelled and removed from active tracking.",
+                    category="triggers"
                 )
                 state.update_tracked_call(cid, updates)
                 continue
@@ -327,7 +338,8 @@ def check_tracked_calls_once() -> None:
                     f"• *Target 1 (TP1)*: `+{tp1_p:.1f}%` ({fmt_dollar(tp1)})\n"
                     f"• *Target 2 (TP2)*: `+{tp2_p:.1f}%` ({fmt_dollar(tp2)})\n"
                     f"• *Stop Loss (SL)*: `-{sl_p:.1f}%` ({fmt_dollar(sl)})\n\n"
-                    f"⚡ *Action:* Entry band reached. Position is now ACTIVE and under 24/7 target tracking."
+                    f"⚡ *Action:* Entry band reached. Position is now ACTIVE and under 24/7 target tracking.",
+                    category="triggers"
                 )
 
                 # Dispatch automated trade execution to subscribed users
@@ -532,7 +544,8 @@ def check_tracked_calls_once() -> None:
                     f"• *Current Price*: `{fmt_dollar(live_price)}` (PnL: {pnl_display})\n"
                     f"• *Reversal Driver*: {rev_reason}\n\n"
                     f"💡 *Best Actionable Advice:*\n"
-                    f"{advice_text}"
+                    f"{advice_text}",
+                    category="reversals"
                 )
 
         # ── 9. Check Every +10% Increase Milestone ──────────────────────────
@@ -559,7 +572,8 @@ def check_tracked_calls_once() -> None:
                 f"• *Asset*: `${ticker}` ({tf} {side})\n"
                 f"• *Drawdown from Entry*: `-{drop_pct:.1f}%`\n"
                 f"• *Live Price*: `{fmt_dollar(live_price)}` (Entry: `{fmt_dollar(entry_mid)}`)\n\n"
-                f"⚠️ High volatility drawdown step reached. Verify structure before adding risk."
+                f"⚠️ High volatility drawdown step reached. Verify structure before adding risk.",
+                category="reversals"
             )
 
         if updates:
@@ -586,7 +600,8 @@ def check_tracked_calls_once() -> None:
                     f"💡 *Best Professional Advice for Traders:*\n"
                     f"1. Type `/calls` to review all running trades and their current PnL.\n"
                     f"2. Move Stop-Loss on profitable trades to Entry Breakeven.\n"
-                    f"3. Avoid new counter-trend entries until fresh 15m/4h structural consolidation confirms."
+                    f"3. Avoid new counter-trend entries until fresh 15m/4h structural consolidation confirms.",
+                    category="reversals"
                 )
         _last_known_btc_regime = current_btc_regime
     except Exception as exc:

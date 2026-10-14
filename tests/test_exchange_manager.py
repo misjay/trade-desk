@@ -100,6 +100,8 @@ class TestExchangeManager(unittest.TestCase):
         mock_client.quantize_qty.return_value = 0.5
         mock_client.get_instrument_info.return_value = {"min_qty": 0.01}
         mock_client.place_order.return_value = {"orderId": "ORD_9999"}
+        mock_client.get_active_positions.return_value = []
+        mock_client.get_wallet_balance.return_value = {"available": 1000.0, "total": 1000.0}
 
         with patch.object(exchange_manager, "get_user_bybit_client", return_value=mock_client):
             success, msg = exchange_manager.execute_trade_for_user(

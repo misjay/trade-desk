@@ -21,6 +21,7 @@ Format Mandate (matches institutional research style):
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import logging
 import math
 import time
@@ -815,6 +816,11 @@ def send_research_with_chart(
                 "chat_id": target_chat,
                 "caption": caption_summary,
                 "parse_mode": "Markdown",
+                "reply_markup": json.dumps({
+                    "inline_keyboard": [
+                        [{"text": "❌ Close Chart", "callback_data": "close_msg"}]
+                    ]
+                }),
             }
             requests.post(photo_url, data=data, files=files, timeout=20)
         except Exception as exc:
@@ -828,6 +834,11 @@ def send_research_with_chart(
         "text": research_text,
         "parse_mode": "Markdown",
         "disable_web_page_preview": True,
+        "reply_markup": {
+            "inline_keyboard": [
+                [{"text": "❌ Close Research", "callback_data": "close_msg"}]
+            ]
+        },
     }
     try:
         r = requests.post(text_url, json=payload, timeout=12)
@@ -1033,6 +1044,7 @@ def dispatch_hourly_calls(
             current_row = []
     if current_row:
         inline_keyboard.append(current_row)
+    inline_keyboard.append([{"text": "❌ Close Digest", "callback_data": "close_msg"}])
 
     index_msg = "\n".join(index_lines)
     send_url = f"https://api.telegram.org/bot{target_token}/sendMessage"
@@ -1041,6 +1053,9 @@ def dispatch_hourly_calls(
         chats = [target_chat] if target_chat else []
 
     for c in chats:
+        if not state.is_chat_alert_enabled(str(c), "digests"):
+            log.debug("Chat %s has paused 2-hour digests. Skipping.", c)
+            continue
         payload = {
             "chat_id": c,
             "text": index_msg,
@@ -1125,7 +1140,10 @@ def dispatch_instant_high_conviction_call(sig: dict) -> bool:
     ]
 
     badge = "⚡" if tf == "15m" else "🏛"
-    inline_keyboard = [[{"text": f"{badge} View ${ticker} Chart & Analysis", "callback_data": f"call_view_{ticker}_{tf}"}]]
+    inline_keyboard = [
+        [{"text": f"{badge} View ${ticker} Chart & Analysis", "callback_data": f"call_view_{ticker}_{tf}"}],
+        [{"text": "❌ Close Alert", "callback_data": "close_msg"}]
+    ]
     index_msg = "\n".join(lines)
 
     send_url = f"https://api.telegram.org/bot{target_token}/sendMessage"
@@ -1134,6 +1152,9 @@ def dispatch_instant_high_conviction_call(sig: dict) -> bool:
         chats = [target_chat] if target_chat else []
 
     for c in chats:
+        if not state.is_chat_alert_enabled(str(c), "triggers"):
+            log.debug("Chat %s has paused trend alerts. Skipping.", c)
+            continue
         payload = {
             "chat_id": c,
             "text": index_msg,
@@ -1215,6 +1236,7 @@ def dispatch_spot_calls(
             current_row = []
     if current_row:
         inline_keyboard.append(current_row)
+    inline_keyboard.append([{"text": "❌ Close Digest", "callback_data": "close_msg"}])
 
     send_url = f"https://api.telegram.org/bot{target_token}/sendMessage"
     chats = call_cfg.get("all_chats")
@@ -1223,6 +1245,9 @@ def dispatch_spot_calls(
 
     text_msg = "\n".join(lines)
     for c in chats:
+        if not state.is_chat_alert_enabled(str(c), "digests"):
+            log.debug("Chat %s has paused spot digests. Skipping.", c)
+            continue
         payload = {
             "chat_id": c,
             "text": text_msg,

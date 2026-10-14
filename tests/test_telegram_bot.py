@@ -912,6 +912,85 @@ class TestTelegramBot(unittest.TestCase):
             self.assertIn("Broadcast Dispatched Successfully", receipt_msg)
             self.assertIn("Trade Signal", receipt_msg)
 
+    def test_reply_attaches_close_button(self):
+        import telegram_bot
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"ok": True}
+
+        with patch("requests.post", return_value=mock_resp) as mock_post:
+            # 1. Plain message without reply_markup
+            telegram_bot._reply("12345", "Hello World", bot_token="TEST_TOK")
+            payload = mock_post.call_args[1].get("json", {})
+            self.assertIn("reply_markup", payload)
+            markup = payload["reply_markup"]
+            self.assertIn("inline_keyboard", markup)
+            buttons = [b for row in markup["inline_keyboard"] for b in row]
+            self.assertTrue(any(b.get("callback_data") == "close_msg" for b in buttons))
+
+            # 2. Message with existing inline buttons
+            existing_markup = {
+                "inline_keyboard": [
+                    [{"text": "View Chart", "callback_data": "chart_btc"}]
+                ]
+            }
+            telegram_bot._reply("12345", "With Chart", bot_token="TEST_TOK", reply_markup=existing_markup)
+            payload2 = mock_post.call_args[1].get("json", {})
+            rows = payload2["reply_markup"]["inline_keyboard"]
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0][0]["text"], "View Chart")
+            self.assertEqual(rows[1][0]["callback_data"], "close_msg")
+
+    def test_notifications_panel_and_commands(self):
+        import telegram_bot
+        import state
+
+        # 1. Build notifications panel
+        text, markup = telegram_bot._build_notifications_panel("12345")
+        self.assertIn("Notification & Alert Preferences", text)
+        self.assertIn("inline_keyboard", markup)
+
+        # 2. Command /notifications
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/notifications", "12345")
+            self.assertIn("Notification & Alert Preferences", mock_reply.call_args[0][1])
+
+        # 3. /pausealerts triggers
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/pausealerts triggers", "12345")
+            self.assertFalse(state.is_chat_alert_enabled("12345", "triggers"))
+            self.assertIn("Trade Trigger Alerts PAUSED", mock_reply.call_args[0][1])
+
+        # 4. /resumealerts triggers
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/resumealerts triggers", "12345")
+            self.assertTrue(state.is_chat_alert_enabled("12345", "triggers"))
+            self.assertIn("Trade Trigger Alerts RESUMED", mock_reply.call_args[0][1])
+
+        # 5. /pausereversals & /resumereversals shortcuts
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("/pausereversals", "12345")
+            self.assertFalse(state.is_chat_alert_enabled("12345", "reversals"))
+            self.assertIn("Market Reversal Alerts PAUSED", mock_reply.call_args[0][1])
+
+            telegram_bot.handle_command("/resumereversals", "12345")
+            self.assertTrue(state.is_chat_alert_enabled("12345", "reversals"))
+            self.assertIn("Market Reversal Alerts RESUMED", mock_reply.call_args[0][1])
+
+        # 6. Natural language: "pause trade triggers" & "pause reversals"
+        with patch.object(telegram_bot, "_reply") as mock_reply:
+            telegram_bot.handle_command("pause trade triggers", "12345")
+            self.assertFalse(state.is_chat_alert_enabled("12345", "triggers"))
+
+            telegram_bot.handle_command("resume trade triggers", "12345")
+            self.assertTrue(state.is_chat_alert_enabled("12345", "triggers"))
+
+            telegram_bot.handle_command("pause reversals", "12345")
+            self.assertFalse(state.is_chat_alert_enabled("12345", "reversals"))
+
+            telegram_bot.handle_command("resume reversals", "12345")
+            self.assertTrue(state.is_chat_alert_enabled("12345", "reversals"))
+
 
 if __name__ == "__main__":
     unittest.main()

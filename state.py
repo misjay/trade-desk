@@ -915,6 +915,101 @@ def is_call_bot_subscribed(chat_id: str) -> bool:
     return cid_str in call_cfg.get("all_chats", [])
 
 
+# ── Chat Notification Preferences (Granular Alert Filters) ─────────────────────
+
+DEFAULT_NOTIF_PREFS: Dict[str, bool] = {
+    "triggers": True,     # Trade Triggered & Active, Setup Invalidated
+    "reversals": True,    # Market Reversals, Warnings & Macro Shifts
+    "milestones": True,   # Take Profit (TP0, TP1, TP2), Break-Even, Trailing Stops
+    "digests": True,      # 2-Hour Scheduled Digests & Spot Accumulation
+}
+
+
+def get_chat_notification_prefs(chat_id: Union[str, int]) -> Dict[str, bool]:
+    """Retrieve granular notification preferences for a chat. Defaults all to True."""
+    cid_str = str(chat_id).strip()
+    with _lock:
+        s = _load_raw()
+        cb = s.get("call_bot", {})
+        prefs_map = cb.get("chat_notification_prefs", {})
+        chat_prefs = prefs_map.get(cid_str)
+        if not chat_prefs:
+            return dict(DEFAULT_NOTIF_PREFS)
+        merged = dict(DEFAULT_NOTIF_PREFS)
+        merged.update(chat_prefs)
+        return merged
+
+
+def set_chat_notification_pref(chat_id: Union[str, int], category: str, enabled: bool) -> Dict[str, bool]:
+    """
+    Set a notification preference for a specific category or 'all'.
+    Returns updated preferences dict.
+    """
+    cid_str = str(chat_id).strip()
+    cat = category.lower().strip()
+    with _lock:
+        s = _load_raw()
+        cb = s.setdefault("call_bot", {})
+        prefs_map = cb.setdefault("chat_notification_prefs", {})
+        current = prefs_map.get(cid_str, dict(DEFAULT_NOTIF_PREFS))
+
+        if cat in ("all", "everything", "alerts", "notifications"):
+            for k in DEFAULT_NOTIF_PREFS:
+                current[k] = enabled
+        elif cat in ("trigger", "triggers", "fill", "entry"):
+            current["triggers"] = enabled
+        elif cat in ("reversal", "reversals", "warning", "warnings", "macro"):
+            current["reversals"] = enabled
+        elif cat in ("milestone", "milestones", "tp", "takeprofit", "profit", "stop", "stops", "be", "breakeven"):
+            current["milestones"] = enabled
+        elif cat in ("digest", "digests", "calls", "hourly", "spot", "summary"):
+            current["digests"] = enabled
+        elif cat in current:
+            current[cat] = enabled
+
+        prefs_map[cid_str] = current
+        cb["updated_at"] = _now()
+        _save(s)
+        return dict(current)
+
+
+def is_chat_alert_enabled(chat_id: Union[str, int], category: str) -> bool:
+    """
+    Check if a specific alert category is enabled for this chat.
+    Takes into account general subscription and granular category filter.
+    """
+    cid_str = str(chat_id).strip()
+    call_cfg = get_call_bot_config()
+
+    # Must not be in unsubscribed_chats
+    unsub = set(str(c).strip() for c in call_cfg.get("unsubscribed_chats", []))
+    if cid_str in unsub:
+        return False
+
+    # Check if registered destination
+    all_c = set(str(c).strip() for c in call_cfg.get("all_chats", []))
+    prim = str(call_cfg.get("chat_id") or "").strip()
+    if cid_str not in all_c and cid_str != prim:
+        try:
+            import access_manager
+            if not access_manager.is_user_authorized(cid_str):
+                return False
+        except Exception:
+            return False
+
+    prefs = get_chat_notification_prefs(cid_str)
+    cat = category.lower().strip()
+    if cat in ("trigger", "triggers", "fill", "entry"):
+        return bool(prefs.get("triggers", True))
+    elif cat in ("reversal", "reversals", "warning", "warnings", "macro"):
+        return bool(prefs.get("reversals", True))
+    elif cat in ("milestone", "milestones", "tp", "takeprofit", "be", "breakeven"):
+        return bool(prefs.get("milestones", True))
+    elif cat in ("digest", "digests", "calls", "hourly"):
+        return bool(prefs.get("digests", True))
+    return bool(prefs.get(cat, True))
+
+
 def record_learning_event(event: dict) -> None:
     with _lock:
         s = _load_raw()

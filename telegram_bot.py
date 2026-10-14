@@ -72,7 +72,16 @@ def _reply(chat_id: str, text: str, bot_token: Optional[str] = None, reply_marku
         "parse_mode": "Markdown",
         "disable_web_page_preview": True,
     }
-    if reply_markup:
+    close_btn = {"text": "❌ Close", "callback_data": "close_msg"}
+    if reply_markup is None:
+        payload["reply_markup"] = {"inline_keyboard": [[close_btn]]}
+    elif isinstance(reply_markup, dict) and "inline_keyboard" in reply_markup:
+        rows = [list(r) for r in reply_markup["inline_keyboard"]]
+        has_close = any(any(b.get("callback_data") in ("close_msg", "dismiss_msg") for b in row) for row in rows)
+        if not has_close:
+            rows.append([close_btn])
+        payload["reply_markup"] = {**reply_markup, "inline_keyboard": rows}
+    else:
         payload["reply_markup"] = reply_markup
     try:
         requests.post(url, json=payload, timeout=8)
@@ -223,6 +232,60 @@ def format_active_calls_summary() -> Tuple[str, List[List[dict]]]:
     return "\n".join(lines), inline_keyboard
 
 
+def _build_notifications_panel(chat_id: str) -> Tuple[str, dict]:
+    """Build the interactive notification preferences text and inline keyboard."""
+    prefs = state.get_chat_notification_prefs(chat_id)
+    trig = prefs.get("triggers", True)
+    rev = prefs.get("reversals", True)
+    mile = prefs.get("milestones", True)
+    dig = prefs.get("digests", True)
+
+    s_trig = "🟢 *Active*" if trig else "⏸ *Paused*"
+    s_rev = "🟢 *Active*" if rev else "⏸ *Paused*"
+    s_mile = "🟢 *Active*" if mile else "⏸ *Paused*"
+    s_dig = "🟢 *Active*" if dig else "⏸ *Paused*"
+
+    text = (
+        "🔔 *Winz Notification & Alert Preferences*\n\n"
+        "Customize which real-time market and trade alerts are sent to this chat:\n\n"
+        f"• *🎯 Trade Triggers*: {s_trig}\n"
+        f"  _(Entry fills, setup invalidations, instant trend alerts)_\n\n"
+        f"• *⚠️ Reversals & Warnings*: {s_rev}\n"
+        f"  _(15m structure rejection, drawdown warnings, BTC macro shifts)_\n\n"
+        f"• *💰 TP & Trailing Stops*: {s_mile}\n"
+        f"  _(TP0/TP1/TP2 hits, Breakeven snap, profit-lock ratchets)_\n\n"
+        f"• *📋 2-Hour Desk Digests*: {s_dig}\n"
+        f"  _(Scheduled 4 scalps + 3 day trades & spot lists)_\n\n"
+        "👇 _Tap any button below to toggle categories or pause/resume all:_"
+    )
+
+    b_trig = f"🎯 Triggers: {'ON 🟢' if trig else 'OFF ⏸'}"
+    b_rev = f"⚠️ Reversals: {'ON 🟢' if rev else 'OFF ⏸'}"
+    b_mile = f"💰 TP/Stops: {'ON 🟢' if mile else 'OFF ⏸'}"
+    b_dig = f"📋 Digests: {'ON 🟢' if dig else 'OFF ⏸'}"
+
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": b_trig, "callback_data": "toggle_notif_triggers"},
+                {"text": b_rev, "callback_data": "toggle_notif_reversals"},
+            ],
+            [
+                {"text": b_mile, "callback_data": "toggle_notif_milestones"},
+                {"text": b_dig, "callback_data": "toggle_notif_digests"},
+            ],
+            [
+                {"text": "⏸ Pause All", "callback_data": "toggle_notif_pause_all"},
+                {"text": "▶️ Resume All", "callback_data": "toggle_notif_resume_all"},
+            ],
+            [
+                {"text": "❌ Close Panel", "callback_data": "close_msg"}
+            ]
+        ]
+    }
+    return text, keyboard
+
+
 def handle_command(
     cmd_text: str,
     chat_id: str,
@@ -316,6 +379,54 @@ def handle_command(
         parts = ["/autotrade", "on"]
     elif lower_raw in ("autotrade off", "auto off", "disable autotrade", "stop autotrade", "turn off autotrade", "pause autotrade", "stop auto trade", "disable auto trade"):
         parts = ["/autotrade", "off"]
+    elif any(k in lower_raw for k in [
+        "pause trade trigger", "pause trade triggers", "pause triggers", "pause trigger",
+        "mute trade trigger", "mute trade triggers", "mute triggers", "stop triggers", "stop trigger alerts"
+    ]):
+        parts = ["/pausealerts", "triggers"]
+    elif any(k in lower_raw for k in [
+        "resume trade trigger", "resume trade triggers", "resume triggers", "resume trigger",
+        "unmute trade trigger", "unmute trade triggers", "unmute triggers", "start triggers"
+    ]):
+        parts = ["/resumealerts", "triggers"]
+    elif any(k in lower_raw for k in [
+        "pause reversal", "pause reversals", "pause reversal alert", "pause reversal alerts",
+        "mute reversal", "mute reversals", "stop reversals", "stop reversal alerts"
+    ]):
+        parts = ["/pausealerts", "reversals"]
+    elif any(k in lower_raw for k in [
+        "resume reversal", "resume reversals", "resume reversal alert", "resume reversal alerts",
+        "unmute reversal", "unmute reversals", "start reversals"
+    ]):
+        parts = ["/resumealerts", "reversals"]
+    elif any(k in lower_raw for k in [
+        "pause milestone", "pause milestones", "pause tp alerts", "pause tp alert", "pause tp", "mute tp"
+    ]):
+        parts = ["/pausealerts", "milestones"]
+    elif any(k in lower_raw for k in [
+        "resume milestone", "resume milestones", "resume tp alerts", "resume tp alert", "resume tp", "unmute tp"
+    ]):
+        parts = ["/resumealerts", "milestones"]
+    elif any(k in lower_raw for k in [
+        "pause digest", "pause digests", "pause 2h digest", "pause hourly calls", "mute digests"
+    ]):
+        parts = ["/pausealerts", "digests"]
+    elif any(k in lower_raw for k in [
+        "resume digest", "resume digests", "resume 2h digest", "resume hourly calls", "unmute digests"
+    ]):
+        parts = ["/resumealerts", "digests"]
+    elif any(k in lower_raw for k in [
+        "pause notification", "pause notifications", "pause alert", "pause alerts",
+        "mute notification", "mute notifications", "mute alerts", "stop alerts", "stop notifications"
+    ]):
+        parts = ["/pausealerts", "all"]
+    elif any(k in lower_raw for k in [
+        "resume notification", "resume notifications", "resume alert", "resume alerts",
+        "unmute notification", "unmute notifications", "unmute alerts", "start alerts", "start notifications"
+    ]):
+        parts = ["/resumealerts", "all"]
+    elif lower_raw in ("notifications", "notification preferences", "alert preferences", "alerts", "notification settings", "alert settings"):
+        parts = ["/notifications"]
     elif "how are we doing" in lower_raw or "performance today" in lower_raw or "what is the drawdown" in lower_raw or "show positions" in lower_raw:
         parts = ["/status"]
     else:
@@ -496,6 +607,8 @@ def handle_command(
             "• `/tweet [COIN]` — 280-char formatted Twitter/X post\n"
             "• `/news [COIN]` — Breaking crypto news & sentiment\n"
             "• `/sentiment` — Fear & Greed Index\n"
+            "• `/notifications` — Alert preferences & granular toggles\n"
+            "• `/pausealerts` / `/resumealerts` — Pause/resume triggers or reversals\n"
             "• `/subscribe` / `/unsubscribe` — Alert notifications",
             bot_token=_current_bot_token,
         )
@@ -546,6 +659,9 @@ def handle_command(
                 "• `/news [COIN]` — Live breaking crypto news & NLP catalyst scoring\n"
                 "• `/sentiment` — 🌡️ Crypto Fear & Greed Index + institutional tone\n\n"
                 "📢 *Personal Alert Preferences:*\n"
+                "• `/notifications` — 🔔 Interactive panel to toggle triggers, reversals, TP & digests\n"
+                "• `/pausealerts [cat]` — ⏸️ Pause alerts (`triggers`, `reversals`, `tp`, `digests`, or `all`)\n"
+                "• `/resumealerts [cat]` — 🟢 Resume alerts (`triggers`, `reversals`, `tp`, `digests`, or `all`)\n"
                 "• `/subscribe` — 🔔 Enable 2h digests & live trade trigger notifications in this chat\n"
                 "• `/unsubscribe` — 🔕 Disable automated broadcasts in this chat\n"
                 "• `/setchannel` — Broadcast signals to your group or channel"
@@ -1037,6 +1153,11 @@ def handle_command(
                 "text": formatted_broadcast,
                 "parse_mode": "Markdown",
                 "disable_web_page_preview": True,
+                "reply_markup": {
+                    "inline_keyboard": [
+                        [{"text": "❌ Dismiss", "callback_data": "close_msg"}]
+                    ]
+                },
             }
             try:
                 res = requests.post(url, json=payload, timeout=8)
@@ -1802,6 +1923,62 @@ def handle_command(
             bot_token=_current_bot_token,
         )
 
+    elif cmd in ("/notifications", "/alerts", "/notif", "/notifs"):
+        panel_text, panel_markup = _build_notifications_panel(chat_id)
+        _reply(chat_id, panel_text, bot_token=_current_bot_token, reply_markup=panel_markup)
+
+    elif cmd in ("/pausealerts", "/pausenotif", "/pausealert"):
+        category = args[0].lower() if args else "all"
+        if category in ("triggers", "trigger", "entry", "fill"):
+            state.set_chat_notification_pref(chat_id, "triggers", False)
+            _reply(chat_id, "⏸ *Trade Trigger Alerts PAUSED*\n\nEntry fill and setup invalidation alerts have been paused for this chat.\nOther alerts remain active. Type `/resumealerts triggers` to re-enable.", bot_token=_current_bot_token)
+        elif category in ("reversals", "reversal", "warning", "warnings"):
+            state.set_chat_notification_pref(chat_id, "reversals", False)
+            _reply(chat_id, "⏸ *Market Reversal Alerts PAUSED*\n\nReversal signals, drawdown warnings, and macro alerts have been paused for this chat.\nType `/resumealerts reversals` to re-enable.", bot_token=_current_bot_token)
+        elif category in ("milestones", "milestone", "tp", "stops", "stop"):
+            state.set_chat_notification_pref(chat_id, "milestones", False)
+            _reply(chat_id, "⏸ *Take Profit & Trailing Stop Alerts PAUSED*\n\nTP hits, Break-Even snaps, and profit locks have been paused for this chat.\nType `/resumealerts tp` to re-enable.", bot_token=_current_bot_token)
+        elif category in ("digests", "digest", "hourly", "calls"):
+            state.set_chat_notification_pref(chat_id, "digests", False)
+            _reply(chat_id, "⏸ *2-Hour Desk Digests PAUSED*\n\nScheduled 2-hour trade desk digests have been paused for this chat.\nType `/resumealerts digests` to re-enable.", bot_token=_current_bot_token)
+        else:
+            state.set_chat_notification_pref(chat_id, "all", False)
+            _reply(chat_id, "⏸ *All Notifications PAUSED*\n\nAll automated trade triggers, reversals, milestone alerts, and 2-hour digests have been paused for this chat.\nType `/resumealerts` to resume or `/notifications` to manage preferences.", bot_token=_current_bot_token)
+
+    elif cmd in ("/resumealerts", "/resumenotif", "/resumealert"):
+        category = args[0].lower() if args else "all"
+        if category in ("triggers", "trigger", "entry", "fill"):
+            state.set_chat_notification_pref(chat_id, "triggers", True)
+            _reply(chat_id, "🟢 *Trade Trigger Alerts RESUMED*\n\nYou will now receive live entry fill and setup invalidation alerts.", bot_token=_current_bot_token)
+        elif category in ("reversals", "reversal", "warning", "warnings"):
+            state.set_chat_notification_pref(chat_id, "reversals", True)
+            _reply(chat_id, "🟢 *Market Reversal Alerts RESUMED*\n\nYou will now receive market reversal, drawdown warning, and macro trend alerts.", bot_token=_current_bot_token)
+        elif category in ("milestones", "milestone", "tp", "stops", "stop"):
+            state.set_chat_notification_pref(chat_id, "milestones", True)
+            _reply(chat_id, "🟢 *Take Profit & Trailing Stop Alerts RESUMED*\n\nYou will now receive TP hits, Break-Even snaps, and profit lock alerts.", bot_token=_current_bot_token)
+        elif category in ("digests", "digest", "hourly", "calls"):
+            state.set_chat_notification_pref(chat_id, "digests", True)
+            _reply(chat_id, "🟢 *2-Hour Desk Digests RESUMED*\n\nYou will now receive scheduled 2-hour trade digests with interactive charts.", bot_token=_current_bot_token)
+        else:
+            state.set_chat_notification_pref(chat_id, "all", True)
+            _reply(chat_id, "🟢 *All Notifications RESUMED*\n\nAll automated trade triggers, reversals, milestone alerts, and 2-hour digests are active.", bot_token=_current_bot_token)
+
+    elif cmd == "/pausetriggers":
+        state.set_chat_notification_pref(chat_id, "triggers", False)
+        _reply(chat_id, "⏸ *Trade Trigger Alerts PAUSED*\n\nEntry fill and setup invalidation alerts are silenced.\nType `/resumetriggers` to re-enable.", bot_token=_current_bot_token)
+
+    elif cmd == "/resumetriggers":
+        state.set_chat_notification_pref(chat_id, "triggers", True)
+        _reply(chat_id, "🟢 *Trade Trigger Alerts RESUMED*\n\nEntry fill and setup invalidation alerts are active.", bot_token=_current_bot_token)
+
+    elif cmd == "/pausereversals":
+        state.set_chat_notification_pref(chat_id, "reversals", False)
+        _reply(chat_id, "⏸ *Market Reversal Alerts PAUSED*\n\nReversal signals, drawdown warnings, and macro alerts are silenced.\nType `/resumereversals` to re-enable.", bot_token=_current_bot_token)
+
+    elif cmd == "/resumereversals":
+        state.set_chat_notification_pref(chat_id, "reversals", True)
+        _reply(chat_id, "🟢 *Market Reversal Alerts RESUMED*\n\nReversal signals, drawdown warnings, and macro alerts are active.", bot_token=_current_bot_token)
+
     elif cmd in ("/news", "/sentiment", "/fng"):
         target_ticker = args[0].upper().replace("USDT", "") if args else "BTC"
         _reply(chat_id, f"🗞 *Gathering Institutional Sentiment & Live Breaking News for ${target_ticker}...*", bot_token=_current_bot_token)
@@ -2494,7 +2671,32 @@ def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_tri
                         cb_id = cb_query.get("id")
                         cb_data = cb_query.get("data", "")
                         from_user = cb_query.get("from", {})
-                        cb_chat_id = str(cb_query.get("message", {}).get("chat", {}).get("id") or from_user.get("id"))
+                        cb_msg = cb_query.get("message") or {}
+                        cb_chat_id = str(cb_msg.get("chat", {}).get("id") or from_user.get("id"))
+                        cb_msg_id = cb_msg.get("message_id")
+
+                        # Handle message dismissal / close IMMEDIATELY before authorization check
+                        if cb_data in ("close_msg", "dismiss_msg", "delete_msg"):
+                            try:
+                                ack_url = f"https://api.telegram.org/bot{token}/answerCallbackQuery"
+                                requests.post(ack_url, json={"callback_query_id": cb_id}, timeout=4)
+                            except Exception:
+                                pass
+                            if cb_msg_id:
+                                try:
+                                    del_url = f"https://api.telegram.org/bot{token}/deleteMessage"
+                                    r_del = requests.post(del_url, json={"chat_id": cb_chat_id, "message_id": cb_msg_id}, timeout=5)
+                                    if not (r_del.status_code == 200 and r_del.json().get("ok")):
+                                        edit_url = f"https://api.telegram.org/bot{token}/editMessageText"
+                                        requests.post(edit_url, json={
+                                            "chat_id": cb_chat_id,
+                                            "message_id": cb_msg_id,
+                                            "text": "🗑️ _Message closed._",
+                                            "parse_mode": "Markdown",
+                                        }, timeout=5)
+                                except Exception as exc:
+                                    log.debug("Failed to delete closed message: %s", exc)
+                            continue
 
                         if not access_manager.is_user_authorized(cb_chat_id):
                             try:
@@ -2510,6 +2712,40 @@ def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_tri
                                 )
                             except Exception:
                                 pass
+                            continue
+
+                        # Handle interactive notification preference toggles
+                        if cb_data.startswith("toggle_notif_"):
+                            action = cb_data.replace("toggle_notif_", "")
+                            if action == "pause_all":
+                                state.set_chat_notification_pref(cb_chat_id, "all", False)
+                                ack_text = "⏸ All notifications paused"
+                            elif action == "resume_all":
+                                state.set_chat_notification_pref(cb_chat_id, "all", True)
+                                ack_text = "🟢 All notifications resumed"
+                            else:
+                                curr = state.get_chat_notification_prefs(cb_chat_id).get(action, True)
+                                state.set_chat_notification_pref(cb_chat_id, action, not curr)
+                                ack_text = f"{action.capitalize()}: {'ON 🟢' if not curr else 'OFF ⏸'}"
+
+                            try:
+                                ack_url = f"https://api.telegram.org/bot{token}/answerCallbackQuery"
+                                requests.post(ack_url, json={"callback_query_id": cb_id, "text": ack_text}, timeout=4)
+                            except Exception:
+                                pass
+
+                            panel_text, panel_markup = _build_notifications_panel(cb_chat_id)
+                            try:
+                                edit_url = f"https://api.telegram.org/bot{token}/editMessageText"
+                                requests.post(edit_url, json={
+                                    "chat_id": cb_chat_id,
+                                    "message_id": cb_msg_id,
+                                    "text": panel_text,
+                                    "parse_mode": "Markdown",
+                                    "reply_markup": panel_markup,
+                                }, timeout=6)
+                            except Exception as exc:
+                                log.debug("Failed to update notification panel: %s", exc)
                             continue
 
                         # Acknowledge callback query to Telegram
