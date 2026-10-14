@@ -608,10 +608,12 @@ def reset_global_circuit_breaker() -> bool:
     """Manually clear/reset the global daily circuit breaker freeze."""
     with _lock:
         s = _load_raw()
+        now_iso = datetime.now(timezone.utc).isoformat()
         gcb = s.get("global_circuit_breaker", {})
         gcb["active"] = False
         gcb["loss_24h"] = 0.0
-        gcb["expires_at"] = datetime.now(timezone.utc).isoformat()
+        gcb["expires_at"] = now_iso
+        gcb["last_reset_at"] = now_iso
         s["global_circuit_breaker"] = gcb
         _save(s)
         log.info("Global Daily Loss Circuit Breaker manually reset. Normal trading unblocked.")
@@ -622,6 +624,7 @@ def check_and_trigger_global_daily_circuit_breaker() -> Optional[dict]:
     """
     Check rolling 24-hour total realized loss across all assets.
     If total realized loss >= cfg.max_daily_loss_usdt ($500), freeze all new entries for cfg.global_circuit_breaker_freeze_hours (12h).
+    Respects manual reset timestamp (last_reset_at) to avoid re-triggering from historical test losses.
     """
     if not cfg.enable_global_daily_circuit_breaker:
         return None
@@ -634,7 +637,17 @@ def check_and_trigger_global_daily_circuit_breaker() -> Optional[dict]:
         s = _load_raw()
         closed = s.get("closed_positions", [])
         now = datetime.now(timezone.utc)
-        cutoff_24h = now - timedelta(hours=24)
+        cutoff = now - timedelta(hours=24)
+
+        gcb = s.get("global_circuit_breaker", {})
+        reset_str = gcb.get("last_reset_at")
+        if reset_str:
+            try:
+                reset_dt = datetime.fromisoformat(reset_str.replace("Z", "+00:00"))
+                if reset_dt > cutoff:
+                    cutoff = reset_dt
+            except Exception:
+                pass
 
         recent_losses = 0.0
         recent_pnl = 0.0
@@ -643,7 +656,7 @@ def check_and_trigger_global_daily_circuit_breaker() -> Optional[dict]:
             if c_time_str:
                 try:
                     c_dt = datetime.fromisoformat(c_time_str.replace("Z", "+00:00"))
-                    if c_dt >= cutoff_24h:
+                    if c_dt >= cutoff:
                         pnl = float(c.get("pnl_usdt", 0.0) or c.get("closed_pnl", 0.0))
                         recent_pnl += pnl
                         if pnl < 0:
