@@ -600,6 +600,11 @@ def _tracker_loop() -> None:
             check_tracked_calls_once()
         except Exception as exc:
             log.debug("Call tracker loop error: %s", exc)
+        try:
+            import exchange_manager
+            exchange_manager.sync_all_active_users()
+        except Exception as exc:
+            log.debug("User exchange sync error: %s", exc)
         time.sleep(15)
 
 

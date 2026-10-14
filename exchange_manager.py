@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import requests
 from cryptography.fernet import Fernet
 
-from config import bybit_linear_symbol
+from config import cfg, bybit_linear_symbol
 from notifier import fmt_dollar
 import user_store
 
@@ -261,6 +261,12 @@ def execute_trade_for_user(
 
     sym = bybit_linear_symbol(t_clean)
 
+    # First, reconcile any closed positions on Bybit so slots are accurately freed up
+    try:
+        sync_user_positions_with_bybit(cid)
+    except Exception as e_sync:
+        log.debug("Auto-sync prior to order execution exception: %s", e_sync)
+
     # 1. Enforce max concurrent positions on exchange (default 2 to protect wallet margin)
     max_user_positions = int(ex.get("max_positions", 2))
     try:
@@ -406,3 +412,91 @@ def dispatch_triggered_trade_to_users(
             log.warning("Failed auto-trade dispatch for user %s: %s", cid, exc)
 
     return executed_count
+ 
+ 
+def sync_user_positions_with_bybit(chat_id: Union[str, int], bot_token: Optional[str] = None) -> List[dict]:
+    """
+    Reconciles user_store open_positions with live Bybit positions.
+    Detects if a trade closed on Bybit (TP, SL, manual), updates user_store,
+    notifies the user via Telegram, and frees up the concurrent trade slot!
+    """
+    cid = str(chat_id).strip()
+    client = get_user_bybit_client(cid)
+    if not client:
+        return []
+
+    try:
+        bybit_pos = client.get_active_positions(category="linear")
+        active_syms = {p["symbol"] for p in bybit_pos if float(p.get("size", 0.0)) > 0}
+    except Exception as e:
+        log.debug("Could not fetch active Bybit positions for user %s: %s", cid, e)
+        return []
+
+    u = user_store.get_user(cid)
+    user_open = u.get("open_positions", {})
+    if not user_open:
+        return []
+
+    closed_positions = []
+    from telegram_bot import _reply
+    import state
+
+    # Fetch recent closed PnL from Bybit to record exact realized gain/loss
+    try:
+        closed_records = client.get_closed_pnl(category="linear", limit=10) or []
+    except Exception:
+        closed_records = []
+
+    for pid, pos in list(user_open.items()):
+        ticker = pos.get("ticker", "").upper().replace("USDT", "")
+        sym = bybit_linear_symbol(ticker)
+
+        # If position is no longer active on Bybit, it was closed!
+        if sym not in active_syms:
+            log.info("Live position %s (%s) closed on Bybit for user %s. Finalizing state...", pid, sym, cid)
+            
+            # Find matching closed PnL record
+            match_pnl = 0.0
+            exit_p = float(pos.get("entry_price", 0.0))
+            exec_type = "TRADE"
+            for rec in closed_records:
+                if rec.get("symbol") == sym:
+                    match_pnl = float(rec.get("closed_pnl", 0.0))
+                    exit_p = float(rec.get("exit_price", exit_p))
+                    exec_type = str(rec.get("exec_type", "TRADE")).upper()
+                    break
+
+            c_pos = user_store.close_user_position(cid, pid, exit_p, reason=f"BYBIT_{exec_type}")
+            if c_pos:
+                c_pos["pnl_usdt"] = match_pnl
+                closed_positions.append(c_pos)
+
+                pnl_str = f"+${match_pnl:.2f} 🟢" if match_pnl >= 0 else f"-${abs(match_pnl):.2f} 🔴"
+                outcome_label = "🏆 TAKE PROFIT HIT!" if match_pnl > 0 else "🛑 STOP LOSS TRIGGERED"
+                receipt = (
+                    f"{outcome_label} (Live Bybit)\n\n"
+                    f"• *Asset*: `{sym}` ({pos.get('side', 'TRADE')})\n"
+                    f"• *Entry Price*: `{fmt_dollar(pos.get('entry_price', 0.0))}`\n"
+                    f"• *Exit Price*: `{fmt_dollar(exit_p)}`\n"
+                    f"• *Realized PnL*: `{pnl_str}`\n\n"
+                    f"✨ *Slot Freed*: 1 trading slot is now open and ready for the next setup!"
+                )
+                if not bot_token:
+                    call_cfg = state.get_call_bot_config()
+                    bot_token = call_cfg.get("token") or cfg.call_bot_token or cfg.telegram_token
+                try:
+                    _reply(cid, receipt, bot_token=bot_token)
+                except Exception as e_rep:
+                    log.debug("Error sending position close receipt to %s: %s", cid, e_rep)
+
+    return closed_positions
+
+
+def sync_all_active_users(bot_token: Optional[str] = None) -> None:
+    """Run position sync for all live connected auto-trading users."""
+    auto_users = user_store.get_all_auto_trade_users()
+    for cid, _ in auto_users:
+        try:
+            sync_user_positions_with_bybit(cid, bot_token=bot_token)
+        except Exception as exc:
+            log.debug("Error syncing positions for user %s: %s", cid, exc)

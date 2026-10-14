@@ -713,29 +713,30 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
         notify_entry_filled(pos_perp)
     log.info("Opened PERP order: %s %s @$%.4f qty=%.6f lev=%dx status=%s", ticker, side, entry_mid, perp_qty, lev, pos_perp["status"])
 
-    # Dispatch to connected live Bybit users in parallel
-    try:
-        import exchange_manager
-        sig_payload = {
-            "ticker": ticker,
-            "side": side,
-            "live_price": entry_mid,
-            "trigger_price": entry_mid,
-            "sl": sl,
-            "tp1": tp1,
-            "tp2": tp2,
-            "tf": trade_type,
-        }
-        call_cfg = state.get_call_bot_config()
-        c_tok = call_cfg.get("token") or cfg.call_bot_token or cfg.telegram_token
-        threading.Thread(
-            target=exchange_manager.dispatch_triggered_trade_to_users,
-            args=(sig_payload,),
-            kwargs={"bot_token": c_tok},
-            daemon=True,
-        ).start()
-    except Exception as exc:
-        log.warning("Could not dispatch master order to live connected users: %s", exc)
+    # Dispatch to connected live Bybit users if order filled immediately (market order)
+    if use_market_order:
+        try:
+            import exchange_manager
+            sig_payload = {
+                "ticker": ticker,
+                "side": side,
+                "live_price": entry_mid,
+                "trigger_price": entry_mid,
+                "sl": sl,
+                "tp1": tp1,
+                "tp2": tp2,
+                "tf": trade_type,
+            }
+            call_cfg = state.get_call_bot_config()
+            c_tok = call_cfg.get("token") or cfg.call_bot_token or cfg.telegram_token
+            threading.Thread(
+                target=exchange_manager.dispatch_triggered_trade_to_users,
+                args=(sig_payload,),
+                kwargs={"bot_token": c_tok},
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            log.warning("Could not dispatch master order to live connected users: %s", exc)
 
     # ── 2. Execute SPOT Block ────────────────────────────────────────────────
     # Check if spot trading is enabled via /onspot (disabled via /offspot)
@@ -1038,6 +1039,28 @@ def _sync_with_bybit() -> None:
             if was_working:
                 log.info("Limit order for %s filled on Bybit! Now OPEN.", ticker)
                 notifier.notify_entry_filled(matched_pos)
+                try:
+                    import exchange_manager
+                    sig_payload = {
+                        "ticker": ticker,
+                        "side": b_side,
+                        "live_price": b_entry,
+                        "trigger_price": b_entry,
+                        "sl": matched_pos.get("sl"),
+                        "tp1": matched_pos.get("tp1"),
+                        "tp2": matched_pos.get("tp2"),
+                        "tf": matched_pos.get("trade_type", "scalp"),
+                    }
+                    call_cfg = state.get_call_bot_config()
+                    c_tok = call_cfg.get("token") or cfg.call_bot_token or cfg.telegram_token
+                    threading.Thread(
+                        target=exchange_manager.dispatch_triggered_trade_to_users,
+                        args=(sig_payload,),
+                        kwargs={"bot_token": c_tok},
+                        daemon=True,
+                    ).start()
+                except Exception as exc:
+                    log.warning("Could not dispatch filled limit order to live users: %s", exc)
                 if matched_pos.get("tp1") and not matched_pos.get("partial_tp_placed"):
                     tp_side = "Sell" if b_side == "BUY" else "Buy"
                     p_tp1 = matched_pos["tp1"] * 1000.0 if ticker == "PEPE" else matched_pos["tp1"]
