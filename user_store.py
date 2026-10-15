@@ -310,6 +310,16 @@ def close_user_position(
     return pos
 
 
+def update_user_position(chat_id: Union[str, int], pos_id: str, updates: dict) -> bool:
+    """Update fields of an active open position in user_store."""
+    u = get_user(chat_id)
+    if pos_id in u.get("open_positions", {}):
+        u["open_positions"][pos_id].update(updates)
+        _save_user(chat_id, u)
+        return True
+    return False
+
+
 def close_all_user_positions(
     chat_id: Union[str, int],
     fetch_price_fn: Callable[[str], float],

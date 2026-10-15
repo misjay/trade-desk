@@ -533,6 +533,46 @@ def sync_user_positions_with_bybit(chat_id: Union[str, int], bot_token: Optional
                 except Exception as e_rep:
                     log.debug("Error sending position close receipt to %s: %s", cid, e_rep)
 
+        # Position is STILL ACTIVE on Bybit — check if trailing stop to Break-Even is warranted!
+        else:
+            b_pos = next((p for p in bybit_pos if p.get("symbol") == sym), None)
+            if b_pos and not pos.get("be_trailed"):
+                try:
+                    b_mark = float(b_pos.get("mark_price") or b_pos.get("markPrice") or 0.0)
+                    b_entry = float(b_pos.get("entry_price") or b_pos.get("avgPrice") or pos.get("entry_price", 0.0))
+                    b_side = str(b_pos.get("side", pos.get("side", "Buy"))).upper()
+
+                    if b_entry > 0 and b_mark > 0:
+                        gain_pct = ((b_mark - b_entry) / b_entry * 100.0) if b_side in ("BUY", "LONG") else ((b_entry - b_mark) / b_entry * 100.0)
+                        sl_val = float(pos.get("sl") or 0.0)
+                        risk_dist = abs(b_entry - sl_val) if sl_val > 0 else (b_entry * 0.02)
+                        curr_r = (abs(b_mark - b_entry) / risk_dist) if risk_dist > 0 else 0.0
+
+                        # Trail to Break-Even at +0.35R progress OR +1.0% price gain
+                        if gain_pct >= 1.0 or curr_r >= 0.35:
+                            log.info("Trailing SL to Break-Even for user %s on %s %s (gain: +%.2f%%, +%.2fR)", cid, sym, b_side, gain_pct, curr_r)
+                            be_sl = b_entry * 1000.0 if ticker == "PEPE" else b_entry
+                            be_res = client.set_trading_stop(sym, stop_loss=be_sl)
+                            if be_res:
+                                pos["be_trailed"] = True
+                                pos["sl"] = b_entry
+                                user_store.update_user_position(cid, pid, {"be_trailed": True, "sl": b_entry})
+                                be_receipt = (
+                                    f"🛡️ *Capital Protection Active: {ticker}* 🛡️\n\n"
+                                    f"• *Progress*: `+{gain_pct:.1f}%` (+{curr_r:.2f}R) at `{fmt_dollar(b_mark)}`\n"
+                                    f"• *Action*: Bybit Stop Loss automatically shifted to **Break-Even** (`{fmt_dollar(b_entry)}`)\n"
+                                    f"• *Status*: **$0.00 Risk** (Trade is now 100% Risk-Free!)"
+                                )
+                                if not bot_token:
+                                    call_cfg = state.get_call_bot_config()
+                                    bot_token = call_cfg.get("token") or cfg.call_bot_token or cfg.telegram_token
+                                try:
+                                    _reply(cid, be_receipt, bot_token=bot_token)
+                                except Exception as e_rep:
+                                    log.debug("Error sending BE notification to %s: %s", cid, e_rep)
+                except Exception as e_be:
+                    log.debug("Error checking BE trail for user %s %s: %s", cid, sym, e_be)
+
     return closed_positions
 
 
