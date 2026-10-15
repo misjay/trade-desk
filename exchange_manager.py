@@ -232,9 +232,29 @@ def execute_trade_for_user(
 
     # If NOT connected to a real exchange, execute on user's paper demo portfolio
     if not is_connected:
-        lev = int(user_store.get_user_leverage(cid, t_clean) or 10)
+        user_goal = user_store.get_user_goal(cid)
         u = user_store.get_user(cid)
-        trade_margin = min(1000.0, max(50.0, float(u.get("paper_equity", 10000.0)) * 0.10))
+        paper_eq = float(u.get("paper_equity", 10000.0))
+        lev = int(user_store.get_user_leverage(cid, t_clean) or 10)
+        trade_margin = min(1000.0, max(5.0, paper_eq * 0.10))
+
+        if user_goal:
+            user_store.update_goal_morning_equity_if_new_day(cid, paper_eq)
+            user_goal = user_store.get_user_goal(cid)
+            m_eq = float(user_goal.get("morning_equity", paper_eq))
+            max_loss_pct = float(user_goal.get("max_daily_loss_pct", 5.0))
+            today_pnl = paper_eq - m_eq
+            if m_eq > 0 and (today_pnl / m_eq * 100.0) <= -max_loss_pct:
+                log.info("Goal Guard: Demo user %s reached %s%% daily loss limit ($%.2f). Skipping trade.", cid, max_loss_pct, today_pnl)
+                return False, f"Goal Guard Active: Daily loss cap ({max_loss_pct}%) reached today. Demo trading paused to preserve equity."
+
+            lev = int(user_goal.get("leverage", lev))
+            from goal_tracker import size_goal_trade
+            sl_dist = abs(live_price - sl) / live_price * 100.0 if (live_price > 0 and sl) else 1.2
+            sizing = size_goal_trade(paper_eq, m_eq, sl_dist, leverage=lev, max_daily_loss_pct=max_loss_pct, today_realized_loss=min(0.0, today_pnl))
+            if sizing.get("allowed"):
+                trade_margin = float(sizing.get("margin_usdt", trade_margin))
+
         notional = trade_margin * lev
         qty = round(notional / live_price, 6) if live_price > 0 else 1.0
 
@@ -284,6 +304,30 @@ def execute_trade_for_user(
 
     lev = int(user_store.get_user_leverage(cid, t_clean) or 10)
     risk_usdt = float(ex.get("risk_per_trade_usdt", 50.0))
+
+    # Goal Tracker Guard & Sizing Integration for Live Exchange
+    user_goal = user_store.get_user_goal(cid)
+    if user_goal:
+        try:
+            wb = client.get_wallet_balance("USDT")
+            cur_eq = float(wb.get("equity", 0.0))
+            user_store.update_goal_morning_equity_if_new_day(cid, cur_eq)
+            user_goal = user_store.get_user_goal(cid)
+            m_eq = float(user_goal.get("morning_equity", cur_eq))
+            max_loss_pct = float(user_goal.get("max_daily_loss_pct", 5.0))
+            today_pnl = cur_eq - m_eq
+            if m_eq > 0 and (today_pnl / m_eq * 100.0) <= -max_loss_pct:
+                log.info("Goal Guard: Live user %s reached %s%% daily loss limit ($%.2f). Skipping trade %s.", cid, max_loss_pct, today_pnl, sym)
+                return False, f"Goal Guard Active: Daily loss cap ({max_loss_pct}%) reached today. New trades paused to protect capital."
+
+            lev = int(user_goal.get("leverage", lev))
+            from goal_tracker import size_goal_trade
+            sl_dist = abs(live_price - sl) / live_price * 100.0 if (live_price > 0 and sl) else 1.2
+            sizing = size_goal_trade(cur_eq, m_eq, sl_dist, leverage=lev, max_daily_loss_pct=max_loss_pct, today_realized_loss=min(0.0, today_pnl))
+            if sizing.get("allowed"):
+                risk_usdt = float(sizing.get("margin_usdt", risk_usdt))
+        except Exception as e_goal:
+            log.debug("Goal check exception in exchange_manager for %s: %s", cid, e_goal)
 
     try:
         # A. Set isolated margin and leverage

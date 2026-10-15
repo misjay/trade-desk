@@ -641,6 +641,11 @@ def handle_command(
                 "• `/autotrade <on/off>` — ⚙️ Toggle automated trade execution on/off\n"
                 "• `/risk <USDT>` — ⚖️ Set your margin size per trade (e.g. `/risk 50`)\n"
                 "• `/disconnect` — 🔌 Wipe your API keys and unlink exchange\n\n"
+                "🎯 *Target Growth & Compounding Flight Plan:*\n"
+                "• `/setgoal <START> <TARGET> [DAYS] [LEV] [MAX_LOSS%]` — 🚀 Initialize flight plan (e.g. `/setgoal 10 100 30 5 5`)\n"
+                "• `/goal` — 📊 View daily progress, required compound rate & pacing\n"
+                "• `/goalplan` — 💡 Get highest-conviction setup sized for today's target\n"
+                "• `/cancelgoal` — 🛑 Cancel active growth flight plan\n\n"
                 "⚙️ *Risk Management & Settings:*\n"
                 "• `/leverage <COIN> <VAL>` — ⚡ Set custom leverage (e.g. `/leverage BTC 20`)\n"
                 "• `/existingleverage` — 📊 Show your active leverage settings\n"
@@ -692,6 +697,10 @@ def handle_command(
                 "• `/setfeedbackbot <TOKEN> <CHAT_ID>` — 🤖 Connect another bot for daily feedback\n"
                 "• `/feedbackbot` — 📋 View current feedback bot destination\n"
                 "• `/probation` — 🧪 View 24h quarantined & 50% probation assets\n"
+                "• `/setgoal <START> <TARGET> [DAYS] [LEV] [MAX_LOSS%]` — 🚀 Set target growth plan\n"
+                "• `/goal` — 📊 Progress tracker & compound pacing\n"
+                "• `/goalplan` — 💡 Recommend trade sized for today's target\n"
+                "• `/cancelgoal` — 🛑 Cancel growth plan\n"
                 "• `/leverage <COIN> <VAL>` — ⚡ Set leverage (e.g. `/leverage BTC 10`)\n"
                 "• `/existingleverage` — 📊 Show leverage used for each asset\n"
                 "• `/avoid <COINS>` — 🚫 Blacklist assets (e.g. `/avoid DOGE PEPE`)\n"
@@ -2271,6 +2280,187 @@ def handle_command(
             )
         except ValueError:
             _reply(chat_id, f"❌ Invalid amount: `{args[0]}`. Must be a numeric value like `/risk 50`.", bot_token=_current_bot_token)
+
+    elif cmd in ("/setgoal", "/goalset"):
+        if len(args) < 3:
+            _reply(
+                chat_id,
+                "🎯 *Usage:* `/setgoal <START_USDT> <TARGET_USDT> <DAYS> [LEVERAGE] [MAX_DAILY_LOSS%]`\n\n"
+                "• *Example:* `/setgoal 10 100 30` (Takes $10 to $100 in 30 days @ 5x leverage)\n"
+                "• *Custom:* `/setgoal 10 100 30 5 5` (With 5x leverage and 5% max daily loss)\n\n"
+                "_Winz will calculate your required daily growth rate and recommend adaptive risk-managed trades._",
+                bot_token=_current_bot_token,
+            )
+            return
+
+        try:
+            start_cap = float(args[0].replace("$", "").replace(",", ""))
+            target_cap = float(args[1].replace("$", "").replace(",", ""))
+            days = int(args[2])
+            lev = int(args[3]) if len(args) > 3 else 5
+            max_loss = float(args[4]) if len(args) > 4 else 5.0
+
+            if start_cap <= 0 or target_cap <= start_cap:
+                _reply(chat_id, "❌ Target capital must be greater than starting capital.", bot_token=_current_bot_token)
+                return
+            if days < 1 or days > 365:
+                _reply(chat_id, "❌ Timeframe must be between 1 and 365 days.", bot_token=_current_bot_token)
+                return
+            if lev < 1 or lev > 25:
+                _reply(chat_id, "❌ Goal leverage must be between 1x and 25x.", bot_token=_current_bot_token)
+                return
+            if max_loss < 1.0 or max_loss > 20.0:
+                _reply(chat_id, "❌ Maximum daily loss must be between 1% and 20% of account equity.", bot_token=_current_bot_token)
+                return
+
+            import goal_tracker
+            goal = user_store.set_user_goal(
+                chat_id=chat_id,
+                starting_capital=start_cap,
+                target_capital=target_cap,
+                timeframe_days=days,
+                max_daily_loss_pct=max_loss,
+                leverage=lev,
+            )
+
+            cur_eq = start_cap
+            ex = user_store.get_user_exchange(chat_id)
+            if ex and ex.get("connected"):
+                client = exchange_manager.get_user_bybit_client(chat_id)
+                if client:
+                    try:
+                        bal = client.get_wallet_balance("USDT")
+                        cur_eq = float(bal.get("equity", start_cap))
+                    except Exception:
+                        pass
+            else:
+                u = user_store.get_user(chat_id)
+                cur_eq = float(u.get("paper_equity", start_cap))
+
+            card = goal_tracker.format_goal_progress_card(goal, cur_eq, morning_equity=cur_eq)
+            _reply(
+                chat_id,
+                f"🚀 *Target Growth Flight Plan Initialized!*\n\n{card}",
+                bot_token=_current_bot_token,
+            )
+        except Exception as exc:
+            _reply(chat_id, f"❌ Error initializing goal: {exc}", bot_token=_current_bot_token)
+
+    elif cmd in ("/goal", "/progress", "/flightplan"):
+        goal = user_store.get_user_goal(chat_id)
+        if not goal:
+            _reply(
+                chat_id,
+                "ℹ️ *No Active Target Growth Flight Plan*\n\n"
+                "Launch your compounding growth plan with:\n"
+                "`/setgoal <START_USDT> <TARGET_USDT> <DAYS> [LEVERAGE] [MAX_DAILY_LOSS%]`\n\n"
+                "_Example: `/setgoal 10 100 30` (Takes $10 to $100 in 30 days @ 5x leverage with 5% daily loss cap)_",
+                bot_token=_current_bot_token,
+            )
+            return
+
+        cur_eq = float(goal.get("starting_capital", 10.0))
+        ex = user_store.get_user_exchange(chat_id)
+        if ex and ex.get("connected"):
+            client = exchange_manager.get_user_bybit_client(chat_id)
+            if client:
+                try:
+                    bal = client.get_wallet_balance("USDT")
+                    cur_eq = float(bal.get("equity", cur_eq))
+                except Exception:
+                    pass
+        else:
+            u = user_store.get_user(chat_id)
+            cur_eq = float(u.get("paper_equity", cur_eq))
+
+        user_store.update_goal_morning_equity_if_new_day(chat_id, cur_eq)
+        goal = user_store.get_user_goal(chat_id)
+        m_eq = float(goal.get("morning_equity", cur_eq))
+
+        import goal_tracker
+        card = goal_tracker.format_goal_progress_card(goal, cur_eq, morning_equity=m_eq)
+        _reply(chat_id, card, bot_token=_current_bot_token)
+
+    elif cmd in ("/goalplan", "/recommend", "/dailytrade"):
+        goal = user_store.get_user_goal(chat_id)
+        if not goal:
+            _reply(
+                chat_id,
+                "ℹ️ *No Active Target Goal*\n\n"
+                "Set your target goal first with:\n"
+                "`/setgoal <START> <TARGET> <DAYS>` (e.g. `/setgoal 10 100 30`)",
+                bot_token=_current_bot_token,
+            )
+            return
+
+        cur_eq = float(goal.get("starting_capital", 10.0))
+        ex = user_store.get_user_exchange(chat_id)
+        if ex and ex.get("connected"):
+            client = exchange_manager.get_user_bybit_client(chat_id)
+            if client:
+                try:
+                    bal = client.get_wallet_balance("USDT")
+                    cur_eq = float(bal.get("equity", cur_eq))
+                except Exception:
+                    pass
+        else:
+            u = user_store.get_user(chat_id)
+            cur_eq = float(u.get("paper_equity", cur_eq))
+
+        user_store.update_goal_morning_equity_if_new_day(chat_id, cur_eq)
+        goal = user_store.get_user_goal(chat_id)
+        m_eq = float(goal.get("morning_equity", cur_eq))
+
+        import goal_tracker, scanner
+        btc_regime = scanner.get_btc_macro_regime()
+        candidates = state.get_last_signals()
+        if not candidates:
+            c, e, _ = scanner.run_scan("scalp")
+            candidates = c + e
+
+        rec = goal_tracker.recommend_goal_trade(goal, cur_eq, m_eq, candidates, btc_regime=btc_regime)
+        if not rec.get("has_trade"):
+            _reply(
+                chat_id,
+                f"🛡️ *Goal Flight Plan Recommendation: STAND ASIDE*\n\n"
+                f"• *Status*: `{rec.get('status')}`\n"
+                f"• *Market Regime*: `BTC {btc_regime}`\n"
+                f"• *Reason*: {rec.get('message')}\n\n"
+                f"_Capital preservation is prioritized over forcing low-quality trades._",
+                bot_token=_current_bot_token,
+            )
+            return
+
+        t = rec["trade"]
+        rep_msg = (
+            f"🎯 *TODAY'S TARGET-GROWTH TRADE RECOMMENDATION* 🎯\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• *Asset*: `${t['ticker']}` (*{t['side']}* | {t['tf']})\n"
+            f"• *Conviction*: `{t['conviction']}% Alignment`\n"
+            f"• *Entry Price*: `${t['entry_price']:,.4f}`\n"
+            f"• *Entry Band*: `{t['entry_range']}`\n"
+            f"• *Target 1 (TP)*: `${t['tp1']:,.4f}` (`+{t['tp_dist_pct']:.1f}%`)\n"
+            f"• *Stop Loss (SL)*: `${t['sl']:,.4f}` (`-{t['sl_dist_pct']:.1f}%`)\n"
+            f"• *Risk:Reward*: `1:{t['rr']:.1f}`\n\n"
+            f"⚖️ *Goal Sizing & Risk Calibration*:\n"
+            f"• *Leverage*: `{t['leverage']}x Isolated`\n"
+            f"• *Recommended Margin*: `${t['recommended_margin']:.2f} USDT`\n"
+            f"• *Notional Position Size*: `${t['recommended_notional']:.2f} USDT`\n"
+            f"• *Potential Gain (at TP)*: `+${t['est_gain_usdt']:.2f}` (`+{t['est_return_on_equity_pct']:.1f}%` on equity)\n"
+            f"• *Max Downside (at SL)*: `-${t['est_loss_at_sl']:.2f}` (Safe within 5% daily cap)\n\n"
+            f"🧠 *Institutional Thesis*:\n"
+            f"{t['reason']}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👉 _If auto-trade is enabled, this trade executes automatically when the entry band fills._"
+        )
+        _reply(chat_id, rep_msg, bot_token=_current_bot_token)
+
+    elif cmd in ("/cancelgoal", "/stopgoal"):
+        res = user_store.cancel_user_goal(chat_id)
+        if res:
+            _reply(chat_id, "🛑 *Target Growth Goal CANCELLED.* Your trading parameters have returned to default.", bot_token=_current_bot_token)
+        else:
+            _reply(chat_id, "ℹ️ You do not currently have an active target goal.", bot_token=_current_bot_token)
 
     elif cmd in ("/calls", "/activecalls", "/tracked"):
         summary_text, inline_keyboard = format_active_calls_summary()

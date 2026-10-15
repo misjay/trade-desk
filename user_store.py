@@ -558,3 +558,90 @@ def set_user_has_access(chat_id: Union[str, int], has_access: bool, code: Option
         u["access_revoked_at"] = _now()
     _save_user(chat_id, u)
 
+
+# ── Target Growth & Goal Engine ──────────────────────────────────────────────
+
+def set_user_goal(
+    chat_id: Union[str, int],
+    starting_capital: float,
+    target_capital: float,
+    timeframe_days: int = 30,
+    max_daily_loss_pct: float = 5.0,
+    leverage: int = 5,
+    target_daily_return_pct: Optional[float] = None,
+) -> dict:
+    """Initialize or update a user's target growth goal."""
+    u = get_user(chat_id)
+    now_dt = datetime.now(timezone.utc)
+    
+    # Calculate initial daily return if not provided
+    from goal_tracker import calculate_compound_daily_rate
+    calc_rate = calculate_compound_daily_rate(starting_capital, target_capital, timeframe_days)
+    daily_rate = float(target_daily_return_pct) if target_daily_return_pct else calc_rate
+
+    goal = {
+        "active": True,
+        "starting_capital": round(float(starting_capital), 2),
+        "target_capital": round(float(target_capital), 2),
+        "timeframe_days": int(timeframe_days),
+        "max_daily_loss_pct": round(float(max_daily_loss_pct), 1),
+        "leverage": max(1, min(25, int(leverage))),
+        "target_daily_return_pct": daily_rate,
+        "start_date": now_dt.date().isoformat(),
+        "created_at": now_dt.isoformat(),
+        "morning_equity": round(float(starting_capital), 2),
+        "morning_date": now_dt.date().isoformat(),
+        "daily_history": [],
+    }
+    u["goal"] = goal
+    _save_user(chat_id, u)
+    log.info("User %s initialized growth goal: $%s -> $%s in %d days", chat_id, starting_capital, target_capital, timeframe_days)
+    return goal
+
+
+def get_user_goal(chat_id: Union[str, int]) -> Optional[dict]:
+    """Retrieve user's goal if active, else None."""
+    u = get_user(chat_id)
+    goal = u.get("goal")
+    if goal and goal.get("active"):
+        return dict(goal)
+    return None
+
+
+def cancel_user_goal(chat_id: Union[str, int]) -> bool:
+    """Deactivate user's target goal."""
+    u = get_user(chat_id)
+    if "goal" in u:
+        u["goal"]["active"] = False
+        u["goal"]["cancelled_at"] = _now()
+        _save_user(chat_id, u)
+        return True
+    return False
+
+
+def update_goal_morning_equity_if_new_day(chat_id: Union[str, int], current_equity: float) -> dict:
+    """Updates the morning reference equity at 00:00 UTC rollover for daily 5% loss tracking."""
+    u = get_user(chat_id)
+    goal = u.get("goal")
+    if not goal or not goal.get("active"):
+        return {}
+
+    today_str = datetime.now(timezone.utc).date().isoformat()
+    if goal.get("morning_date") != today_str:
+        # Record previous day snapshot into history
+        prev_m = float(goal.get("morning_equity", current_equity))
+        day_pnl = current_equity - prev_m
+        goal.setdefault("daily_history", []).append({
+            "date": goal.get("morning_date", today_str),
+            "start_equity": prev_m,
+            "end_equity": current_equity,
+            "pnl": round(day_pnl, 2),
+            "pnl_pct": round((day_pnl / prev_m) * 100.0, 2) if prev_m > 0 else 0.0,
+        })
+        # Reset morning baseline
+        goal["morning_equity"] = round(current_equity, 2)
+        goal["morning_date"] = today_str
+        _save_user(chat_id, u)
+
+    return goal
+
