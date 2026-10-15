@@ -634,7 +634,8 @@ def handle_command(
                 "🎯 *Trade Setups & Active Signals:*\n"
                 "• `/calls` — 📋 View active triggered trades & pending entry bands\n"
                 "• `/hourlycalls` — 🚨 View the 15-setup trade desk (6 Scalps + 4 Day + 5 Spot)\n"
-                "• `/spot` — 💎 View 5 Spot Accumulation setups with interactive chart buttons\n\n"
+                "• `/spot` — 💎 View 5 Spot Accumulation setups with interactive chart buttons\n"
+                "• `/radar` — 📡 Scan 350+ unlisted Bybit pairs for opportunistic breakout anomalies\n\n"
                 "🔐 *Automated Exchange Trading (Bybit / CEX):*\n"
                 "• `/connect bybit <KEY> <SECRET>` — ⚡ Connect your Bybit account for automated execution\n"
                 "• `/myexchange` — 💼 View connected account balance, equity & status\n"
@@ -2693,6 +2694,39 @@ def handle_command(
             _reply(chat_id, "\n".join(lines) + _paused_footer())
         
         threading.Thread(target=_do_watchlist_scan, daemon=True, name="tg-watchlist-scan").start()
+
+    elif cmd in ("/radar", "/opportunistic", "/discover"):
+        _reply(chat_id, "📡 *Scanning all 350+ Bybit USDT perpetuals for unlisted opportunistic movers...*", bot_token=_current_bot_token)
+        def _do_radar_sweep():
+            import dynamic_screener
+            candidates = dynamic_screener.sweep_unlisted_opportunities(top_n=5)
+            if not candidates:
+                _reply(chat_id, "ℹ️ *Opportunistic Radar*: No unlisted pair met the $15M+ turnover & 4%+ momentum threshold right now.", bot_token=_current_bot_token)
+                return
+
+            lines = [
+                "⚡ *WINZ WHOLE-EXCHANGE OPPORTUNISTIC RADAR* ⚡",
+                "• *Universe*: `350+ Unlisted Bybit Linear Perps`",
+                "• *Filter*: `Turnover >= $15M USDT + Abnormal Momentum`",
+                "• *Status*: `Ephemeral (One-Time Trade, Never Added to Watchlist)`\n",
+                f"🔥 *Top {len(candidates)} Unlisted Momentum Movers:*",
+            ]
+            for c in candidates:
+                lines.append(
+                    f"• *${c['ticker']}* (`{c['symbol']}`)\n"
+                    f"  Mark: `${c['live_price']:,.4f}` | 24h Vol: `{c['turnover_str']}` | 24h Move: `+{c['price_24h_pct']:.1f}%`\n"
+                )
+
+            # Check if any candidate has an active A+ trigger setup right now
+            triggered_sig = dynamic_screener.run_opportunistic_scan_and_dispatch(manual=True, bot_token=_current_bot_token)
+            if triggered_sig:
+                lines.append(f"\n🚨 *ACTIVE TRIGGER DISPATCHED FOR ${triggered_sig['ticker']}!* See details above.")
+            else:
+                lines.append("\n🛡️ *Order Block Status*: Candidates are floating mid-range. Standing by for clean demand/supply shelf retest before triggering.")
+
+            _reply(chat_id, "\n".join(lines), bot_token=_current_bot_token)
+
+        threading.Thread(target=_do_radar_sweep, daemon=True, name="radar-manual").start()
 
     elif cmd in ("/gencode", "/createcode", "/newcode"):
         if not is_admin(chat_id):

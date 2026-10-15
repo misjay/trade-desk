@@ -373,6 +373,14 @@ def _setup_scheduler():
             name="Daily Ticker Pruning & Quarantine Matrix (24h)",
             replace_existing=True,
         )
+    import dynamic_screener
+    _scheduler.add_job(
+        lambda: dynamic_screener.run_opportunistic_scan_and_dispatch(),
+        trigger=IntervalTrigger(minutes=15),
+        id="opportunistic_radar_sweep",
+        name="Whole-Exchange Opportunistic Radar Sweep (15m)",
+        replace_existing=True,
+    )
 
 
 def run_daily_pruning_job():
