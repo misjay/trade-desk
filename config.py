@@ -181,7 +181,7 @@ CORE_TICKERS: List[str] = [
 EXTRA_TICKERS: List[str] = [
     "ARB", "WLD", "STRK", "APT", "SEI",
     "INJ", "OP", "DOT", "ATOM", "FIL",
-    "RENDER", "FET",
+    "RENDER", "FET", "ARC", "ZEREBRO",
 ]
 
 ALL_TICKERS: List[str] = CORE_TICKERS + EXTRA_TICKERS
@@ -192,7 +192,7 @@ MARKET_ALLOWED_TICKERS: List[str] = ["BTC", "ETH", "SOL", "XRP", "BNB"]
 # Weekend defensive trading universe (high-liquidity majors only)
 WEEKEND_MAJORS_ONLY: List[str] = ["BTC", "ETH", "SOL"]
 
-NO_MARKET_TICKERS: List[str] = ["PEPE", "TAO", "ENA", "HBAR", "NEAR"]
+NO_MARKET_TICKERS: List[str] = ["PEPE", "TAO", "ENA", "HBAR", "NEAR", "ARC", "ZEREBRO"]
 
 
 def is_weekend_derisk_window(now_utc: Optional[datetime] = None) -> bool:

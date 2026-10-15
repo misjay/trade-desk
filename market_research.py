@@ -170,6 +170,18 @@ ASSET_CATALYSTS: Dict[str, Dict[str, str]] = {
         "sector": "Proof of Personhood & Biometric Identity",
         "hook": "most projects optimize for bot activity.\n\n$WLD is anchoring verifiable human identity in an AI agent world.\n\nscarcity of verified attention is the ultimate asymmetric play.",
     },
+    "ARC": {
+        "fundamental": "Decentralized AI agent compute coordination and low-latency LLM execution framework",
+        "speculation": "AI infrastructure narrative rotation and low-cap agentic crypto adoption",
+        "sector": "Decentralized AI Infrastructure",
+        "hook": "most tokens chase surface-level AI wrappers.\n\n$ARC is building the agentic compute coordination layer connecting machine reasoning to on-chain execution.\n\nwhen AI infrastructure reprices, the base rails move first.",
+    },
+    "ZEREBRO": {
+        "fundamental": "Autonomous cross-chain creative AI agent with persistent dynamic RAG memory architecture",
+        "speculation": "Solana AI agent token speculative dominance and hyperstition cultural narrative expansion",
+        "sector": "Autonomous AI Agent Meta",
+        "hook": "most memecoins rely on human attention spans to stay alive.\n\n$ZEREBRO is an autonomous AI agent generating its own culture, media, and liquidity loops 24/7.\n\nthis isn't just a token. it's self-propagating machine culture.",
+    },
 }
 
 TWITTER_HOOKS: Dict[str, str] = {
