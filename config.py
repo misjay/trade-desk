@@ -60,18 +60,18 @@ class Config:
     discord_bot_token: str = field(default_factory=lambda: os.getenv("DISCORD_BOT_TOKEN", ""))
     discord_channel_id: str = field(default_factory=lambda: os.getenv("DISCORD_CHANNEL_ID", ""))
 
-    # Risk: exactly 0.5% of balance per trade
-    risk_per_trade: float = field(default_factory=lambda: float(os.getenv("RISK_PER_TRADE", "0.005")))
+    # Risk: institutional dynamic scaling (1.0% base, 1.5% A+ setups)
+    risk_per_trade: float = field(default_factory=lambda: float(os.getenv("RISK_PER_TRADE", "0.010")))
     paper_equity: float = field(default_factory=lambda: float(os.getenv("PAPER_EQUITY", "10000")))
 
     # Loss Mitigation & Exposure Caps
-    max_concurrent_positions: int = field(default_factory=lambda: int(os.getenv("MAX_CONCURRENT_POSITIONS", "6")))
-    min_free_margin_pct: float = field(default_factory=lambda: float(os.getenv("MIN_FREE_MARGIN_PCT", "0.30")))
-    max_position_notional: float = field(default_factory=lambda: float(os.getenv("MAX_POSITION_NOTIONAL", "25000.0")))
+    max_concurrent_positions: int = field(default_factory=lambda: int(os.getenv("MAX_CONCURRENT_POSITIONS", "8")))
+    min_free_margin_pct: float = field(default_factory=lambda: float(os.getenv("MIN_FREE_MARGIN_PCT", "0.25")))
+    max_position_notional: float = field(default_factory=lambda: float(os.getenv("MAX_POSITION_NOTIONAL", "150000.0")))
 
     # GitHub Best Practices: Hummingbot, Freqtrade, Passivbot parameters
-    max_directional_positions: int = field(default_factory=lambda: int(os.getenv("MAX_DIRECTIONAL_POSITIONS", "3")))
-    max_directional_ratio: float = field(default_factory=lambda: float(os.getenv("MAX_DIRECTIONAL_RATIO", "0.65")))
+    max_directional_positions: int = field(default_factory=lambda: int(os.getenv("MAX_DIRECTIONAL_POSITIONS", "6")))
+    max_directional_ratio: float = field(default_factory=lambda: float(os.getenv("MAX_DIRECTIONAL_RATIO", "0.85")))
     enable_market_regime_filter: bool = field(default_factory=lambda: os.getenv("ENABLE_MARKET_REGIME_FILTER", "true").lower() in ("true", "1", "yes"))
     enable_micro_grid_entry: bool = field(default_factory=lambda: os.getenv("ENABLE_MICRO_GRID_ENTRY", "true").lower() in ("true", "1", "yes"))
     unstuck_timeout_minutes: int = field(default_factory=lambda: int(os.getenv("UNSTUCK_TIMEOUT_MINUTES", "90")))
@@ -85,18 +85,18 @@ class Config:
 
     # Precision Risk & Gatekeeper Parameters
     enable_btc_momentum_gate: bool = field(default_factory=lambda: os.getenv("ENABLE_BTC_MOMENTUM_GATE", "true").lower() in ("true", "1", "yes"))
-    enable_btc_regime_lock: bool = field(default_factory=lambda: os.getenv("ENABLE_BTC_REGIME_LOCK", "true").lower() in ("true", "1", "yes"))
-    enable_strict_4h_confluence: bool = field(default_factory=lambda: os.getenv("ENABLE_STRICT_4H_CONFLUENCE", "true").lower() in ("true", "1", "yes"))
-    enable_wick_confirmation: bool = field(default_factory=lambda: os.getenv("ENABLE_WICK_CONFIRMATION", "true").lower() in ("true", "1", "yes"))
+    enable_btc_regime_lock: bool = field(default_factory=lambda: os.getenv("ENABLE_BTC_REGIME_LOCK", "false").lower() in ("true", "1", "yes"))
+    enable_strict_4h_confluence: bool = field(default_factory=lambda: os.getenv("ENABLE_STRICT_4H_CONFLUENCE", "false").lower() in ("true", "1", "yes"))
+    enable_wick_confirmation: bool = field(default_factory=lambda: os.getenv("ENABLE_WICK_CONFIRMATION", "false").lower() in ("true", "1", "yes"))
     enable_dynamic_kelly_sizing: bool = field(default_factory=lambda: os.getenv("ENABLE_DYNAMIC_KELLY_SIZING", "true").lower() in ("true", "1", "yes"))
-    risk_a_plus: float = field(default_factory=lambda: float(os.getenv("RISK_A_PLUS", "0.0070")))
-    risk_standard: float = field(default_factory=lambda: float(os.getenv("RISK_STANDARD", "0.0045")))
-    risk_weekend_chop: float = field(default_factory=lambda: float(os.getenv("RISK_WEEKEND_CHOP", "0.0030")))
+    risk_a_plus: float = field(default_factory=lambda: float(os.getenv("RISK_A_PLUS", "0.0150")))
+    risk_standard: float = field(default_factory=lambda: float(os.getenv("RISK_STANDARD", "0.0100")))
+    risk_weekend_chop: float = field(default_factory=lambda: float(os.getenv("RISK_WEEKEND_CHOP", "0.0065")))
     enable_daily_pruning: bool = field(default_factory=lambda: os.getenv("ENABLE_DAILY_PRUNING", "true").lower() in ("true", "1", "yes"))
 
     # Global Daily Loss Circuit Breaker: Freeze all trading for 12h if rolling 24h loss exceeds limit
     enable_global_daily_circuit_breaker: bool = field(default_factory=lambda: os.getenv("ENABLE_GLOBAL_DAILY_CIRCUIT_BREAKER", "true").lower() in ("true", "1", "yes"))
-    max_daily_loss_usdt: float = field(default_factory=lambda: float(os.getenv("MAX_DAILY_LOSS_USDT", "500.0")))
+    max_daily_loss_usdt: float = field(default_factory=lambda: float(os.getenv("MAX_DAILY_LOSS_USDT", "5400.0")))
     global_circuit_breaker_freeze_hours: float = field(default_factory=lambda: float(os.getenv("GLOBAL_CIRCUIT_BREAKER_FREEZE_HOURS", "12.0")))
 
     # High-Impact Macro Economic Event Blackout (CPI, FOMC, NFP)
@@ -115,6 +115,21 @@ class Config:
     enable_adaptive_maker_pegging: bool = field(default_factory=lambda: os.getenv("ENABLE_ADAPTIVE_MAKER_PEGGING", "true").lower() in ("true", "1", "yes"))
     enable_climax_early_cut: bool = field(default_factory=lambda: os.getenv("ENABLE_CLIMAX_EARLY_CUT", "true").lower() in ("true", "1", "yes"))
     enable_hwm_drawdown_leverage: bool = field(default_factory=lambda: os.getenv("ENABLE_HWM_DRAWDOWN_LEVERAGE", "true").lower() in ("true", "1", "yes"))
+
+    # 4-Pillar Drawdown Shield & Profit Integrity Parameters
+    max_dollar_loss_cap: float = field(default_factory=lambda: float(os.getenv("MAX_DOLLAR_LOSS_CAP", "150.0")))
+    max_scalp_loss_cap: float = field(default_factory=lambda: float(os.getenv("MAX_SCALP_LOSS_CAP", "10.0")))
+    max_day_loss_cap: float = field(default_factory=lambda: float(os.getenv("MAX_DAY_LOSS_CAP", "35.0")))
+    directional_quarantine_hours: float = field(default_factory=lambda: float(os.getenv("DIRECTIONAL_QUARANTINE_HOURS", "4.0")))
+    quarantine_strike1_hours: float = field(default_factory=lambda: float(os.getenv("QUARANTINE_STRIKE1_HOURS", "2.0")))
+    quarantine_strike2_hours: float = field(default_factory=lambda: float(os.getenv("QUARANTINE_STRIKE2_HOURS", "12.0")))
+    quarantine_strike3_hours: float = field(default_factory=lambda: float(os.getenv("QUARANTINE_STRIKE3_HOURS", "48.0")))
+    quarantine_structural_rsi_short: float = field(default_factory=lambda: float(os.getenv("QUARANTINE_STRUCTURAL_RSI_SHORT", "58.0")))
+    quarantine_structural_rsi_long: float = field(default_factory=lambda: float(os.getenv("QUARANTINE_STRUCTURAL_RSI_LONG", "42.0")))
+    max_short_rsi_cap: float = field(default_factory=lambda: float(os.getenv("MAX_SHORT_RSI_CAP", "68.0")))
+    min_rr_gate: float = field(default_factory=lambda: float(os.getenv("MIN_RR_GATE", "2.0")))
+    be_profit_fee_buffer_pct: float = field(default_factory=lambda: float(os.getenv("BE_PROFIT_FEE_BUFFER_PCT", "0.0025")))
+    enable_pullback_entry_filter: bool = field(default_factory=lambda: os.getenv("ENABLE_PULLBACK_ENTRY_FILTER", "false").lower() in ("true", "1", "yes"))
 
     # Scanner settings
     scalp_tf: int = field(default_factory=lambda: int(os.getenv("SCALP_TF", "15")))
@@ -167,8 +182,21 @@ class Config:
 cfg = Config()
 
 
-# ── Ticker universe ─────────────────────────────────────────────────────────
-# Mandated Core 24 order every run:
+# ── Master Desk Autonomous Trading Universe (Liquid Leaders Only) ───────────
+# Real-money automated trade execution on Bybit is strictly restricted to these proven liquid leaders:
+# Note: ETH and SUI quarantined from 15m scalps due to high wick noise & chronic relative lag. Added ADA (+121.57 USDT profit leader).
+AUTONOMOUS_TRADING_TICKERS: List[str] = [
+    "BTC", "SOL", "XRP", "BNB",
+    "DOGE", "ADA", "LINK", "AVAX", "NEAR",
+]
+
+# Assets quarantined from automated 15m scalps (allowed for Day trades or manual calls only)
+SCALP_QUARANTINE_TICKERS: List[str] = [
+    "ETH", "SUI",
+]
+
+# ── Complete Community & Winz Discord Scanner Universe (All 38 Assets) ─────
+# Retained 100% for Winz Discord Bot, Community Watchlists, Manual Calls & Spot Accumulation:
 CORE_TICKERS: List[str] = [
     "BTC", "ETH", "SOL", "XRP", "BNB",
     "DOGE", "ADA", "LINK", "AVAX", "SUI",
@@ -177,7 +205,6 @@ CORE_TICKERS: List[str] = [
     "PEPE", "ENA", "HBAR", "NEAR",
 ]
 
-# Extras if liquid (24h quote volume >= 50M USDT):
 EXTRA_TICKERS: List[str] = [
     "ARB", "WLD", "STRK", "APT", "SEI",
     "INJ", "OP", "DOT", "ATOM", "FIL",
@@ -186,27 +213,59 @@ EXTRA_TICKERS: List[str] = [
 
 ALL_TICKERS: List[str] = CORE_TICKERS + EXTRA_TICKERS
 
-# Market order allowed ONLY on Tier A if mark inside Entry and slip < 0.15%
-MARKET_ALLOWED_TICKERS: List[str] = ["BTC", "ETH", "SOL", "XRP", "BNB"]
+# 100% Post-Only Maker Discipline: Market orders are eliminated to avoid 0.11% round-trip taker fee leakage.
+MARKET_ALLOWED_TICKERS: List[str] = []
 
-# Weekend defensive trading universe (high-liquidity majors only)
-WEEKEND_MAJORS_ONLY: List[str] = ["BTC", "ETH", "SOL"]
+# Weekend defensive trading universe (strictly top liquid majors)
+WEEKEND_MAJORS_ONLY: List[str] = ["BTC", "ETH", "SOL", "XRP", "BNB", "LINK"]
 
-NO_MARKET_TICKERS: List[str] = ["PEPE", "TAO", "ENA", "HBAR", "NEAR", "ARC", "ZEREBRO"]
+NO_MARKET_TICKERS: List[str] = ALL_TICKERS
+
+# ── Asset Risk & Quality Tiers ──────────────────────────────────────────────
+# Tier 1: Proven Cash Cows & High-Liquidity Momentum Leaders (100% Sizing)
+TIER_1_CASH_COWS: List[str] = [
+    "BTC", "ETH", "SOL", "XRP", "BNB"
+]
+
+# Tier 2: Established Majors & High-Volume DeFi/L1s (70% Sizing)
+TIER_2_MAJORS: List[str] = [
+    "DOGE", "LINK", "AVAX", "NEAR", "SUI", "AAVE", "LTC", "HYPE", "ADA"
+]
+
+# Tier 3: Community & Volatile Assets (35% Micro Sizing for any manual or secondary setups)
+TIER_3_HIGH_CHOP: List[str] = [
+    "HBAR", "TRX", "PEPE", "STRK", "ARB", "ONDO", "OP", "FIL", "ENA", "ZEC", "APT", "SEI", "INJ", "DOT", "ATOM", "FET", "ARC", "ZEREBRO", "UNI", "BCH", "XLM", "TAO", "WLD"
+]
+
+def get_asset_tier(ticker: str) -> int:
+    t = str(ticker).upper().replace("USDT", "").replace("1000", "")
+    if t in TIER_1_CASH_COWS:
+        return 1
+    if t in TIER_2_MAJORS:
+        return 2
+    return 2  # Default to Tier 2 for any liquid extra
+
+def get_asset_risk_multiplier(ticker: str) -> float:
+    tier = get_asset_tier(ticker)
+    if tier == 1:
+        return 1.00
+    if tier == 2:
+        return 0.70
+    return 0.35  # Tier 3 micro-sizing (35%)
 
 
 def is_weekend_derisk_window(now_utc: Optional[datetime] = None) -> bool:
     """
-    Returns True if current UTC time is inside the Friday Afternoon -> Sunday Night derisking window.
-    Window: Friday 14:00 UTC through Sunday 22:00 UTC.
-    Covers US cash session close, CME settlement, and illiquid weekend chop.
+    Returns True if current UTC time is inside the Friday Night -> Sunday Night derisking window.
+    Window: Friday 21:00 UTC (after US NY session close) through Sunday 22:00 UTC.
+    Allows full Friday NY session execution while protecting against illiquid weekend chop.
     """
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
     weekday = now_utc.weekday()  # Monday=0, Friday=4, Saturday=5, Sunday=6
     hour = now_utc.hour
 
-    if weekday == 4 and hour >= 14:  # Friday starting at 14:00 UTC
+    if weekday == 4 and hour >= 21:  # Friday starting at 21:00 UTC (after US market close)
         return True
     if weekday == 5:                 # All of Saturday
         return True

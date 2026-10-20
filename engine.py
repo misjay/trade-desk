@@ -129,8 +129,14 @@ def check_portfolio_inventory_skew(target_side: str) -> Tuple[bool, str]:
 
     # Rule 2: Directional Net Notional Ratio (when both long and short positions exist)
     if len(long_positions) > 0 and len(short_positions) > 0:
-        long_notional = sum(float(p.get("qty", 0.0)) * float(p.get("entry_price", 0.0)) for p in long_positions)
-        short_notional = sum(float(p.get("qty", 0.0)) * float(p.get("entry_price", 0.0)) for p in short_positions)
+        long_notional = sum(
+            float(p.get("qty", 0.0)) * float(p.get("entry_price", 0.0)) * (1000.0 if p.get("ticker") == "PEPE" else 1.0)
+            for p in long_positions
+        )
+        short_notional = sum(
+            float(p.get("qty", 0.0)) * float(p.get("entry_price", 0.0)) * (1000.0 if p.get("ticker") == "PEPE" else 1.0)
+            for p in short_positions
+        )
         total_notional = long_notional + short_notional
 
         if total_notional > 0:
@@ -184,7 +190,7 @@ def check_sector_basket_exposure(ticker: str) -> Tuple[bool, str]:
     return True, f"Sector {sector} capacity available"
 
 
-# ── Balance & Risk Sizing (0.5% balance risk) ───────────────────────────────
+# ── Balance & Risk Sizing (Institutional Dynamic Risk) ──────────────────────
 def get_current_equity() -> float:
     """
     Get current equity for sizing.
@@ -205,15 +211,19 @@ def compute_position_size(
     sl: float,
     equity: float,
     leverage: int,
-    risk_pct: float = 0.005,  # 0.5% balance risk
+    risk_pct: float = 0.010,  # 1.0% institutional base balance risk
+    trade_type: str = "scalp",
 ) -> Tuple[float, float, str]:
     """
-    Compute trade quantity based on 0.5% balance risk:
-      risk_capital = equity * 0.005
+    Compute trade quantity based on dynamic institutional balance risk:
+      risk_capital = equity * risk_pct
       qty = risk_capital / |entry_price - sl|
 
     Guardrails:
-      - If SL would require >1% equity at allowed leverage, cut size.
+      - If SL would require >2% equity at allowed leverage, cut size.
+      - Symmetrical Scalp Loss Cap: Caps max loss on scalps to cfg.max_scalp_loss_cap ($10 max)
+        to ensure losses never outstrip profit targets.
+      - Scale max position notional dynamically with portfolio equity.
       - Ensure notional margin <= available equity.
       - Quantize to Bybit lot step and check minOrderQty.
       - Handle PEPE 1000-multiplier for Bybit Linear perps.
@@ -224,22 +234,32 @@ def compute_position_size(
     if dist <= 0 or entry_price <= 0:
         return 0.0, 0.0, "Invalid SL or entry price"
 
-    risk_capital = equity * risk_pct
+    from config import get_asset_risk_multiplier
+    asset_mult = get_asset_risk_multiplier(ticker)
+
+    risk_capital = equity * risk_pct * asset_mult
     raw_qty = risk_capital / dist
 
-    # Check maximum allowed loss at SL (cap at 1% equity)
-    max_allowed_loss = equity * 0.01
+    # Symmetrical Risk Guard:
+    # On scalps, profit targets average $5 - $15. A full stopout must NEVER exceed $10.00!
+    # On day trades, profit targets average $20 - $50. Stopout is capped at $35.00.
+    target_cap = cfg.max_scalp_loss_cap if trade_type == "scalp" else cfg.max_day_loss_cap
+    max_allowed_loss = min(target_cap, min(equity * 0.015, cfg.max_dollar_loss_cap)) * asset_mult
     if raw_qty * dist > max_allowed_loss:
         raw_qty = max_allowed_loss / dist
+        log.info("🎯 Symmetrical Risk Sizing: Capped %s (%s) risk to max dollar loss $%.2f (multiplier=%.2f, raw_qty=%.4f)", ticker, trade_type, max_allowed_loss, asset_mult, raw_qty)
 
     # Check margin required at given leverage:
     notional = raw_qty * entry_price
 
-    # Hard position notional ceiling:
-    if notional > cfg.max_position_notional:
-        raw_qty = cfg.max_position_notional / entry_price
-        notional = cfg.max_position_notional
-        log.info("Capped %s position notional to $%.2f (raw_qty=%.4f)", ticker, cfg.max_position_notional, raw_qty)
+    # Dynamic institutional position notional ceiling (scales with portfolio equity):
+    is_tier_a_asset = ticker.upper() in ("BTC", "ETH", "SOL", "XRP", "BNB")
+    equity_mult = 1.15 if is_tier_a_asset else 0.85
+    dynamic_max_notional = max(cfg.max_position_notional, equity * equity_mult)
+    if notional > dynamic_max_notional:
+        raw_qty = dynamic_max_notional / entry_price
+        notional = dynamic_max_notional
+        log.info("Capped %s position notional to dynamic institutional cap $%.2f (raw_qty=%.4f)", ticker, dynamic_max_notional, raw_qty)
 
     required_margin = notional / max(1, leverage)
     max_safe_margin = equity * 0.80  # don't tie up more than 80% equity in one trade
@@ -375,12 +395,62 @@ def validate_execution_conditions(
     return True, "VALID"
 
 
+def evict_weakest_working_order(new_conviction: float, min_gap: float = 6.0) -> Optional[dict]:
+    """
+    Smart Slot Upgrade:
+    If the portfolio is at max capacity and a high-conviction A+ setup arrives,
+    find the lowest-conviction (and oldest) unfilled WORKING limit order that is at least
+    `min_gap` conviction points weaker than `new_conviction`. Cancel it on Bybit and remove
+    it from state to free a slot for the A+ setup.
+    """
+    open_pos = state.get_open_positions()
+    working_candidates = []
+    for pid, p in open_pos.items():
+        if p.get("status") == "WORKING":
+            p_conv = float(p.get("conviction", 80.0) or 80.0)
+            if (new_conviction - p_conv) >= min_gap:
+                working_candidates.append((p_conv, str(p.get("opened_at", "")), pid, p))
+
+    if not working_candidates:
+        return None
+
+    # Sort by lowest conviction first, then oldest opened_at
+    working_candidates.sort(key=lambda x: (x[0], x[1]))
+    weak_conv, _, weak_pid, weak_pos = working_candidates[0]
+    weak_sym = weak_pos.get("symbol") or bybit_linear_symbol(weak_pos.get("ticker", ""))
+
+    # Verify it hasn't filled on Bybit in the meantime
+    if not client.is_paper:
+        try:
+            active_syms = {bp.get("symbol") for bp in client.get_active_positions() if float(bp.get("size", 0) or 0) > 0}
+            if weak_sym in active_syms:
+                state.update_open_position(weak_pid, {"status": "OPEN"})
+                return None
+            # Cancel resting limit orders for this working setup
+            oids = list(weak_pos.get("order_ids") or [])
+            if weak_pos.get("order_id") and weak_pos.get("order_id") not in oids:
+                oids.append(weak_pos.get("order_id"))
+            for oid in oids:
+                if oid:
+                    client.cancel_order("linear", weak_sym, order_id=oid)
+        except Exception as exc:
+            log.debug("Smart Slot Upgrade cancel check exception for %s: %s", weak_sym, exc)
+
+    removed = state.remove_open_position(weak_pid)
+    if removed:
+        log.info(
+            "⚡ Smart Slot Upgrade: Cancelled unfilled WORKING order %s (%s, %.1f%% conv) to free slot for A+ setup (%.1f%% conv)",
+            weak_pos.get("ticker"), weak_pos.get("side"), weak_conv, new_conviction
+        )
+    return removed
+
+
 # ── Execution Logic (Perp + Spot) ───────────────────────────────────────────
 def execute_signal(sig: dict) -> Dict[str, Any]:
     """
     Execute a BUY or SELL signal from Trade Desk:
       1. Checks VALID_IF criteria
-      2. Computes position size from 0.5% equity risk
+      2. Computes position size from dynamic institutional equity risk
       3. Places PERP limit order (Post-Only) with isolated margin & leverage
       4. Places SPOT limit order (1x leverage, checked for inventory if SELL)
       5. Records open positions in state store
@@ -398,12 +468,32 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
     tp3 = float(sig["tp3"]) if sig.get("tp3") is not None else None
     sl = float(sig["sl"]) if sig.get("sl") is not None else None
 
+    # Decoupled Execution: Master Desk autonomous trade execution is strictly limited to proven liquid leaders.
+    # Full universe remains 100% active for Winz Discord, Spot desks, and community signals.
+    from config import AUTONOMOUS_TRADING_TICKERS
+    if ticker not in AUTONOMOUS_TRADING_TICKERS:
+        log.info("Master Desk Execution: Skipping %s (reserved for Winz Discord community signals; autonomous desk restricted to liquid leaders: %s)",
+                 ticker, ", ".join(AUTONOMOUS_TRADING_TICKERS))
+        return {"status": "SKIPPED", "reason": f"Asset {ticker} is active for Winz Discord community only; excluded from autonomous trade desk execution."}
+
     if sl is None:
         log.warning("Rejecting %s %s: SL is missing", ticker, side)
         return {"status": "REJECTED", "reason": "SL is missing"}
 
     entry_mid = (entry_low + entry_high) / 2.0
+
+    # Pillar 2: Minimum Risk-to-Reward Gate (1.0:1 for scalps in chop, cfg.min_rr_gate for day trades)
+    min_rr = 1.0 if trade_type == "scalp" else cfg.min_rr_gate
+    if sl is not None and tp1 is not None and entry_mid > 0:
+        sl_dist = abs(entry_mid - sl)
+        tp_dist = abs(tp1 - entry_mid)
+        rr_ratio = tp_dist / max(sl_dist, 1e-9)
+        if rr_ratio < min_rr:
+            log.info("Pillar 2 R:R Gate rejected %s %s: R:R ratio %.2f < %.2f minimum", ticker, side, rr_ratio, min_rr)
+            return {"status": "REJECTED", "reason": f"Risk-to-reward ratio ({rr_ratio:.2f}) is below mandatory {min_rr:.1f}:1 minimum."}
+
     equity = get_current_equity()
+    conviction = float(sig.get("conviction", 80) or 80)
     custom_lev = state.get_custom_leverage(ticker)
     if custom_lev is not None:
         lev = int(custom_lev)
@@ -417,10 +507,6 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
         return {"status": "SKIPPED", "reason": "Bot execution is PAUSED. Send /resume to enable order placement."}
 
     open_pos = state.get_open_positions()
-    if len(open_pos) >= cfg.max_concurrent_positions:
-        log.info("Max concurrent positions reached (%d/%d), rejecting %s", len(open_pos), cfg.max_concurrent_positions, ticker)
-        return {"status": "REJECTED", "reason": f"Max concurrent positions cap reached ({len(open_pos)}/{cfg.max_concurrent_positions})"}
-
     # Per-Ticker Duplicate & Stacking Guard: Never open a duplicate position on the same ticker
     for p in open_pos.values():
         if p.get("ticker") == ticker and p.get("status") in ("OPEN", "WORKING"):
@@ -428,12 +514,31 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
                      ticker, side, p.get("status"), p.get("id"))
             return {"status": "REJECTED", "reason": f"Active {p.get('status')} position already exists for {ticker}"}
 
+    if len(open_pos) >= cfg.max_concurrent_positions:
+        if conviction >= 88.0:
+            evicted = evict_weakest_working_order(conviction, min_gap=6.0)
+            if evicted:
+                open_pos = state.get_open_positions()
+        if len(open_pos) >= cfg.max_concurrent_positions:
+            log.info("Max concurrent positions reached (%d/%d), rejecting %s", len(open_pos), cfg.max_concurrent_positions, ticker)
+            return {"status": "REJECTED", "reason": f"Max concurrent positions cap reached ({len(open_pos)}/{cfg.max_concurrent_positions})"}
+
     perp_sym_check = bybit_linear_symbol(ticker)
     for bp in client.get_active_positions():
         if bp.get("symbol") == perp_sym_check and float(bp.get("size", 0) or 0) > 0:
             log.info("Execution rejected for %s %s: Bybit already has live %s position of size %s",
                      ticker, side, bp.get("side"), bp.get("size"))
             return {"status": "REJECTED", "reason": f"Live Bybit position already open for {perp_sym_check}"}
+
+    # 2-Stage Daily Profit Shield Check (+10% Momentum Filter / +50% Jackpot Lock)
+    profit_shield = state.get_daily_profit_shield_status(equity)
+    if profit_shield["stage"] >= 1 and conviction < profit_shield["min_conviction"]:
+        reason_msg = (
+            f"Daily Profit Shield ({profit_shield['mode']}, +{profit_shield['daily_gain_pct']:.1f}% today): "
+            f"Filtered {ticker} ({conviction:.0f}% < {profit_shield['min_conviction']:.0f}% min conviction)"
+        )
+        log.info("🛡️ %s", reason_msg)
+        return {"status": "SKIPPED", "reason": reason_msg}
 
     # Hummingbot Inventory Skew & Directional Balance Rule
     skew_ok, skew_reason = check_portfolio_inventory_skew(side)
@@ -454,21 +559,25 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
 
     # Dynamic Kelly Risk Sizing (conviction & weekend volatility regime adjustment)
     effective_risk_pct = cfg.risk_per_trade
-    conviction = sig.get("conviction", 80)
     now_utc = datetime.now(timezone.utc)
     in_weekend = is_weekend_derisk_window(now_utc)
 
     if cfg.enable_dynamic_kelly_sizing:
         if in_weekend:
-            # Scale down to defensive 0.25% (or configured chop risk) during Friday 14:00 -> Sunday 22:00 window
-            effective_risk_pct = min(cfg.risk_weekend_chop, 0.0025)
+            # Use configured weekend chop risk (0.65% default) during Friday 21:00 -> Sunday 22:00 window
+            effective_risk_pct = cfg.risk_weekend_chop
             log.info("Weekend Derisk Window active: Applied defensive sizing risk=%.2f%% for %s", effective_risk_pct * 100, ticker)
-        elif conviction >= 92:
+        elif conviction >= 88:
             # Scale up on A+ setups (multi-confluence, OI flush reversal, order book absorption)
             effective_risk_pct = cfg.risk_a_plus
-            log.info("A+ Setup detected (conviction=%d): Applied Kelly scaled risk=%.2f%% for %s", conviction, effective_risk_pct * 100, ticker)
+            log.info("A+ Setup detected (conviction=%.0f): Applied Kelly scaled risk=%.2f%% for %s", conviction, effective_risk_pct * 100, ticker)
         else:
             effective_risk_pct = cfg.risk_standard
+
+    if profit_shield["risk_mult"] < 1.0:
+        effective_risk_pct *= profit_shield["risk_mult"]
+        log.info("🏆 +50%% Daily Jackpot Lock Active (+%.1f%% today): Scaled risk to %.2f%% for %s",
+                 profit_shield["daily_gain_pct"], effective_risk_pct * 100, ticker)
 
     # Sizing calculation
     perp_qty, spot_qty, size_note = compute_position_size(
@@ -478,6 +587,7 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
         equity=equity,
         leverage=lev,
         risk_pct=effective_risk_pct,
+        trade_type=trade_type,
     )
     if perp_qty <= 0:
         log.warning("Position sizing returned 0 for %s: %s", ticker, size_note)
@@ -527,17 +637,10 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
         if ticker == "PEPE":
             current_mark = current_mark / 1000.0
 
-        is_tier_a = ticker in MARKET_ALLOWED_TICKERS
-        is_strictly_inside_entry = (entry_low <= current_mark <= entry_high)
-
-        if is_tier_a and is_strictly_inside_entry:
-            ob = client.get_orderbook(perp_sym, category="linear", limit=25)
-            if ob:
-                _, slip_pct = client.compute_book_slippage(ob, side, perp_qty)
-                if slip_pct < MAX_SLIPPAGE_PCT:
-                    use_market_order = True
-                    log.info("Executing MARKET order for Tier A %s %s: mark $%.4f is inside band with slip %.3f%%",
-                             ticker, side, current_mark, slip_pct)
+        # 100% Post-Only Maker Discipline:
+        # Market orders are disabled across all tickers to eliminate 0.055% taker fee leakage.
+        # All orders rest inside the shelf as Post-Only limits.
+        use_market_order = False
 
         target_tp = perp_tp2 if perp_tp2 else perp_tp1
 
@@ -697,7 +800,9 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
         "tp2": tp2,
         "tp3": tp3,
         "sl": sl,
+        "initial_sl": sl,
         "leverage": lev,
+        "conviction": conviction,
         "order_id": perp_order_id,
         "order_ids": placed_order_ids,
         "micro_grid": is_micro_grid,
@@ -725,7 +830,11 @@ def execute_signal(sig: dict) -> Dict[str, Any]:
                 "sl": sl,
                 "tp1": tp1,
                 "tp2": tp2,
-                "tf": trade_type,
+                "tf": "15m" if trade_type == "scalp" else "4h",
+                "conviction": conviction,
+                "score": conviction,
+                "confidence": conviction,
+                "grade": "A+" if conviction >= 88 else "A",
             }
             call_cfg = state.get_call_bot_config()
             c_tok = call_cfg.get("token") or cfg.call_bot_token or cfg.telegram_token
@@ -900,6 +1009,10 @@ def _sync_with_bybit() -> None:
     if eq > 0:
         state.set_equity(eq)
 
+    # Fetch active Bybit positions first so Step 2 knows whether a closed-pnl record is a partial scale-out or full close
+    bybit_positions = client.get_active_positions(category="linear")
+    bybit_syms = {p["symbol"]: p for p in bybit_positions}
+
     # 2. Check Bybit closed PnL
     closed_records = client.get_closed_pnl(category="linear", limit=20)
     for c in closed_records:
@@ -925,15 +1038,24 @@ def _sync_with_bybit() -> None:
             exit_p = float(c.get("exit_price") or 0.0)
             pnl_u = float(c.get("closed_pnl") or 0.0)
             qty_c = float(c.get("qty") or 0.0)
-            c_side = "BUY" if c.get("side", "").lower() == "buy" else "SELL"
+            # In Bybit closed-pnl, 'side' is the closing order's side (Sell closes Buy, Buy closes Sell)
+            c_side = matched_pos.get("side") if matched_pos else ("SELL" if c.get("side", "").lower() == "buy" else "BUY")
 
             if ticker == "PEPE":
                 entry_p = entry_p / 1000.0
                 exit_p = exit_p / 1000.0
 
             lev = matched_pos.get("leverage", 4) if matched_pos else 4
-            margin = (entry_p * qty_c / max(1, lev)) if (entry_p * qty_c) > 0 else 1.0
+            notional_c = (entry_p * 1000.0 * qty_c) if ticker == "PEPE" else (entry_p * qty_c)
+            margin = (notional_c / max(1, lev)) if notional_c > 0 else 1.0
             pnl_pct = round((pnl_u / margin) * 100, 2)
+
+            is_partial_close = (sym in bybit_syms and float(bybit_syms[sym].get("size", 0)) > 0)
+            exit_reason_str = (
+                f"BYBIT_PARTIAL_{c.get('exec_type', 'TRADE').upper()}"
+                if is_partial_close
+                else f"BYBIT_{c.get('exec_type', 'TRADE').upper()}"
+            )
 
             closed_entry = {
                 "id": f"{ticker}_{c_side}_closed_{order_id[:8]}",
@@ -946,53 +1068,56 @@ def _sync_with_bybit() -> None:
                 "qty": qty_c,
                 "pnl_usdt": round(pnl_u, 4),
                 "pnl_pct": pnl_pct,
-                "exit_reason": f"BYBIT_{c.get('exec_type', 'TRADE').upper()}",
+                "exit_reason": exit_reason_str,
                 "order_id": order_id,
                 "closed_at": datetime.now(timezone.utc).isoformat(),
             }
             state.record_closed_position(closed_entry)
-            if matched_pos_id:
-                state.remove_open_position(matched_pos_id)
-            notifier.notify_trade_closed(closed_entry)
 
-            # Record probation lifecycle outcome if asset was on probation
-            prob_status = state.record_probation_trade(ticker, pnl_u)
-            if prob_status == "GRADUATED":
-                log.info("%s graduated from probation! Restored to full size.", ticker)
-                notifier.send_text(f"🎓 *Probation Graduated:* {ticker} finished 3 probation trades in profit! Restored to 100% position sizing.")
-            elif prob_status == "RE_QUARANTINED":
-                log.info("%s failed probation and re-quarantined for 24h.", ticker)
-                notifier.send_text(f"🚫 *Probation Failed:* {ticker} incurred net loss on probation (${pnl_u:,.2f}). Quarantined on Avoid List for 24h.")
-            elif pnl_u < -1.0:
-                # Real-time 2-loss circuit breaker for individual ticker
-                quar_info = state.check_and_trigger_consecutive_loss_quarantine(ticker)
-                if quar_info:
-                    log.warning("Real-time circuit breaker triggered for %s", ticker)
+            # CRITICAL: Only remove open_position and fire full-close lifecycle if the position is 100% closed on Bybit!
+            if not is_partial_close:
+                if matched_pos_id:
+                    state.remove_open_position(matched_pos_id)
+                notifier.notify_trade_closed(closed_entry)
+
+                # Record probation lifecycle outcome if asset was on probation
+                prob_status = state.record_probation_trade(ticker, pnl_u)
+                if prob_status == "GRADUATED":
+                    log.info("%s graduated from probation! Restored to full size.", ticker)
+                    notifier.send_text(f"🎓 *Probation Graduated:* {ticker} finished 3 probation trades in profit! Restored to 100% position sizing.")
+                elif prob_status == "RE_QUARANTINED":
+                    log.info("%s failed probation and re-quarantined for 24h.", ticker)
+                    notifier.send_text(f"🚫 *Probation Failed:* {ticker} incurred net loss on probation (${pnl_u:,.2f}). Quarantined on Avoid List for 24h.")
+                elif pnl_u < -1.0:
+                    # Real-time 2-loss circuit breaker for individual ticker
+                    quar_info = state.check_and_trigger_consecutive_loss_quarantine(ticker)
+                    if quar_info:
+                        log.warning("Real-time circuit breaker triggered for %s", ticker)
+                        client.cancel_all_orders(category="linear", symbol=sym)
+                        q_hrs = float(quar_info.get("hours", 12.0))
+                        notifier.send_text(
+                            f"🚨 *Instant Circuit Breaker Triggered: {ticker}*\n\n"
+                            f"• *Reason*: Asset suffered 2 consecutive stop-outs.\n"
+                            f"• *Action*: Automatically quarantined on Avoid List for {q_hrs:.0f} hours.\n"
+                            f"• *Outcome*: All resting limit orders purged. Capital protected from repeated drawdowns."
+                        )
+
+                # Global 24h Account Loss Circuit Breaker check
+                gcb = state.check_and_trigger_global_daily_circuit_breaker()
+                if gcb:
+                    log.warning("Global daily circuit breaker triggered: loss -$%.2f", gcb.get("loss_24h", 0.0))
                     notifier.send_text(
-                        f"🚨 *Instant Circuit Breaker Triggered: {ticker}*\n\n"
-                        f"• *Reason*: Asset suffered 2 consecutive stop-outs.\n"
-                        f"• *Action*: Automatically quarantined on Avoid List for 24 hours.\n"
-                        f"• *Outcome*: Capital protected from repeated drawdowns."
+                        f"🛑 *GLOBAL ACCOUNT CIRCUIT BREAKER TRIGGERED*\n\n"
+                        f"• *24h Realized Loss*: **-${gcb.get('loss_24h', 0.0):,.2f} USDT**\n"
+                        f"• *Threshold*: -${cfg.max_daily_loss_usdt:,.2f} USDT\n"
+                        f"• *Action*: All automated trade entries **FROZEN for {gcb.get('hours', 12.0):.0f} hours**.\n"
+                        f"• *Protection*: Portfolio drawdown capped. Existing open positions remain monitored with active trailing stops."
                     )
 
-            # Global 24h Account Loss Circuit Breaker check
-            gcb = state.check_and_trigger_global_daily_circuit_breaker()
-            if gcb:
-                log.warning("Global daily circuit breaker triggered: loss -$%.2f", gcb.get("loss_24h", 0.0))
-                notifier.send_text(
-                    f"🛑 *GLOBAL ACCOUNT CIRCUIT BREAKER TRIGGERED*\n\n"
-                    f"• *24h Realized Loss*: **-${gcb.get('loss_24h', 0.0):,.2f} USDT**\n"
-                    f"• *Threshold*: -${cfg.max_daily_loss_usdt:,.2f} USDT\n"
-                    f"• *Action*: All automated trade entries **FROZEN for {gcb.get('hours', 12.0):.0f} hours**.\n"
-                    f"• *Protection*: Portfolio drawdown capped. Existing open positions remain monitored with active trailing stops."
-                )
-
     # 3. Check Bybit active positions
-    bybit_positions = client.get_active_positions(category="linear")
-    bybit_syms = {p["symbol"]: p for p in bybit_positions}
     local_positions = state.get_open_positions()
 
-    for sym, bp in bybit_syms.items():
+    for sym, bp in list(bybit_syms.items()):
         ticker = sym.replace("USDT", "")
         if ticker.startswith("1000"):
             ticker = ticker[4:]
@@ -1018,6 +1143,20 @@ def _sync_with_bybit() -> None:
                 matched_pos = p
                 break
 
+        # Auto-clean leftover dust positions (< $50 notional on Master Desk) so they never clog a portfolio slot
+        b_notional = b_qty * b_mark * (1000.0 if ticker == "PEPE" else 1.0)
+        if b_notional < 50.0:
+            close_side = "Sell" if b_side == "BUY" else "Buy"
+            log.info("Auto-cleaning dust position on Bybit: %s %s qty=%s (notional=$%.2f)", sym, b_side, b_qty, b_notional)
+            client.close_position_market(sym, side=close_side, qty=b_qty, category="linear")
+            if matched_id:
+                state.remove_open_position(matched_id)
+            bybit_syms.pop(sym, None)
+            continue
+
+        last_sig = state.get_last_signal(ticker)
+        sig_matches_side = bool(last_sig and str(last_sig.get("side", "")).upper() == b_side)
+
         if matched_pos:
             was_working = (matched_pos.get("status") == "WORKING")
             updates = {
@@ -1030,8 +1169,30 @@ def _sync_with_bybit() -> None:
             }
             if b_tp and not matched_pos.get("tp1"):
                 updates["tp1"] = b_tp / 1000.0 if ticker == "PEPE" else b_tp
+            elif not matched_pos.get("tp1") and sig_matches_side and last_sig.get("tp1"):
+                updates["tp1"] = last_sig.get("tp1")
+            if not matched_pos.get("tp2") and sig_matches_side and last_sig.get("tp2"):
+                updates["tp2"] = last_sig.get("tp2")
+            if not matched_pos.get("tp3") and sig_matches_side and last_sig.get("tp3"):
+                updates["tp3"] = last_sig.get("tp3")
             if b_sl and not matched_pos.get("sl"):
                 updates["sl"] = b_sl / 1000.0 if ticker == "PEPE" else b_sl
+            if not matched_pos.get("initial_sl"):
+                if sig_matches_side and last_sig.get("sl"):
+                    updates["initial_sl"] = last_sig.get("sl")
+                elif matched_pos.get("sl"):
+                    updates["initial_sl"] = matched_pos.get("sl")
+
+            # Fallback: if tp1 is still None, compute institutional +1.5R / +2.5R / +3.5R targets from initial_sl
+            eff_init_sl = updates.get("initial_sl") or matched_pos.get("initial_sl") or updates.get("sl") or matched_pos.get("sl")
+            if not (updates.get("tp1") or matched_pos.get("tp1")) and eff_init_sl:
+                r_d = abs(b_entry - float(eff_init_sl))
+                if r_d / max(b_entry, 1e-9) < 0.001:
+                    r_d = b_entry * 0.012
+                dec = 9 if ticker == "PEPE" else 5
+                updates["tp1"] = round(b_entry + 1.5 * r_d if b_side == "BUY" else b_entry - 1.5 * r_d, dec)
+                updates["tp2"] = round(b_entry + 2.5 * r_d if b_side == "BUY" else b_entry - 2.5 * r_d, dec)
+                updates["tp3"] = round(b_entry + 3.5 * r_d if b_side == "BUY" else b_entry - 3.5 * r_d, dec)
 
             state.update_open_position(matched_id, updates)
             matched_pos.update(updates)
@@ -1041,6 +1202,8 @@ def _sync_with_bybit() -> None:
                 notifier.notify_entry_filled(matched_pos)
                 try:
                     import exchange_manager
+                    m_conv = float(matched_pos.get("conviction") or (last_sig.get("conviction") if sig_matches_side else 85.0) or 85.0)
+                    m_tt = str(matched_pos.get("trade_type", "scalp")).lower()
                     sig_payload = {
                         "ticker": ticker,
                         "side": b_side,
@@ -1049,7 +1212,11 @@ def _sync_with_bybit() -> None:
                         "sl": matched_pos.get("sl"),
                         "tp1": matched_pos.get("tp1"),
                         "tp2": matched_pos.get("tp2"),
-                        "tf": matched_pos.get("trade_type", "scalp"),
+                        "tf": "15m" if m_tt == "scalp" else "4h",
+                        "conviction": m_conv,
+                        "score": m_conv,
+                        "confidence": m_conv,
+                        "grade": "A+" if m_conv >= 88 else "A",
                     }
                     call_cfg = state.get_call_bot_config()
                     c_tok = call_cfg.get("token") or cfg.call_bot_token or cfg.telegram_token
@@ -1129,20 +1296,29 @@ def _sync_with_bybit() -> None:
                                          ticker, p_tp1, half_qty, tp_res.get("orderId"))
         else:
             # Active on Bybit but missing locally
-            pos_id = f"{ticker}_{b_side}_perp_{uuid.uuid4().hex[:8]}"
+            rec_tp1 = (b_tp / 1000.0 if (b_tp and ticker == "PEPE") else b_tp) or (last_sig.get("tp1") if sig_matches_side else None)
+            rec_tp2 = last_sig.get("tp2") if sig_matches_side else None
+            rec_tp3 = last_sig.get("tp3") if sig_matches_side else None
+            rec_sl = (b_sl / 1000.0 if (b_sl and ticker == "PEPE") else b_sl) or (last_sig.get("sl") if sig_matches_side else None)
+            rec_init_sl = (last_sig.get("sl") if sig_matches_side else None) or rec_sl
+            rec_type = (last_sig.get("trade_type") if sig_matches_side else None) or "scalp"
+            pos_id = f"{ticker}_{b_side}_perp_{rec_type}_{uuid.uuid4().hex[:8]}"
             new_pos = {
                 "id": pos_id,
                 "ticker": ticker,
                 "symbol": sym,
                 "side": b_side,
                 "market": "perp",
-                "trade_type": "scalp",
+                "trade_type": rec_type,
                 "entry_price": b_entry,
                 "mark_price": b_mark,
                 "unrealised_pnl": b_pnl,
                 "qty": b_qty,
-                "tp1": b_tp / 1000.0 if (b_tp and ticker == "PEPE") else b_tp,
-                "sl": b_sl / 1000.0 if (b_sl and ticker == "PEPE") else b_sl,
+                "tp1": rec_tp1,
+                "tp2": rec_tp2,
+                "tp3": rec_tp3,
+                "sl": rec_sl,
+                "initial_sl": rec_init_sl,
                 "leverage": b_lev,
                 "status": "OPEN",
                 "opened_at": datetime.now(timezone.utc).isoformat(),
@@ -1153,8 +1329,16 @@ def _sync_with_bybit() -> None:
 
         # Check Early Break-Even / Multi-Step Ratchet Trail condition
         tp1 = matched_pos.get("tp1")
-        b_sl_orig = float(matched_pos.get("sl") or b_entry)
-        risk_dist = abs(b_entry - b_sl_orig) if abs(b_entry - b_sl_orig) > 0 else (b_entry * 0.01)
+        b_sl_orig = float(matched_pos.get("initial_sl") or matched_pos.get("sl") or b_entry)
+        if abs(b_entry - b_sl_orig) / max(b_entry, 1e-9) < 0.001:
+            # SL is already at Break-Even; use standard 1.2% risk distance and ensure tp0_hit/be_trailed are flagged
+            risk_dist = b_entry * 0.012
+            if not matched_pos.get("be_trailed") or not matched_pos.get("tp0_hit"):
+                state.update_open_position(matched_id, {"be_trailed": True, "tp0_hit": True})
+                matched_pos["be_trailed"] = True
+                matched_pos["tp0_hit"] = True
+        else:
+            risk_dist = abs(b_entry - b_sl_orig)
 
         # Watchdog: Ensure every active position always has a hard exchange Stop Loss on Bybit
         if b_sl is None and not matched_pos.get("sl_attached"):
@@ -1175,25 +1359,25 @@ def _sync_with_bybit() -> None:
         if cfg.enable_ratchet_trail and not matched_pos.get("tp2_hit"):
             curr_r = (b_mark - b_entry) / risk_dist if b_side == "BUY" else (b_entry - b_mark) / risk_dist
 
-            # Level 4 Ratchet: at +1.75R progress, lock in +0.80R guaranteed profit on Bybit
-            if curr_r >= 1.75 and not matched_pos.get("ratchet_l4"):
-                lock_p = round(b_entry + (risk_dist * 0.80) if b_side == "BUY" else b_entry - (risk_dist * 0.80), 8)
-                log.info("Ratchet Level 4 (+1.75R) reached on Bybit for %s %s! Locking +0.80R @%.4f", ticker, b_side, lock_p)
+            # Level 4 Ratchet: at +2.50R progress, lock in +1.50R guaranteed runner profit on Bybit
+            if curr_r >= 2.50 and not matched_pos.get("ratchet_l4"):
+                lock_p = round(b_entry + (risk_dist * 1.50) if b_side == "BUY" else b_entry - (risk_dist * 1.50), 8)
+                log.info("Ratchet Level 4 (+2.50R) reached on Bybit for %s %s! Locking +1.50R @%.4f", ticker, b_side, lock_p)
                 state.update_open_position(matched_id, {"ratchet_l4": True, "ratchet_l3": True, "be_trailed": True, "sl": lock_p})
                 matched_pos["ratchet_l4"] = True
                 matched_pos["sl"] = lock_p
                 be_sl = lock_p * 1000.0 if ticker == "PEPE" else lock_p
                 client.set_trading_stop(sym, stop_loss=be_sl)
                 notifier.send_text(
-                    f"🔒 *Super Profit Lock Active: {ticker}*\n\n"
+                    f"🚀 *Major Profit Runner Engaged: {ticker}*\n\n"
                     f"• *Current Gain*: +{curr_r:.2f}R (`{fmt_dollar(b_mark)}`)\n"
-                    f"• *Action*: Exchange Stop Loss shifted to **+{0.80:.2f}R** profit (`{fmt_dollar(lock_p)}`)\n"
-                    f"• *Status*: Trade guaranteed to close in green."
+                    f"• *Action*: Exchange Stop Loss shifted to **+{1.50:.2f}R** profit (`{fmt_dollar(lock_p)}`)\n"
+                    f"• *Status*: Substantial institutional runner profit locked in!"
                 )
-            # Level 3 Ratchet: at +1.10R progress, lock in +0.35R guaranteed profit on Bybit
-            elif curr_r >= 1.10 and not matched_pos.get("ratchet_l3"):
-                lock_p = round(b_entry + (risk_dist * 0.35) if b_side == "BUY" else b_entry - (risk_dist * 0.35), 8)
-                log.info("Ratchet Level 3 (+1.10R) reached on Bybit for %s %s! Locking +0.35R @%.4f", ticker, b_side, lock_p)
+            # Level 3 Ratchet: at +1.75R progress, lock in +0.80R guaranteed green profit
+            elif curr_r >= 1.75 and not matched_pos.get("ratchet_l3"):
+                lock_p = round(b_entry + (risk_dist * 0.80) if b_side == "BUY" else b_entry - (risk_dist * 0.80), 8)
+                log.info("Ratchet Level 3 (+1.75R) reached on Bybit for %s %s! Locking +0.80R @%.4f", ticker, b_side, lock_p)
                 state.update_open_position(matched_id, {"ratchet_l3": True, "be_trailed": True, "sl": lock_p})
                 matched_pos["ratchet_l3"] = True
                 matched_pos["sl"] = lock_p
@@ -1202,51 +1386,29 @@ def _sync_with_bybit() -> None:
                 notifier.send_text(
                     f"🔒 *Guaranteed Profit Lock Active: {ticker}*\n\n"
                     f"• *Current Gain*: +{curr_r:.2f}R (`{fmt_dollar(b_mark)}`)\n"
-                    f"• *Action*: Exchange Stop Loss shifted to **+{0.35:.2f}R** profit (`{fmt_dollar(lock_p)}`)\n"
-                    f"• *Status*: Adverse reversal profit lock engaged."
+                    f"• *Action*: Exchange Stop Loss shifted to **+{0.80:.2f}R** profit (`{fmt_dollar(lock_p)}`)\n"
+                    f"• *Status*: Green profit locked in. Position running to TP1 & TP2!"
                 )
-            # Level 2 Ratchet (TP0 Micro Scale-Out & Break-Even): at +0.50R progress or >= +1.5% gain, bank 33% profit into cash and move SL to Break-Even
-            elif (curr_r >= 0.50 or abs((b_mark - b_entry) / b_entry) >= 0.015) and not matched_pos.get("tp0_hit"):
-                log.info("TP0 reached for %s %s (+%.2fR)! Executing 33%% micro scale-out and trailing SL to Break-Even @%.4f", ticker, b_side, curr_r, b_entry)
-                tp0_qty = client.quantize_qty(sym, b_qty * 0.33, category="linear")
-                close_side = "Sell" if b_side == "BUY" else "Buy"
-                if tp0_qty > 0 and not client.is_paper:
-                    try:
-                        client.close_position_market(sym, side=close_side, qty=tp0_qty, category="linear")
-                    except Exception as e_tp0:
-                        log.warning("TP0 market scale-out attempt failed: %s", e_tp0)
-                
-                state.update_open_position(matched_id, {"tp0_hit": True, "be_trailed": True, "sl": b_entry, "tp0_closed_qty": tp0_qty})
-                matched_pos["tp0_hit"] = True
+            # Level 2 Ratchet: at +1.25R progress, trail SL to Break-Even + fee buffer (+0.15R)
+            elif curr_r >= 1.25 and not matched_pos.get("be_trailed"):
+                be_buf = round(b_entry + (risk_dist * 0.15) if b_side == "BUY" else b_entry - (risk_dist * 0.15), 8)
+                log.info("Break-Even Ratchet (+1.25R) reached for %s %s! Trailing SL to BE+Fees @%.4f", ticker, b_side, be_buf)
+                state.update_open_position(matched_id, {"be_trailed": True, "sl": be_buf})
                 matched_pos["be_trailed"] = True
-                matched_pos["sl"] = b_entry
-                be_sl = b_entry * 1000.0 if ticker == "PEPE" else b_entry
+                matched_pos["sl"] = be_buf
+                be_sl = be_buf * 1000.0 if ticker == "PEPE" else be_buf
                 client.set_trading_stop(sym, stop_loss=be_sl)
                 gain_pct = ((b_mark - b_entry) / b_entry * 100.0) if b_side == "BUY" else ((b_entry - b_mark) / b_entry * 100.0)
                 notifier.send_text(
-                    f"💰 *TP0 Early Profit Banked: {ticker}* 💰\n\n"
-                    f"• *Progress*: +{curr_r:.2f}R (+{gain_pct:.1f}%) at `{fmt_dollar(b_mark)}`\n"
-                    f"• *Action*: Realized **33%** profit ({tp0_qty} contracts banked into balance)!\n"
-                    f"• *Exchange Stop Loss*: Snapped to Break-Even (`{fmt_dollar(b_entry)}`)\n"
-                    f"• *Downside Risk*: **$0.00** (Remaining 67% position is 100% Risk-Free!)"
-                )
-            elif curr_r >= 0.50 and not matched_pos.get("be_trailed"):
-                log.info("Early +0.50R reached for %s %s! Trailing SL to Break-Even @%.4f", ticker, b_side, b_entry)
-                state.update_open_position(matched_id, {"be_trailed": True, "sl": b_entry})
-                matched_pos["be_trailed"] = True
-                matched_pos["sl"] = b_entry
-                be_sl = b_entry * 1000.0 if ticker == "PEPE" else b_entry
-                client.set_trading_stop(sym, stop_loss=be_sl)
-                notifier.send_text(
                     f"🛡️ *Capital Protection Active: {ticker}*\n\n"
-                    f"• *Progress*: +{curr_r:.2f}R reached at `{fmt_dollar(b_mark)}`\n"
-                    f"• *Action*: Exchange Stop Loss shifted to Break-Even (`{fmt_dollar(b_entry)}`)\n"
-                    f"• *Downside Risk*: **$0.00** (Risk-free trade)"
+                    f"• *Progress*: +{curr_r:.2f}R (+{gain_pct:.1f}%) reached at `{fmt_dollar(b_mark)}`\n"
+                    f"• *Action*: Exchange Stop Loss shifted to Break-Even + Fees (`{fmt_dollar(be_buf)}`)\n"
+                    f"• *Downside Risk*: **$0.00** (100% Risk-Free trade running toward TP1 & TP2!)"
                 )
-            # Level 1 Ratchet: at +0.35R progress, cut max loss by 50% (-0.5R)
-            elif curr_r >= 0.35 and not matched_pos.get("ratchet_l1") and not matched_pos.get("be_trailed"):
+            # Level 1 Ratchet: at +0.75R progress, cut max loss by 50% (-0.5R)
+            elif curr_r >= 0.75 and not matched_pos.get("ratchet_l1") and not matched_pos.get("be_trailed"):
                 half_sl = round(b_entry - (risk_dist * 0.50) if b_side == "BUY" else b_entry + (risk_dist * 0.50), 8)
-                log.info("Ratchet Level 1 (+0.35R) reached on Bybit for %s %s! Reduced risk to -0.5R @%.4f", ticker, b_side, half_sl)
+                log.info("Ratchet Level 1 (+0.75R) reached on Bybit for %s %s! Reduced risk to -0.5R @%.4f", ticker, b_side, half_sl)
                 state.update_open_position(matched_id, {"ratchet_l1": True, "sl": half_sl})
                 matched_pos["ratchet_l1"] = True
                 matched_pos["sl"] = half_sl
@@ -1258,6 +1420,44 @@ def _sync_with_bybit() -> None:
                     f"• *Action*: Exchange Stop Loss tightened to -0.5R (`{fmt_dollar(half_sl)}`)\n"
                     f"• *Downside Risk*: Cut in half (50% max drawdown reduction)"
                 )
+            # Active BTC Shock Shield: if BTC surges/dumps >= 0.35% against open altcoin trade before Break-Even
+            elif not matched_pos.get("be_trailed") and ticker != "BTC":
+                try:
+                    btc_ok, _ = scanner.check_btc_momentum_gate(b_side)
+                    if not btc_ok:
+                        if curr_r >= 0.08:
+                            log.info("BTC Shock Shield: %s %s in slight green (+%.2fR) during adverse BTC impulse! Snapping SL to BE @%.4f", ticker, b_side, curr_r, b_entry)
+                            state.update_open_position(matched_id, {"be_trailed": True, "btc_shock_tightened": True, "sl": b_entry})
+                            matched_pos["be_trailed"] = True
+                            matched_pos["btc_shock_tightened"] = True
+                            matched_pos["sl"] = b_entry
+                            be_sl = b_entry * 1000.0 if ticker == "PEPE" else b_entry
+                            client.set_trading_stop(sym, stop_loss=be_sl)
+                            notifier.send_text(
+                                f"🛡️ *BTC Shock Shield (Instant Break-Even): {ticker}*\n\n"
+                                f"• *Trigger*: Adverse BTC impulse detected while holding {b_side} (+{curr_r:.2f}R)\n"
+                                f"• *Action*: Exchange Stop Loss snapped to **Break-Even** (`{fmt_dollar(b_entry)}`)\n"
+                                f"• *Downside Risk*: **$0.00** (100% protected from BTC squeeze)"
+                            )
+                        elif -0.42 <= curr_r < 0.08 and not matched_pos.get("ratchet_l1") and not matched_pos.get("btc_shock_tightened"):
+                            half_sl = round(b_entry - (risk_dist * 0.50) if b_side == "BUY" else b_entry + (risk_dist * 0.50), 8)
+                            valid_half = (b_side == "BUY" and half_sl < b_mark) or (b_side == "SELL" and half_sl > b_mark)
+                            if valid_half:
+                                log.info("BTC Shock Shield: Tightening %s %s SL by 50%% (-0.50R @%.4f) due to adverse BTC impulse!", ticker, b_side, half_sl)
+                                state.update_open_position(matched_id, {"ratchet_l1": True, "btc_shock_tightened": True, "sl": half_sl})
+                                matched_pos["ratchet_l1"] = True
+                                matched_pos["btc_shock_tightened"] = True
+                                matched_pos["sl"] = half_sl
+                                half_sl_val = half_sl * 1000.0 if ticker == "PEPE" else half_sl
+                                client.set_trading_stop(sym, stop_loss=half_sl_val)
+                                notifier.send_text(
+                                    f"🛡️ *BTC Shock Shield (-0.50R Risk Cut): {ticker}*\n\n"
+                                    f"• *Trigger*: Adverse BTC impulse detected against open {b_side}\n"
+                                    f"• *Action*: Exchange Stop Loss tightened by **50% (-0.50R)** (`{fmt_dollar(half_sl)}`)\n"
+                                    f"• *Protection*: 50% of risk capital shielded while allowing room against fakeout wicks."
+                                )
+                except Exception as e_bsh:
+                    log.debug("BTC Shock Shield check error for %s: %s", ticker, e_bsh)
 
         tp2 = matched_pos.get("tp2")
 
@@ -1332,31 +1532,41 @@ def _sync_with_bybit() -> None:
                         sl_send = new_sl * 1000.0 if ticker == "PEPE" else new_sl
                         client.set_trading_stop(sym, stop_loss=sl_send)
 
-        # Passivbot / Freqtrade Unstucking / Time-Decay Derisking:
-        # If position has been open > cfg.unstuck_timeout_minutes without reaching TP1:
-        if not matched_pos.get("be_trailed") and not matched_pos.get("tp1_hit") and not matched_pos.get("unstuck"):
-            opened_at_str = matched_pos.get("opened_at")
-            if opened_at_str:
-                try:
-                    open_dt = datetime.fromisoformat(opened_at_str.replace("Z", "+00:00"))
-                    age_mins = (datetime.now(timezone.utc) - open_dt).total_seconds() / 60.0
+        # Passivbot / Freqtrade Unstucking & 4H Stale Scalp Time-Stop:
+        opened_at_str = matched_pos.get("opened_at")
+        if opened_at_str:
+            try:
+                open_dt = datetime.fromisoformat(opened_at_str.replace("Z", "+00:00"))
+                age_mins = (datetime.now(timezone.utc) - open_dt).total_seconds() / 60.0
+                curr_r_check = (b_mark - b_entry) / risk_dist if b_side == "BUY" else (b_entry - b_mark) / risk_dist
+
+                # 4-Hour Stale Scalp Time-Stop: auto-scratch stagnant scalps (>240m) stuck in chop (-0.35R to +0.40R)
+                if matched_pos.get("trade_type", "scalp") == "scalp" and age_mins >= 240.0 and (-0.35 <= curr_r_check <= 0.40):
+                    close_side = "Sell" if b_side == "BUY" else "Buy"
+                    log.info("Stale Scalp Time-Stop: Closing stagnant %s %s open %.1f mins (curr_r=%.2fR) to free slot.", ticker, b_side, age_mins, curr_r_check)
+                    client.close_position_market(sym, side=close_side, qty=b_qty, category="linear")
+                    continue
+
+                if not matched_pos.get("be_trailed") and not matched_pos.get("tp1_hit") and not matched_pos.get("unstuck"):
                     if age_mins >= cfg.unstuck_timeout_minutes:
                         is_profitable = (b_side == "BUY" and b_mark >= b_entry) or (b_side == "SELL" and b_mark <= b_entry)
                         if is_profitable:
-                            log.info("Passivbot Unstucking: %s %s open %.1f mins with stalled momentum. Trailing SL to BE.", ticker, b_side, age_mins)
+                            log.info("Passivbot Unstucking: %s %s open %.1f mins with stalled momentum. Trailing SL to BE+Fees.", ticker, b_side, age_mins)
                             state.update_open_position(matched_id, {"be_trailed": True, "unstuck": True})
                             matched_pos["be_trailed"] = True
                             matched_pos["unstuck"] = True
-                            be_sl = b_entry * 1000.0 if ticker == "PEPE" else b_entry
+                            fee_buf = b_entry * cfg.be_profit_fee_buffer_pct
+                            be_sl_price = b_entry + fee_buf if b_side == "BUY" else b_entry - fee_buf
+                            be_sl = be_sl_price * 1000.0 if ticker == "PEPE" else be_sl_price
                             client.set_trading_stop(sym, stop_loss=be_sl)
                             notifier.send_text(
                                 f"⚡ *Passivbot Unstucking Routine Active: {ticker}*\n\n"
                                 f"• *Duration*: Position active for {int(age_mins)} mins without reaching TP1.\n"
-                                f"• *Action*: Exchange Stop Loss shifted to Break-Even (`{fmt_dollar(b_entry)}`).\n"
-                                f"• *Risk*: Adverse reversal drawdown eliminated."
+                                f"• *Action*: Exchange Stop Loss shifted to Fee-Protected Break-Even (`{fmt_dollar(be_sl_price)}`).\n"
+                                f"• *Risk*: Adverse reversal drawdown eliminated; fees guaranteed covered."
                             )
-                except Exception as exc:
-                    log.debug("Error checking unstuck for %s: %s", ticker, exc)
+            except Exception as exc:
+                log.debug("Error checking unstuck for %s: %s", ticker, exc)
 
     # 4. Working orders & spot check
     open_linear_orders = client.get_open_orders(category="linear")
@@ -1364,40 +1574,92 @@ def _sync_with_bybit() -> None:
     open_spot_orders = client.get_open_orders(category="spot")
     spot_order_ids = {o.get("orderId") for o in open_spot_orders if o.get("orderId")}
 
-    # Cancel any resting orders older than 20 minutes (TTL) to prevent capital lockup
-    # Or adaptively re-peg maker orders inside shelf if price starts moving away
+    # Cancel any resting ENTRY orders older than 20 minutes (TTL) to prevent capital lockup
+    # Or adaptively re-peg unfilled maker ENTRY orders inside shelf if price starts moving away.
+    # CRITICAL: Never cancel or re-peg reduceOnly orders, SL/TP trigger orders, or opposite-side TP orders on active positions!
     now_ms = int(time.time() * 1000)
     for o in open_linear_orders:
         created_time = int(o.get("createdTime", 0) or 0)
         oid = o.get("orderId")
         sym = o.get("symbol")
-        side = o.get("side")
+        side = o.get("side", "")
         order_price = float(o.get("price", 0.0) or 0.0)
         age_ms = now_ms - created_time
 
+        is_reduce_only = o.get("reduceOnly") in (True, "true", "True", 1)
+        stop_order_type = str(o.get("stopOrderType", "") or "")
+        order_type = str(o.get("orderType", "") or "")
+
+        if is_reduce_only or stop_order_type or order_type.lower() != "limit":
+            continue
+
+        if sym in bybit_syms:
+            # Position is already open on Bybit!
+            # Only expire same-side unfilled second micro-grid entry legs after 20m TTL; never touch opposite-side TP orders.
+            if side.upper() == str(bybit_syms[sym].get("side", "")).upper():
+                if created_time > 0 and age_ms > (20 * 60 * 1000):
+                    log.info("Cancelling expired second micro-grid entry leg: %s %s ID=%s", sym, side, oid)
+                    client.cancel_order("linear", sym, oid)
+            continue
+
         if created_time > 0 and age_ms > (20 * 60 * 1000):
-            log.info("Cancelling expired linear resting order: %s %s ID=%s", sym, side, oid)
+            log.info("Cancelling expired linear resting entry order: %s %s ID=%s", sym, side, oid)
             client.cancel_order("linear", sym, oid)
         elif cfg.enable_adaptive_maker_pegging and created_time > 0 and (3 * 60 * 1000) <= age_ms <= (15 * 60 * 1000):
-            # Check if live mark is drifting away while order is unfilled
+            # Check if live mark is drifting away while entry order is unfilled
             tick = client.get_ticker(sym, category="linear")
             if tick and order_price > 0:
                 mark = float(tick.get("mark_price", 0.0) or 0.0)
-                # If BUY and mark is drifting 0.20% higher than resting bid:
+                pegged_p = None
                 if side.upper() == "BUY" and (mark - order_price) / order_price >= 0.0020:
-                    pegged_p = client.quantize_price(sym, order_price * 1.0008, category="linear")
-                    if pegged_p < mark:
-                        log.info("Adaptive Maker Pegging: Nudging %s BUY limit from $%.4f to $%.4f (mark=$%.4f)", sym, order_price, pegged_p, mark)
-                        client.cancel_order("linear", sym, oid)
-                        # Re-quote pegged limit order
-                        client.place_order(category="linear", symbol=sym, side="BUY", order_type="Limit", qty=float(o.get("qty")), price=pegged_p, time_in_force="PostOnly")
-                # If SELL and mark is drifting 0.20% lower than resting ask:
+                    cand_p = client.quantize_price(sym, order_price * 1.0008, category="linear")
+                    if cand_p < mark:
+                        pegged_p = cand_p
                 elif side.upper() == "SELL" and (order_price - mark) / order_price >= 0.0020:
-                    pegged_p = client.quantize_price(sym, order_price * 0.9992, category="linear")
-                    if pegged_p > mark:
-                        log.info("Adaptive Maker Pegging: Nudging %s SELL limit from $%.4f to $%.4f (mark=$%.4f)", sym, order_price, pegged_p, mark)
-                        client.cancel_order("linear", sym, oid)
-                        client.place_order(category="linear", symbol=sym, side="SELL", order_type="Limit", qty=float(o.get("qty")), price=pegged_p, time_in_force="PostOnly")
+                    cand_p = client.quantize_price(sym, order_price * 0.9992, category="linear")
+                    if cand_p > mark:
+                        pegged_p = cand_p
+
+                if pegged_p is not None:
+                    # Find matching WORKING position in local state so we preserve SL/TP and update order_id
+                    work_pid = None
+                    work_pos = None
+                    for pid, p in state.get_open_positions().items():
+                        if bybit_linear_symbol(p.get("ticker", "")) == sym and p.get("market") == "perp":
+                            work_pid = pid
+                            work_pos = p
+                            break
+
+                    p_sl = None
+                    p_tp = None
+                    if work_pos:
+                        mult = 1000.0 if work_pos.get("ticker") == "PEPE" else 1.0
+                        if work_pos.get("sl"):
+                            p_sl = float(work_pos["sl"]) * mult
+                        raw_tp = work_pos.get("tp2") or work_pos.get("tp1")
+                        if raw_tp:
+                            p_tp = float(raw_tp) * mult
+
+                    log.info("Adaptive Maker Pegging: Nudging %s %s entry limit from $%.4f to $%.4f (mark=$%.4f)", sym, side.upper(), order_price, pegged_p, mark)
+                    client.cancel_order("linear", sym, oid)
+                    new_resp = client.place_order(
+                        category="linear",
+                        symbol=sym,
+                        side=side.upper(),
+                        order_type="Limit",
+                        qty=float(o.get("qty")),
+                        price=pegged_p,
+                        time_in_force="PostOnly",
+                        stop_loss=p_sl,
+                        take_profit=p_tp,
+                    )
+                    if new_resp and new_resp.get("orderId"):
+                        new_oid = new_resp["orderId"]
+                        linear_order_ids.add(new_oid)
+                        if work_pid and work_pos:
+                            old_ids = [x for x in work_pos.get("order_ids", []) if x != oid]
+                            old_ids.append(new_oid)
+                            state.update_open_position(work_pid, {"order_id": new_oid, "order_ids": old_ids})
 
     for o in open_spot_orders:
         created_time = int(o.get("createdTime", 0) or 0)
@@ -1480,17 +1742,19 @@ def _monitor_paper_positions() -> None:
                     f"• *Action*: Trailed Stop Loss to **+{0.75:.2f}R** profit (`{fmt_dollar(lock_price)}`)\n"
                     f"• *Status*: Trade cannot finish with less than +0.75R gain."
                 )
-            # Level 2 Ratchet: at +1.0R progress, move to Break-Even
+            # Level 2 Ratchet: at +1.0R progress, move to Fee-Protected Break-Even
             elif curr_r >= 1.0 and not pos.get("be_trailed"):
-                log.info("Ratchet Level 2 (+1.0R) reached for paper %s %s! Trailing SL to BE @%.4f", ticker, side, entry_p)
-                state.update_open_position(pos_id, {"be_trailed": True, "sl": entry_p})
+                fee_buf = entry_p * cfg.be_profit_fee_buffer_pct
+                lock_be = round(entry_p + fee_buf if side == "BUY" else entry_p - fee_buf, 8)
+                log.info("Ratchet Level 2 (+1.0R) reached for paper %s %s! Trailing SL to BE+Fees @%.4f", ticker, side, lock_be)
+                state.update_open_position(pos_id, {"be_trailed": True, "sl": lock_be})
                 pos["be_trailed"] = True
-                pos["sl"] = entry_p
+                pos["sl"] = lock_be
                 notifier.send_text(
                     f"🛡️ *Capital Protection Active: {ticker}*\n\n"
                     f"• *Progress*: +{curr_r:.2f}R reached at `{fmt_dollar(live)}`\n"
-                    f"• *Action*: Stop Loss shifted to Break-Even (`{fmt_dollar(entry_p)}`)\n"
-                    f"• *Downside Risk*: **$0.00** (Risk-free trade)"
+                    f"• *Action*: Stop Loss shifted to Fee-Protected Break-Even (`{fmt_dollar(lock_be)}`)\n"
+                    f"• *Downside Risk*: **$0.00** (Net profit secured after fees)"
                 )
             # Level 1 Ratchet: at +0.70R progress, cut max loss by 50% (-0.5R)
             elif curr_r >= 0.70 and not pos.get("ratchet_l1") and not pos.get("be_trailed"):
@@ -1588,10 +1852,12 @@ def _monitor_paper_positions() -> None:
                     f"• *30% Runner*: Dynamic trailing stop active targeting TP3 expansion (`{fmt_dollar(tp3)}`)."
                 )
             elif tp1 is not None and live >= tp1 and not pos.get("tp1_hit"):
-                state.update_open_position(pos_id, {"tp1_hit": True, "be_trailed": True, "sl": entry_p})
+                fee_buf = entry_p * cfg.be_profit_fee_buffer_pct
+                lock_be = round(entry_p + fee_buf, 8)
+                state.update_open_position(pos_id, {"tp1_hit": True, "be_trailed": True, "sl": lock_be})
                 pos["tp1_hit"] = True
                 pos["be_trailed"] = True
-                pos["sl"] = entry_p
+                pos["sl"] = lock_be
                 notifier.notify_tp1_be(pos, live)
             elif pos.get("runner_active"):
                 peak = pos.get("runner_peak", live)
@@ -1630,10 +1896,12 @@ def _monitor_paper_positions() -> None:
                     f"• *30% Runner*: Dynamic trailing stop active targeting TP3 expansion (`{fmt_dollar(tp3)}`)."
                 )
             elif tp1 is not None and live <= tp1 and not pos.get("tp1_hit"):
-                state.update_open_position(pos_id, {"tp1_hit": True, "be_trailed": True, "sl": entry_p})
+                fee_buf = entry_p * cfg.be_profit_fee_buffer_pct
+                lock_be = round(entry_p - fee_buf, 8)
+                state.update_open_position(pos_id, {"tp1_hit": True, "be_trailed": True, "sl": lock_be})
                 pos["tp1_hit"] = True
                 pos["be_trailed"] = True
-                pos["sl"] = entry_p
+                pos["sl"] = lock_be
                 notifier.notify_tp1_be(pos, live)
             elif pos.get("runner_active"):
                 trough = pos.get("runner_trough", live)

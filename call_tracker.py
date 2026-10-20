@@ -283,6 +283,16 @@ def check_tracked_calls_once() -> None:
 
         # 4. Check Entry Fill Status or Pre-Entry Setup Invalidation
         if not entry_filled:
+            # Check Stale Setup TTL Expiration (Scalp > 2h, Day > 12h)
+            max_ttl_seconds = 7200 if str(tf).lower() in ("15m", "15", "scalp") else 43200
+            if age_seconds >= max_ttl_seconds:
+                updates["is_closed"] = True
+                updates["status"] = "EXPIRED"
+                updates["invalidated_at"] = now_utc.isoformat()
+                log.info("Tracked unfilled setup %s %s expired after %d hours", ticker, side, int(age_seconds // 3600))
+                state.update_tracked_call(cid, updates)
+                continue
+
             # Check if price invalidated the setup BEFORE filling entry (e.g. blew past SL before ever entering band)
             pre_entry_invalidated = (live_price <= sl) if side == "BUY" else (live_price >= sl)
             if pre_entry_invalidated:
@@ -304,22 +314,49 @@ def check_tracked_calls_once() -> None:
                 continue
 
             if side == "BUY" and live_price <= (entry_high * 1.0005):
-                entry_filled = True
-                updates["entry_filled"] = True
-                updates["status"] = "ACTIVE"
-                updates["trigger_price"] = live_price
-                updates["triggered_at"] = now_utc.isoformat()
-                log.info("Tracked call %s BUY entry filled at mark $%.4f (zone $%.4f–$%.4f)", cid, live_price, entry_low, entry_high)
+                entry_hit = True
             elif side == "SELL" and live_price >= (entry_low * 0.9995):
-                entry_filled = True
-                updates["entry_filled"] = True
-                updates["status"] = "ACTIVE"
-                updates["trigger_price"] = live_price
-                updates["triggered_at"] = now_utc.isoformat()
-                log.info("Tracked call %s SELL entry filled at mark $%.4f (zone $%.4f–$%.4f)", cid, live_price, entry_low, entry_high)
+                entry_hit = True
             else:
+                entry_hit = False
+
+            if not entry_hit:
                 # Still waiting for price to retest entry band
                 continue
+
+            # Pre-Trigger BTC Momentum Gatekeeper: cancel unfilled altcoin call if BTC is surging/dumping against it
+            if ticker.upper() != "BTC":
+                try:
+                    from scanner import check_btc_momentum_gate
+                    gate_ok, gate_reason = check_btc_momentum_gate(side)
+                    if not gate_ok:
+                        updates["is_closed"] = True
+                        updates["status"] = "INVALIDATED_BTC_SHOCK"
+                        updates["invalidated_at"] = now_utc.isoformat()
+                        log.info("Tracked unfilled setup %s %s cancelled at trigger due to BTC Shock Shield: %s", ticker, side, gate_reason)
+                        _send_alert(
+                            f"🛡️ *{type_prefix}SETUP CANCELLED (BTC SHOCK SHIELD)* 🛡️\n\n"
+                            f"• *Asset*: `${ticker}` ({tf} {side}){age_str}\n"
+                            f"• *Entry Band*: `{fmt_dollar(entry_low)} – {fmt_dollar(entry_high)}`\n"
+                            f"• *Current Mark*: `{fmt_dollar(live_price)}`\n"
+                            f"• *Reason*: `{gate_reason}`\n\n"
+                            f"🚫 *Action:* Unfilled order cancelled prior to entry to protect against adverse BTC impulse.",
+                            category="triggers"
+                        )
+                        state.update_tracked_call(cid, updates)
+                        continue
+                except Exception as e_gate:
+                    log.debug("Call tracker BTC gate check error: %s", e_gate)
+
+            entry_filled = True
+            updates["entry_filled"] = True
+            updates["status"] = "ACTIVE"
+            updates["trigger_price"] = live_price
+            updates["triggered_at"] = now_utc.isoformat()
+            if sl and not call.get("initial_sl"):
+                updates["initial_sl"] = sl
+                call["initial_sl"] = sl
+            log.info("Tracked call %s %s entry filled at mark $%.4f (zone $%.4f–$%.4f)", cid, side, live_price, entry_low, entry_high)
 
             # Notify that trade has triggered and is now active
             base_key = f"{ticker}_{tf}_{round(entry_mid, 4)}"
@@ -350,6 +387,9 @@ def check_tracked_calls_once() -> None:
                     sig_payload = dict(call)
                     sig_payload.update(updates)
                     sig_payload["live_price"] = live_price
+                    sig_payload["confidence"] = call.get("confidence", 85)
+                    sig_payload["grade"] = call.get("grade", "A+")
+                    sig_payload["score"] = call.get("score", 85)
                     threading.Thread(
                         target=exchange_manager.dispatch_triggered_trade_to_users,
                         args=(sig_payload,),
@@ -373,8 +413,41 @@ def check_tracked_calls_once() -> None:
 
         # ── 6. Check Early Profit Protection & Ratchet Profit Locking ─────
         be_trailed = call.get("be_trailed", False)
-        risk_dist = abs(entry_mid - sl) if sl and abs(entry_mid - sl) > 0 else (entry_mid * 0.015)
+        orig_sl = float(call.get("initial_sl") or call.get("orig_sl") or sl or 0.0)
+        if orig_sl > 0 and abs(entry_mid - orig_sl) > 0 and not call.get("initial_sl"):
+            updates["initial_sl"] = orig_sl
+            call["initial_sl"] = orig_sl
+        risk_dist = abs(entry_mid - orig_sl) if orig_sl and abs(entry_mid - orig_sl) > 0 else (entry_mid * 0.015)
         curr_r = gain_pct / ((risk_dist / entry_mid) * 100.0) if risk_dist > 0 else 0.0
+
+        # Tier 0: Active BTC Shock Shield for Open Altcoin Calls (pre-Breakeven)
+        if ticker.upper() != "BTC" and not be_trailed and not call.get("tp0_hit") and not call.get("tp1_hit") and not call.get("btc_shock_shielded"):
+            try:
+                from scanner import check_btc_momentum_gate
+                btc_ok, _ = check_btc_momentum_gate(side)
+                if not btc_ok:
+                    if curr_r >= 0.08:
+                        updates["be_trailed"] = True
+                        updates["btc_shock_shielded"] = True
+                        updates["sl"] = entry_mid
+                        call["be_trailed"] = True
+                        call["btc_shock_shielded"] = True
+                        call["sl"] = entry_mid
+                        sl = entry_mid
+                        be_trailed = True
+                        log.info("BTC Shock Shield snapped tracked call %s (%s) SL to Break-Even ($%.4f)", ticker, side, entry_mid)
+                    elif -0.42 <= curr_r < 0.08 and risk_dist > 0:
+                        tight_sl = round(entry_mid - (risk_dist * 0.50) if side == "BUY" else entry_mid + (risk_dist * 0.50), 8)
+                        is_tighter = (tight_sl > sl) if side == "BUY" else (tight_sl < sl)
+                        if is_tighter:
+                            updates["btc_shock_shielded"] = True
+                            updates["sl"] = tight_sl
+                            call["btc_shock_shielded"] = True
+                            call["sl"] = tight_sl
+                            sl = tight_sl
+                            log.info("BTC Shock Shield tightened tracked call %s (%s) SL by 50%% to $%.4f (-0.50R)", ticker, side, tight_sl)
+            except Exception as e_btc_call:
+                log.debug("BTC Shock Shield check in call_tracker error: %s", e_btc_call)
 
         # Level 4 Ratchet: at +1.75R, lock +0.80R guaranteed profit
         if curr_r >= 1.75 and not call.get("ratchet_l4"):
@@ -409,31 +482,17 @@ def check_tracked_calls_once() -> None:
                 f"• *Action*: Trailing Stop shifted to **+0.35R** profit (`{fmt_dollar(lock_p)}`)\n"
                 f"• *Status*: Adverse reversal profit lock engaged. Guaranteed green exit."
             )
-        # Level 2 Ratchet (TP0 Micro-Scaleout & Break-Even): at +0.50R or >= +1.5% profit, bank 33% profit and snap to BE
-        elif not call.get("tp0_hit") and not call.get("tp1_hit") and (curr_r >= 0.50 or gain_pct >= 1.5):
-            updates["tp0_hit"] = True
-            updates["be_trailed"] = True
-            updates["sl"] = entry_mid
-            call["tp0_hit"] = True
-            call["be_trailed"] = True
-            call["sl"] = entry_mid
-            _send_alert(
-                f"💰 *{type_prefix}TP0 EARLY PROFIT BANKED: ${ticker}* 💰\n\n"
-                f"• *Current Gain*: `+{gain_pct:.1f}%` (+{curr_r:.2f}R @ `{fmt_dollar(live_price)}`)\n"
-                f"• *Action*: Bank **33%** profit now at market!\n"
-                f"• *Stop Loss*: Trailed to Entry Break-Even (`{fmt_dollar(entry_mid)}`)\n"
-                f"• *Status*: First profit slice secured into cash. Remaining 67% is **100% RISK-FREE** running toward TP1 & TP2!"
-            )
-        elif not be_trailed and not call.get("tp1_hit") and (curr_r >= 0.50 or gain_pct >= 1.5):
+        # Level 2 Ratchet (Break-Even): at +1.25R progress or >= +2.5% profit, snap SL to BE
+        elif not be_trailed and not call.get("tp1_hit") and (curr_r >= 1.25 or gain_pct >= 2.5):
             updates["be_trailed"] = True
             updates["sl"] = entry_mid
             call["be_trailed"] = True
             call["sl"] = entry_mid
             _send_alert(
-                f"🛡️ *{type_prefix}EARLY CAPITAL PROTECTION ACTIVE: ${ticker}* 🛡️\n\n"
+                f"🛡️ *{type_prefix}CAPITAL PROTECTION ACTIVE: ${ticker}* 🛡️\n\n"
                 f"• *Current Gain*: `+{gain_pct:.1f}%` (+{curr_r:.2f}R @ `{fmt_dollar(live_price)}`)\n"
                 f"• *Action*: Stop Loss trailed to Entry Breakeven (`{fmt_dollar(entry_mid)}`)\n"
-                f"• *Status*: Trade is now **100% RISK-FREE**. Downside loss eliminated!"
+                f"• *Status*: Trade is now **100% RISK-FREE** running toward TP1 & TP2!"
             )
 
         # ── 6b. Check Stop Exits (Locked Profit / Breakeven / Original SL) ─
@@ -462,7 +521,7 @@ def check_tracked_calls_once() -> None:
                 updates["sl_hit"] = True
                 updates["is_closed"] = True
                 updates["status"] = "CLOSED_BREAKEVEN"
-                profit_note = "TP0 (33%) profit was secured in cash earlier" if tp0_hit else ("TP1 (50%) profit was secured earlier" if tp1_hit else "Trade floated into profit and trailed stop protected capital")
+                profit_note = "TP0 (50%) profit was secured in cash earlier" if tp0_hit else ("TP1 (50%) profit was secured earlier" if tp1_hit else "Trade floated into profit and trailed stop protected capital")
                 _send_alert(
                     f"🛡️ *{type_prefix}BREAKEVEN STOP TRIGGERED* 🛡️\n\n"
                     f"• *Asset*: `${ticker}` ({tf} {side}){age_str}\n"
