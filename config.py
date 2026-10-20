@@ -191,9 +191,7 @@ AUTONOMOUS_TRADING_TICKERS: List[str] = [
 ]
 
 # Assets quarantined from automated 15m scalps (allowed for Day trades or manual calls only)
-SCALP_QUARANTINE_TICKERS: List[str] = [
-    "ETH", "SUI",
-]
+SCALP_QUARANTINE_TICKERS: List[str] = []
 
 # ── Complete Community & Winz Discord Scanner Universe (All 38 Assets) ─────
 # Retained 100% for Winz Discord Bot, Community Watchlists, Manual Calls & Spot Accumulation:

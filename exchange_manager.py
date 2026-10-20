@@ -335,11 +335,7 @@ def execute_trade_for_user(
             log.info("🛡️ %s blocked %s for user %s", reason, t_clean, cid)
             return False, reason
 
-    # 2d. Scalp Quarantine Gate: Do not execute scalps on quarantined high-noise assets
-    from config import SCALP_QUARANTINE_TICKERS
-    if timeframe == "15m" and t_clean in SCALP_QUARANTINE_TICKERS:
-        log.info("🛡️ Scalp Quarantine blocked %s for user %s: High noise / lag asset quarantined from scalping.", t_clean, cid)
-        return False, f"Asset {t_clean} is temporarily quarantined from 15m scalps due to high noise or chronic relative weakness."
+    # 2d. All Winz assets permitted on Winz using Xira's methodology & dynamic guardrails
 
     sig_score = float((signal_metadata or {}).get("score") or (signal_metadata or {}).get("confidence") or (signal_metadata or {}).get("conviction") or 85.0)
 
@@ -361,14 +357,7 @@ def execute_trade_for_user(
         record_shielded_setup(cid, t_clean, side_clean, dq_reason)
         return False, dq_reason
 
-    # Xira Model Integration: Restrict auto-trading strictly to liquid leaders
-    from config import AUTONOMOUS_TRADING_TICKERS
-    if t_clean not in AUTONOMOUS_TRADING_TICKERS:
-        log.info("Winz Auto-Trade: Skipping %s (autonomous trading restricted to liquid leaders: %s)",
-                 t_clean, ", ".join(AUTONOMOUS_TRADING_TICKERS))
-        record_shielded_setup(cid, t_clean, side_clean, "Excluded: Liquid leaders only")
-        return False, f"Asset {t_clean} is excluded (Xira liquid leaders only)"
-
+    # Xira Methodology: All Winz assets permitted using Xira's institutional framework
     # 3. BTC Momentum Gatekeeper (Real-time Altcoin Protection against Squeezes & Dumps)
     if t_clean != "BTC":
         try:
@@ -381,16 +370,16 @@ def execute_trade_for_user(
         except Exception as e_gate:
             log.debug("BTC Momentum Gate check error: %s", e_gate)
 
-    # Pillar 2: Minimum Risk-to-Reward Gate (1.0:1 for scalps in chop, 1.2:1 for 4H day trades)
+    # Xira Methodology: Minimum Risk-to-Reward Gate (Strictly >= 2.0:1 institutional standard across all Winz assets)
     if sl and tp1 and live_price > 0:
         sl_dist = abs(live_price - sl)
         tp_dist = abs(tp1 - live_price)
         rr_ratio = tp_dist / max(sl_dist, 1e-9)
-        min_user_rr = 1.0 if str(timeframe).lower() in ("15m", "15", "scalp") else 1.2
+        min_user_rr = max(2.0, cfg.min_rr_gate)
         if rr_ratio < min_user_rr:
-            log.info("Pillar 2 R:R Gate: Skipped %s %s for user %s: R:R ratio %.2f < %.2f minimum.", t_clean, side_clean, cid, rr_ratio, min_user_rr)
+            log.info("Xira R:R Gate: Skipped %s %s for user %s: R:R ratio %.2f < %.2f minimum.", t_clean, side_clean, cid, rr_ratio, min_user_rr)
             record_shielded_setup(cid, t_clean, side_clean, f"R:R Ratio {rr_ratio:.2f} < {min_user_rr:.1f}:1 min")
-            return False, f"R:R Gate: Risk-to-reward ratio ({rr_ratio:.2f}) below {min_user_rr:.1f}:1 minimum."
+            return False, f"Xira R:R Gate: Risk-to-reward ratio ({rr_ratio:.2f}) below {min_user_rr:.1f}:1 minimum."
 
     # 4. Mode Filter (Sniper, Hybrid 70/30, Normal)
     user_mode = user_store.get_user_auto_trade_mode(cid)
@@ -602,20 +591,13 @@ def execute_trade_for_user(
         # A. Set isolated margin and leverage
         client.set_isolated_margin_and_leverage(sym, lev)
 
-        # B. Calculate order quantity using True Risk-Normalized Sizing (Pillar 1)
-        is_scalp_exec = str(timeframe).lower() in ("15m", "15", "scalp")
-        max_sl_dist = 0.0125 if is_scalp_exec else 0.022
+        # B. Xira Methodology: True Structural Stop Loss & Risk-Normalized Position Sizing across all Winz assets
         if sl and live_price > 0:
             stop_dist_pct = abs(live_price - sl) / live_price
-            if stop_dist_pct > max_sl_dist:
-                old_sl = sl
-                sl = live_price * (1.0 - max_sl_dist) if side_clean == "BUY" else live_price * (1.0 + max_sl_dist)
-                sl = client.quantize_price(sym, sl, category="linear")
-                stop_dist_pct = max_sl_dist
-                log.info("🎯 Tightened %s scalp SL from $%.4f to $%.4f (capped to %.2f%% max risk distance)", sym, old_sl, sl, max_sl_dist * 100.0)
+            sl = client.quantize_price(sym, sl, category="linear")
         else:
-            stop_dist_pct = 0.0125
-            sl = live_price * (1.0 - 0.0125) if side_clean == "BUY" else live_price * (1.0 + 0.0125)
+            stop_dist_pct = 0.018
+            sl = live_price * (1.0 - 0.018) if side_clean == "BUY" else live_price * (1.0 + 0.018)
             sl = client.quantize_price(sym, sl, category="linear")
 
         target_notional = risk_usdt / max(stop_dist_pct, 0.005)
