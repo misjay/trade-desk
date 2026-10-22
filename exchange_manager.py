@@ -978,49 +978,14 @@ def sync_user_positions_with_bybit(chat_id: Union[str, int], bot_token: Optional
                             risk_dist = b_entry * 0.015
                         curr_r = (((b_mark - b_entry) / risk_dist) if is_buy else ((b_entry - b_mark) / risk_dist)) if risk_dist > 0 else 0.0
 
-                        # A. Check Stale Scalp Time-Stop (Free up slots if stuck in flat chop)
-                        opened_at_str = pos.get("opened_at") or pos.get("created_at")
-                        is_scalp = str(pos.get("tf", "15m")).lower() in ("15m", "15", "scalp")
-                        max_stale_hours = 2.5 if is_scalp else 12.0
-                        hours_open = 0.0
-                        if opened_at_str:
-                            try:
-                                ot = datetime.fromisoformat(opened_at_str)
-                                hours_open = (datetime.now(timezone.utc) - ot).total_seconds() / 3600.0
-                            except Exception:
-                                pass
-
-                        # If position has been flat in chop for > 5.0h (and not in profit): scratch to free up trade slot
-                        max_stale_hours = 5.0 if is_scalp else 12.0
-                        if hours_open >= max_stale_hours and abs(gain_pct) < 0.25 and not pos.get("stale_warned"):
-                            pos_size = float(b_pos.get("size", 0) or b_pos.get("qty", 0) or 0)
-                            if pos_size > 0:
-                                log.info("Stale Time-Stop: %s %s flat for %.1f hours. Closing at market to free trade slot.", sym, b_side, hours_open)
-                                close_side = "Sell" if is_buy else "Buy"
-                                scratch_res = client.close_position_market(sym, side=close_side, qty=pos_size, category="linear")
-                                if scratch_res:
-                                    user_store.close_user_position(cid, pid, b_mark, reason="STALE_TIME_STOP")
-                                    pnl_est = ((b_mark - b_entry) * pos_size) if is_buy else ((b_entry - b_mark) * pos_size)
-                                    pnl_str = f"+${pnl_est:.2f} 🟢" if pnl_est >= 0 else f"-${abs(pnl_est):.2f} 🔴"
-                                    time_stop_msg = (
-                                        f"⏱️ *Stale Scalp Time-Stop Executed* ⏱️\n\n"
-                                        f"• *Asset*: `{sym}` ({pos.get('side')})\n"
-                                        f"• *Duration*: `{hours_open:.1f} hours` (Flat Range Consolidation)\n"
-                                        f"• *Exit Price*: `{fmt_dollar(b_mark)}` ({gain_pct:+.2f}%)\n"
-                                        f"• *Est PnL*: `{pnl_str}`\n\n"
-                                        f"✨ *Slot Freed*: 1 trading slot is now open and ready for fresh A+ Sniper setups!"
-                                    )
-                                    if not bot_token:
-                                        call_cfg = state.get_call_bot_config()
-                                        bot_token = call_cfg.get("token") or cfg.call_bot_token or cfg.telegram_token
-                                    try:
-                                        _reply(cid, time_stop_msg, bot_token=bot_token)
-                                    except Exception as e_rep:
-                                        log.debug("Error sending time-stop receipt: %s", e_rep)
-                                    continue
-
-                        # B. Check Partial Scale-Out (Bank 50% profit at +1.0R progress or >= +1.5% gain)
-                        if (curr_r >= 1.0 or gain_pct >= 1.5) and not pos.get("tp1_scaled"):
+                        # Institutional Model (Restored from Oct 15):
+                        # 1. No premature micro-choking: The original Stop Loss remains intact
+                        #    at orig_sl to allow the trade full breathing room through normal pullbacks.
+                        # 2. When price reaches TP1 (curr_r >= 1.2 or gain_pct >= 2.0%):
+                        #    - Bank 50% profit into wallet cash.
+                        #    - Move Stop Loss on remaining 50% runner to Break-Even (entry price).
+                        #    - Let the 50% runner ride to TP2/TP3 100% Risk-Free.
+                        if (curr_r >= 1.2 or gain_pct >= 2.0) and not pos.get("tp1_scaled"):
                             b_qty = float(b_pos.get("size", 0) or b_pos.get("qty", 0) or 0)
                             half_qty = client.quantize_qty(sym, b_qty * 0.50, category="linear")
                             try:
@@ -1028,9 +993,6 @@ def sync_user_positions_with_bybit(chat_id: Union[str, int], bot_token: Optional
                             except Exception:
                                 min_qty = 0.001
 
-                            import asset_dna
-                            dna_sc = asset_dna.get_asset_dna(ticker)
-                            # Xira Model: Always bank 50% partial profit at TP1 and let remaining 50% runner ride to TP2/TP3
                             close_qty = half_qty
 
                             if close_qty >= min_qty:
@@ -1039,183 +1001,31 @@ def sync_user_positions_with_bybit(chat_id: Union[str, int], bot_token: Optional
                                 if res_scale:
                                     pos["tp1_scaled"] = True
                                     pos["scaled_qty"] = close_qty
-                                    # Immediately snap Bybit exchange Stop Loss to +0.35R Green Profit Lock on scale-out!
-                                    lock_sl_raw = b_entry + (risk_dist * 0.35) if is_buy else b_entry - (risk_dist * 0.35)
-                                    lock_sl = client.quantize_price(sym, lock_sl_raw, category="linear")
+                                    # Snap Stop Loss to Entry (Break-Even) for the remaining 50% runner!
+                                    lock_sl = client.quantize_price(sym, b_entry, category="linear")
                                     cur_sl_check = float(b_pos.get("stopLoss") or pos.get("sl") or 0.0)
                                     should_move_sl = (lock_sl > cur_sl_check) if is_buy else (cur_sl_check == 0.0 or lock_sl < cur_sl_check)
                                     if should_move_sl:
                                         sl_moved = client.set_trading_stop(category="linear", symbol=sym, stop_loss=lock_sl)
                                         if sl_moved:
                                             pos["sl"] = lock_sl
-                                            pos["profit_lock_l2"] = True
                                             pos["be_trailed"] = True
                                     user_store.update_user_position(cid, pid, pos)
-                                    log.info("TP1 Partial Scale-Out: Banked 50%% profit (%s units) and locked SL@$%.4f for user %s on %s", close_qty, lock_sl, cid, sym)
+                                    log.info("🎯 TP1 Institutional Profit Banked: Banked 50%% profit (%s units) and moved SL to BE @ $%.4f for user %s on %s", close_qty, lock_sl, cid, sym)
                                     scale_msg = (
-                                        f"💰 *TP1 Institutional Profit Banked: {ticker}* 💰\n\n"
+                                        f"💰 *TP1 Profit Banked: {ticker}* 💰\n\n"
                                         f"• *Progress*: `+{gain_pct:.1f}%` (+{curr_r:.2f}R) at `{fmt_dollar(b_mark)}`\n"
-                                        f"• *Archetype*: `{dna_sc.get('archetype')}` (Xira Multi-Tier Model)\n"
                                         f"• *Action*: Realized **50% profit** ({close_qty} contracts banked into balance)!\n"
-                                        f"• *Stop Loss*: Snapped to **+0.35R Guaranteed Green Profit** (`{fmt_dollar(lock_sl)}`)\n"
-                                        f"• *Runner Status*: Remaining 50% position running 100% Risk-Free to TP2!"
+                                        f"• *Stop Loss*: Moved to **Break-Even** (`{fmt_dollar(lock_sl)}`)\n"
+                                        f"• *Runner*: Remaining 50% position riding 100% Risk-Free to TP2/TP3!"
                                     )
                                     if not bot_token:
                                         call_cfg = state.get_call_bot_config()
                                         bot_token = call_cfg.get("token") or cfg.call_bot_token or cfg.telegram_token
-                                    scale_buttons = {
-                                        "inline_keyboard": [
-                                            [
-                                                {"text": "🔒 Lock BE", "callback_data": f"pos_lock_be_{ticker}"},
-                                                {"text": "💰 Bank 50%", "callback_data": f"pos_bank_50_{ticker}"},
-                                            ],
-                                            [
-                                                {"text": "🛑 Emergency Close", "callback_data": f"pos_close_full_{ticker}"},
-                                                {"text": "🧬 View DNA", "callback_data": f"pos_view_dna_{ticker}"},
-                                            ]
-                                        ]
-                                    }
                                     try:
-                                        _reply(cid, scale_msg, bot_token=bot_token, reply_markup=scale_buttons)
+                                        _reply(cid, scale_msg, bot_token=bot_token)
                                     except Exception as e_rep:
                                         log.debug("Error sending scale-out receipt: %s", e_rep)
-
-                        # Multi-Tier Ratchet Progression:
-                        # Tier 4: Ultra Profit Trail (+1.75R or >= +2.5% gain) -> Lock in +1.10R profit
-                        # Tier 3: Super Profit Lock (+1.20R or >= +1.8% gain) -> Lock in +0.65R profit
-                        # Tier 2: Green Profit Lock (+0.55R or >= +1.0% gain) -> Lock in +0.30R profit
-                        # Tier 1: Break-Even Lock (+0.35R or >= +0.7% gain) -> Lock in Entry (0 Risk)
-                        # Tier 0: Active BTC Shock Shield (if BTC surges/dumps >= 0.35% against open trade before BE)
-
-                        import asset_dna
-                        dna = asset_dna.get_asset_dna(ticker)
-                        trail_mode = dna.get("trail_mode", "STANDARD_RATCHET")
-
-                        target_sl = None
-                        tier_name = None
-                        lock_desc = ""
-                        lock_flag = None
-
-                        # Pillar 2: Dynamic Ratchet based on Asset DNA Personality
-                        # Give Scalps Full Breathing Room to Hit Real TP Targets (No 1m Micro-Choking):
-                        if is_scalp:
-                            be_r_trigger = 1.25
-                            be_gain_trigger = 2.40
-                            l2_r_trigger = 1.75
-                            l2_gain_trigger = 3.20
-                        else:
-                            be_r_trigger = 1.35
-                            be_gain_trigger = 2.80
-                            l2_r_trigger = 1.85
-                            l2_gain_trigger = 3.60
-
-                        if (curr_r >= 1.75 or gain_pct >= 2.5) and not pos.get("profit_lock_l4"):
-                            target_sl = b_entry + (risk_dist * 1.10) if is_buy else b_entry - (risk_dist * 1.10)
-                            tier_name = "Ultra Profit Trail"
-                            lock_desc = f"+1.10R (+{gain_pct * 0.6:.1f}% locked)"
-                            lock_flag = "profit_lock_l4"
-                        elif (curr_r >= 1.25 or gain_pct >= 1.8) and not pos.get("profit_lock_l3"):
-                            target_sl = b_entry + (risk_dist * 0.65) if is_buy else b_entry - (risk_dist * 0.65)
-                            tier_name = "Super Profit Lock"
-                            lock_desc = f"+0.65R (+{gain_pct * 0.5:.1f}% locked)"
-                            lock_flag = "profit_lock_l3"
-                        elif (curr_r >= l2_r_trigger or gain_pct >= l2_gain_trigger) and not pos.get("profit_lock_l2") and not pos.get("profit_lock_l3") and not pos.get("profit_lock_l4"):
-                            target_sl = b_entry + (risk_dist * 0.25) if is_buy else b_entry - (risk_dist * 0.25)
-                            tier_name = "Green Profit Lock (+0.25R)"
-                            lock_desc = f"+0.25R (+{gain_pct * 0.4:.1f}% locked)"
-                            lock_flag = "profit_lock_l2"
-                        elif (curr_r >= be_r_trigger or gain_pct >= be_gain_trigger) and not pos.get("be_trailed"):
-                            fee_buf = b_entry * 0.0015
-                            target_sl = b_entry + fee_buf if is_buy else b_entry - fee_buf
-                            tier_name = "Early Breakeven Shield (BE+Fees)"
-                            lock_desc = "+0.15% Net Profit (Fees Guaranteed Covered)"
-                            lock_flag = "be_trailed"
-                        elif not is_scalp and (curr_r >= 0.50 or gain_pct >= 0.70) and not pos.get("risk_cut_half") and not pos.get("be_trailed"):
-                            target_sl = b_entry - (risk_dist * 0.50) if is_buy else b_entry + (risk_dist * 0.50)
-                            tier_name = "Progressive Risk Cut (-0.50R)"
-                            lock_desc = "Max Loss Cut by 50% (-0.50R Downside Protected)"
-                            lock_flag = "risk_cut_half"
-                        elif not pos.get("be_trailed") and ticker != "BTC":
-                            try:
-                                import scanner
-                                side_check = "BUY" if is_buy else "SELL"
-                                btc_ok, _ = scanner.check_btc_momentum_gate(side_check)
-                                if not btc_ok:
-                                    if curr_r >= 0.50:
-                                        fee_buf = b_entry * 0.0030
-                                        target_sl = b_entry + fee_buf if is_buy else b_entry - fee_buf
-                                        tier_name = "BTC Shock Shield (Fee-Protected BE)"
-                                        lock_desc = "+0.30% Net Profit (Protected against adverse BTC impulse)"
-                                        lock_flag = "be_trailed"
-                                    elif -0.42 <= curr_r < 0.50 and not pos.get("btc_shock_tightened") and not pos.get("risk_cut_half") and not pos.get("be_trailed"):
-                                        target_sl = b_entry - (risk_dist * 0.50) if is_buy else b_entry + (risk_dist * 0.50)
-                                        tier_name = "BTC Shock Shield (-0.50R Risk Cut)"
-                                        lock_desc = "Max Loss Cut by 50% (-0.50R against BTC impulse)"
-                                        lock_flag = "btc_shock_tightened"
-                            except Exception as e_btc_sh:
-                                log.debug("BTC shock check error for %s: %s", sym, e_btc_sh)
-
-                        if target_sl is not None and lock_flag:
-                            target_sl = client.quantize_price(sym, target_sl, category="linear")
-                            cur_sl = float(b_pos.get("stopLoss") or pos.get("sl") or 0.0)
-
-                            # Only advance SL if it tightens risk/locks more profit and is safely behind current mark
-                            should_update = False
-                            if is_buy:
-                                should_update = (cur_sl == 0.0 or target_sl > cur_sl) and target_sl < b_mark
-                            else:
-                                should_update = (cur_sl == 0.0 or target_sl < cur_sl) and target_sl > b_mark
-
-                            if should_update:
-                                adj_sl = target_sl * 1000.0 if ticker == "PEPE" else target_sl
-                                be_res = client.set_trading_stop(sym, stop_loss=adj_sl)
-                                if be_res:
-                                    pos[lock_flag] = True
-                                    if lock_flag == "profit_lock_l4":
-                                        pos["profit_lock_l3"] = True
-                                        pos["profit_lock_l2"] = True
-                                        pos["be_trailed"] = True
-                                        pos["risk_cut_half"] = True
-                                    elif lock_flag == "profit_lock_l3":
-                                        pos["profit_lock_l2"] = True
-                                        pos["be_trailed"] = True
-                                        pos["risk_cut_half"] = True
-                                    elif lock_flag == "be_trailed":
-                                        pos["risk_cut_half"] = True
-
-                                    pos["sl"] = target_sl
-                                    user_store.update_user_position(cid, pid, pos)
-                                    log.info(
-                                        "Tier '%s' engaged for user %s on %s %s! SL updated to %.4f (gain: +%.2f%%, +%.2fR)",
-                                        tier_name, cid, sym, b_side, target_sl, gain_pct, curr_r,
-                                    )
-
-                                    trail_receipt = (
-                                        f"🔒 *{tier_name}: {ticker}* 🔒\n\n"
-                                        f"• *Current Gain*: `+{gain_pct:.1f}%` (+{curr_r:.2f}R) at `{fmt_dollar(b_mark)}`\n"
-                                        f"• *Action*: Bybit Stop Loss shifted to **`{fmt_dollar(target_sl)}`**\n"
-                                        f"• *Guaranteed Profit*: **{lock_desc}**\n"
-                                        f"• *Status*: Trade locked against reversals -- profits secured!"
-                                    )
-                                    if not bot_token:
-                                        call_cfg = state.get_call_bot_config()
-                                        bot_token = call_cfg.get("token") or cfg.call_bot_token or cfg.telegram_token
-                                    trail_buttons = {
-                                        "inline_keyboard": [
-                                            [
-                                                {"text": "🔒 Lock BE", "callback_data": f"pos_lock_be_{ticker}"},
-                                                {"text": "💰 Bank 50%", "callback_data": f"pos_bank_50_{ticker}"},
-                                            ],
-                                            [
-                                                {"text": "🛑 Emergency Close", "callback_data": f"pos_close_full_{ticker}"},
-                                                {"text": "🧬 View DNA", "callback_data": f"pos_view_dna_{ticker}"},
-                                            ]
-                                        ]
-                                    }
-                                    try:
-                                        _reply(cid, trail_receipt, bot_token=bot_token, reply_markup=trail_buttons)
-                                    except Exception as e_rep:
-                                        log.debug("Error sending trail notification to %s: %s", cid, e_rep)
                 except Exception as e_be:
                     log.debug("Error checking profit lock trail for user %s %s: %s", cid, sym, e_be)
 
