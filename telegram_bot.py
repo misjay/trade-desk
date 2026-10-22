@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Union
 
 import requests
+import re
 
 from config import cfg, bybit_linear_symbol, bybit_spot_symbol, CORE_TICKERS
 from notifier import send_text, fmt_dollar
@@ -58,11 +59,20 @@ def is_admin(chat_id: Union[str, int]) -> bool:
     return cid_str in admin_ids
 
 
+class _ThreadLocalBotToken:
+    def __init__(self):
+        self._local = threading.local()
+    def get(self) -> Optional[str]:
+        return getattr(self._local, "token", None)
+    def set(self, token: Optional[str]) -> None:
+        self._local.token = token
+
+_bot_token_holder = _ThreadLocalBotToken()
 _current_bot_token: Optional[str] = None
 
 
 def _reply(chat_id: str, text: str, bot_token: Optional[str] = None, reply_markup: Optional[dict] = None) -> None:
-    token = bot_token or _current_bot_token or cfg.telegram_token
+    token = bot_token or _bot_token_holder.get() or _current_bot_token or cfg.call_bot_token or cfg.telegram_token
     if not token:
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -286,6 +296,194 @@ def _build_notifications_panel(chat_id: str) -> Tuple[str, dict]:
     return text, keyboard
 
 
+
+# ── Token Research & Chart Query Parser (Winz Exclusive) ────────────────────
+RESERVED_BOT_COMMANDS = {
+    "start", "help", "menu", "status", "calls", "hourlycalls", "spot", "positions",
+    "tp", "derisk", "shield", "news", "sentiment", "notifications", "alerts",
+    "notif", "notifs", "pausealerts", "resumealerts", "pause", "resume",
+    "pausescalp", "pauseday", "resumescalp", "resumeday", "onlyday", "onlyscalp",
+    "autotrade", "auto", "trade", "buy", "sell", "access", "code", "invite",
+    "gencode", "codes", "revokecode", "grant", "revokeuser", "users",
+    "cancel", "cancelorder", "cancelallorders", "close", "closeall", "drop",
+    "broadcast", "signal", "tweet", "twitter", "feedback", "probation",
+    "leverage", "existingleverage", "scan", "avoid", "allow", "avoided",
+    "subscribe", "unsubscribe", "unsub", "sub", "setchannel", "setcallbot",
+    "callbot", "setfeedbackbot", "feedbackbot", "setgoal", "goals",
+    "dailyreport", "hourlyreport", "weeklyreport", "monthlyreport", "watchlist",
+    "yes", "no", "ok", "cancel", "done", "back", "close_panel", "onspot", "offspot",
+    "mode", "hybrid", "sniper", "normal", "dna", "profile", "dailydebug",
+    "radar", "balance", "myexchange", "compound", "disconnect", "resetdemo", "goal", "goalplan", "cancelgoal", "fng"
+}
+
+COMMON_WORDS = {
+    "hello", "hi", "hey", "thanks", "thank", "good", "morning", "night", "afternoon",
+    "evening", "please", "cool", "great", "nice", "awesome", "perfect", "bye", "see",
+    "what", "how", "why", "when", "where", "who", "which", "will", "can", "could",
+    "would", "should", "there", "their", "they", "this", "that", "these", "those"
+}
+
+
+def parse_token_research_query(raw_text: str) -> Optional[Tuple[str, str]]:
+    """
+    Parse an on-demand token research query from natural language or commands.
+    Returns (ticker, mode) where mode in ('scalp', 'day', 'spot') or None.
+    Guaranteed: This is strictly an informational tool (never triggers automated execution).
+    """
+    if not raw_text:
+        return None
+
+    clean = raw_text.strip().rstrip("?!.,")
+    parts = clean.split()
+    if not parts:
+        return None
+
+    first_word = parts[0].lower().split("@")[0]
+
+    def _extract_tf(words: List[str]) -> Tuple[List[str], str]:
+        tf = "scalp"
+        rem = []
+        for w in words:
+            lw = w.lower().strip("(),?!.")
+            if lw in ("day", "4h", "swing", "macro"):
+                tf = "day"
+            elif lw in ("spot", "1d", "daily", "invest"):
+                tf = "spot"
+            elif lw in ("scalp", "15m", "fast", "micro"):
+                tf = "scalp"
+            else:
+                rem.append(w)
+        return rem, tf
+
+    # 1. Explicit Slash Commands: /research, /analyze, /analysis, /chart, /entry, /setup, /token, /thesis
+    if first_word in ("/research", "/analyze", "/analysis", "/chart", "/entry", "/setup", "/token", "/thesis"):
+        args = parts[1:]
+        if not args:
+            return ("BTC", "scalp")
+        rem_args, tf = _extract_tf(args)
+        raw_tick = rem_args[0].rstrip("?!.,") if rem_args else "BTC"
+        raw_tick = raw_tick.upper().replace("$", "").replace("USDT", "").replace("/", "").replace("-", "").strip()
+        if raw_tick.lower() not in RESERVED_BOT_COMMANDS and len(raw_tick) >= 2:
+            return (raw_tick, tf)
+        return ("BTC", tf)
+
+    # 2. Shorthand slash command for token, e.g. /btc, /sol, /eth, /pepe, /sui
+    if first_word.startswith("/") and 3 <= len(first_word) <= 10:
+        cand = first_word[1:].upper().replace("USDT", "").strip()
+        if cand.lower() not in RESERVED_BOT_COMMANDS and cand.lower() not in COMMON_WORDS and cand.isalpha():
+            rem_args, tf = _extract_tf(parts[1:])
+            return (cand, tf)
+
+    # 3. Natural Language Prefix Queries:
+    # e.g. "research BTC", "analyze SOL", "chart ETH", "entry for SUI", "check PEPE", "what about NEAR?"
+    nl_match = re.match(
+        r"^(?:please\s+)?(?:give\s+me\s+)?(?:research|analyze|analysis|chart|entry|setup|check|what\s+about|how\s+about|look\s+at)\s+(?:on\s+|for\s+)?([A-Za-z0-9_\$]+)(?:\s+(.*))?$",
+        clean,
+        re.IGNORECASE,
+    )
+    if nl_match:
+        token_cand = nl_match.group(1).upper().replace("$", "").replace("USDT", "").replace("/", "").replace("-", "").strip().rstrip("?!.,")
+        extra_str = (nl_match.group(2) or "").strip().lower()
+        tf = "scalp"
+        if any(k in extra_str for k in ("day", "4h", "swing")):
+            tf = "day"
+        elif any(k in extra_str for k in ("spot", "1d", "daily")):
+            tf = "spot"
+        elif any(k in extra_str for k in ("scalp", "15m")):
+            tf = "scalp"
+        if token_cand.lower() not in RESERVED_BOT_COMMANDS and token_cand.lower() not in COMMON_WORDS and len(token_cand) >= 2:
+            return (token_cand, tf)
+
+    # 4. Direct Token Inputs:
+    # Single or 2-word inputs:
+    # e.g. "$BTC", "BTC", "SOL", "ethusdt", "PEPE", "SUI 4h", "DOGE spot", "AVAX scalp"
+    if len(parts) <= 2:
+        rem_args, tf = _extract_tf(parts)
+        if len(rem_args) == 1:
+            raw_cand = rem_args[0].rstrip("?!.,")
+            cand = raw_cand.upper().replace("$", "").replace("USDT", "").replace("/", "").replace("-", "").strip()
+            if cand.lower() not in RESERVED_BOT_COMMANDS and cand.lower() not in COMMON_WORDS and cand.isalnum() and 2 <= len(cand) <= 10:
+                is_cash_tag = raw_cand.startswith("$") or raw_cand.lower().endswith("usdt")
+                from config import ALL_TICKERS
+                known_tickers = set(t.upper() for t in ALL_TICKERS)
+                if is_cash_tag or cand in known_tickers or len(parts) == 2 or raw_cand.isupper():
+                    return (cand, tf)
+
+    return None
+
+
+def _handle_token_research_request(
+    target_ticker: str,
+    req_mode: str,
+    chat_id: str,
+    bot_token: Optional[str] = None,
+) -> None:
+    """
+    Execute instant on-demand research, annotated candlestick chart, and entry setup.
+    Guaranteed: Runs in background thread, completely isolated from automated order execution.
+    Only available on Winz bot (@thewinzbot).
+    """
+    tok = bot_token or _current_bot_token or cfg.telegram_token
+    t_clean = target_ticker.upper().replace("$", "").replace("USDT", "").replace("/", "").replace("-", "").strip()
+    mode_desc = "Spot (1D)" if req_mode == "spot" else ("Day Trade (4h)" if req_mode == "day" else "Scalp (15m)")
+
+    _reply(
+        chat_id,
+        f"🔬 *Analyzing ${t_clean} ({mode_desc})...*\n"
+        f"• _Fetching real-time Bybit order flow & OHLCV candles_\n"
+        f"• _Mapping supply/demand shelves & whale liquidity walls_\n"
+        f"• _Compiling institutional research & technical chart markup..._",
+        bot_token=tok,
+    )
+
+    def _worker(ticker_sym: str, mode_str: str, c_id: str, b_tok: str):
+        try:
+            import market_research
+            from scanner import fetch_ohlcv, fetch_live_price
+
+            tf_min = 1440 if mode_str == "spot" else (240 if mode_str == "day" else 15)
+
+            # Check if token exists on Bybit
+            df_check = fetch_ohlcv(ticker_sym, tf_minutes=tf_min, limit=10)
+            lp_check = fetch_live_price(ticker_sym)
+
+            if df_check is None and lp_check is None:
+                _reply(
+                    c_id,
+                    f"⚠️ *Token Not Found on Bybit*: `${ticker_sym}`\n\n"
+                    f"We could not find active market data or order books for `${ticker_sym}` on Bybit.\n"
+                    f"👉 Please verify the symbol ticker (e.g. `BTC`, `ETH`, `SOL`, `PEPE`, `SUI`, `AVAX`, `LINK`).",
+                    bot_token=b_tok,
+                )
+                return
+
+            if mode_str == "spot":
+                sig = market_research.build_spot_signal(ticker_sym)
+            else:
+                sig = market_research.build_signal_for_timeframe(ticker_sym, tf_minutes=tf_min)
+
+            # Persist last researched signal
+            state.set_last_researched_signal(sig)
+
+            # Deliver chart + research note with interactive buttons
+            market_research.send_research_with_chart(
+                sig,
+                bot_token=b_tok,
+                chat_id=c_id,
+                tf_minutes=tf_min,
+            )
+        except Exception as exc:
+            log.error("Token research worker failed for %s: %s", ticker_sym, exc, exc_info=True)
+            _reply(c_id, f"⚠️ An error occurred while generating research for `${ticker_sym}`: {exc}", bot_token=b_tok)
+
+    threading.Thread(
+        target=_worker,
+        args=(t_clean, req_mode, chat_id, tok),
+        daemon=True,
+        name=f"research-{t_clean}",
+    ).start()
+
+
 def handle_command(
     cmd_text: str,
     chat_id: str,
@@ -296,6 +494,7 @@ def handle_command(
     global _current_bot_token
     if bot_token:
         _current_bot_token = bot_token
+        _bot_token_holder.set(bot_token)
 
     raw_text = cmd_text.strip()
     if not raw_text:
@@ -434,14 +633,33 @@ def handle_command(
 
     if not parts:
         return
-    cmd = parts[0].lower().split("@")[0]
+    raw_cmd = parts[0].lower().split("@")[0]
     args = parts[1:]
+    # Normalize prefixes (?, !, /) and bare commands (e.g. ?hourlycalls, !positions, hourlycalls)
+    if raw_cmd.startswith(("?", "!", "/")):
+        cmd = "/" + raw_cmd.lstrip("?!/")
+    elif raw_cmd in RESERVED_BOT_COMMANDS or raw_cmd in [c["command"] for c in WINZ_PUBLIC_COMMANDS]:
+        cmd = "/" + raw_cmd
+    else:
+        cmd = raw_cmd
 
     import engine
 
     # Check which bot received this command
     call_cfg = state.get_call_bot_config()
-    is_winz_bot = bool(bot_token and bot_token == call_cfg.get("token"))
+    winz_token = call_cfg.get("token") or cfg.call_bot_token
+    is_winz_bot = bool(bot_token and (bot_token == winz_token or bot_token == call_cfg.get("token")))
+
+    # ── 1B. On-Demand Token Research & Chart Route (Winz Bot Only) ────────────
+    if is_winz_bot:
+        token_query = parse_token_research_query(raw_text)
+        if token_query:
+            all_b_chats = state.get_call_bot_config().get("all_chats", [])
+            is_auth = access_manager.is_user_authorized(chat_id) or str(chat_id) in [str(x) for x in all_b_chats] or str(chat_id).startswith("-")
+            if is_auth:
+                t_ticker, t_mode = token_query
+                _handle_token_research_request(t_ticker, t_mode, chat_id, bot_token=bot_token)
+                return
 
     # ── 1. Access Code Redemption Handling ────────────────────────────────────
     if cmd in ("/access", "/code", "/invite"):
@@ -516,7 +734,27 @@ def handle_command(
             return
 
     # ── 2. Access Authorization Gate for Public Users ─────────────────────────
-    if not access_manager.is_user_authorized(chat_id):
+    WINZ_FREE_COMMANDS = {
+        "/start", "/help", "/menu", "/access", "/code", "/invite",
+        "/calls", "/activecalls", "/tracked", "/hourlycalls", "/sendcalls",
+        "/spot", "/spotcalls", "/radar", "/opportunistic", "/discover",
+        "/status", "/balance", "/positions",
+        "/dna", "/token", "/profile", "/news", "/sentiment", "/fng",
+        "/shield", "/profitshield", "/dailyshield", "/dailydebug", "/intel",
+        "/subscribe", "/sub", "/unsubscribe", "/unsub",
+        "/trade", "/papertrade", "/buy", "/sell", "/long", "/short",
+        "/tp", "/takeprofit", "/closeprofit", "/closeinprofit",
+        "/derisk", "/harvest", "/close", "/closeall", "/panic",
+        "/resetdemo", "/reset", "/leverage", "/existingleverage",
+        "/avoid", "/allow", "/avoided", "/onlyday", "/onlyscalp",
+        "/pausescalp", "/pauseday", "/resumescalp", "/resumeday",
+        "/pause", "/resume", "/notifications", "/alerts", "/notif",
+        "/pausealerts", "/resumealerts", "/research", "/tweet",
+        "/connect", "/disconnect", "/myexchange", "/autotrade", "/compound",
+        "/mode", "/hybrid", "/sniper", "/normal", "/risk",
+        "/setgoal", "/goal", "/goalplan", "/cancelgoal"
+    }
+    if not access_manager.is_user_authorized(chat_id) and not (is_winz_bot and cmd in WINZ_FREE_COMMANDS):
         # Inspect un-slashed messages to see if user pasted a raw access code or invite link
         if not raw_text.startswith("/"):
             candidate = access_manager.extract_and_normalize_code(raw_text)
@@ -640,6 +878,9 @@ def handle_command(
                 "• `/connect bybit <KEY> <SECRET>` — ⚡ Connect your Bybit account for automated execution\n"
                 "• `/myexchange` — 💼 View connected account balance, equity & status\n"
                 "• `/autotrade <on/off>` — ⚙️ Toggle automated trade execution on/off\n"
+                "• `/mode` — ⚙️ Auto-trade mode (`/hybrid`, `/sniper`, `/normal`)\n"
+                "• `/hybrid` — 🚀 70% Scalps (tight TP) & 30% Trend (wide targets)\n"
+                "• `/sniper` — 🎯 High conviction tight-target execution only\n"
                 "• `/risk <USDT>` — ⚖️ Set your margin size per trade (e.g. `/risk 50`)\n"
                 "• `/disconnect` — 🔌 Wipe your API keys and unlink exchange\n\n"
                 "🎯 *Target Growth & Compounding Flight Plan:*\n"
@@ -754,17 +995,38 @@ def handle_command(
             if ex and ex.get("connected"):
                 acct_info = f"• *Connected Account*: `Bybit` ({ex.get('api_key_masked')})\n"
 
+            import exchange_manager
+            p_shield = exchange_manager._get_user_daily_profit_shield(chat_id, eq)
+            shield_stage = p_shield.get("stage", 0)
+            shield_gain = p_shield.get("daily_gain_pct", 0.0)
+            if shield_stage == 2:
+                shield_badge = f"🏆 Jackpot Lock (+{shield_gain:.1f}% today | Risk 0.5x, Score ≥ 90%)"
+            elif shield_stage == 1:
+                shield_badge = f"🚀 Momentum Filter (+{shield_gain:.1f}% today | Score ≥ 85%)"
+            else:
+                shield_badge = f"🟢 Normal (+{shield_gain:.1f}% today | Target: +20% / +50%)"
+
+            u_mode = user_store.get_user_auto_trade_mode(chat_id)
+            if u_mode == "hybrid":
+                mode_str = "🚀 Hybrid (70% Scalp / 30% Trend)"
+            elif u_mode == "sniper":
+                mode_str = "🎯 Sniper (Tight TP ≤ 1.8%)"
+            else:
+                mode_str = "⚡ Normal (All Signals)"
+
             msg = (
                 f"💼 *Your Personal Trading Desk Status*\n\n"
                 f"{acct_info}"
                 f"• *Execution*: {pause_str}\n"
                 f"• *Automated Trading*: {auto_str}\n"
+                f"• *Auto-Trade Mode*: {mode_str}\n"
+                f"• *Daily Profit Shield*: {shield_badge}\n"
                 f"• *Demo Equity*: `${eq:,.2f} USDT`\n"
                 f"• *Net Equity (with Floating)*: `${net_equity:,.2f} USDT`\n"
                 f"• *Open Positions*: `{len(open_pos)}`\n"
                 f"• *Session Score*: `{stats.get('wins', 0)}W / {stats.get('losses', 0)}L / {stats.get('breakevens', 0)}BE`\n"
                 f"• *Session Realized PnL*: `${stats.get('total_pnl_usdt', 0.0):+,.2f} USDT`\n\n"
-                f"_Commands: `/autotrade on/off`, `/positions`, `/trade <COIN>`, `/tp`, `/derisk`, `/close <COIN>`, `/closeall`, `/resetdemo`_"
+                f"_Commands: `/mode`, `/shield`, `/autotrade on/off`, `/positions`, `/trade <COIN>`, `/tp`, `/derisk`, `/close <COIN>`, `/closeall`, `/resetdemo`_"
             )
             _reply(chat_id, msg)
             return
@@ -781,11 +1043,26 @@ def handle_command(
         pause_str = state.get_execution_mode_status()
         spot_str = "🟢 ON (Dual-Venue)" if spot_on else "🔴 OFF (Perps Only)"
 
+        gcb_active, gcb_reason = state.is_global_circuit_breaker_active()
+        gcb_badge = f"🚨 FROZEN ({gcb_reason})" if gcb_active else "🟢 Clear (Normal)"
+
+        m_shield = state.get_daily_profit_shield_status(eq)
+        m_stage = m_shield.get("stage", 0)
+        m_gain = m_shield.get("daily_gain_pct", 0.0)
+        if m_stage == 2:
+            m_shield_badge = f"🏆 Jackpot Lock (+{m_gain:.1f}% today | Risk 0.5x, Conv ≥ 90%)"
+        elif m_stage == 1:
+            m_shield_badge = f"🚀 Momentum Filter (+{m_gain:.1f}% today | Conv ≥ 85%)"
+        else:
+            m_shield_badge = f"🟢 Normal (+{m_gain:.1f}% today | Target: +20% / +50%)"
+
         msg = (
             f"📊 *Xira Trade Desk Status*\n\n"
             f"• *Mode*: `{mode_str}` ({cfg.effective_demo_env})\n"
             f"• *Execution*: {pause_str}\n"
+            f"• *Master Circuit Breaker*: {gcb_badge}\n"
             f"• *Spot Trading*: {spot_str}\n"
+            f"• *Daily Profit Shield*: {m_shield_badge}\n"
             f"• *Total Equity*: `${eq:,.2f} USDT`\n"
             f"• *Available*: `${avail:,.2f} USDT`\n"
             f"• *Open Positions*: `{active_count}`\n"
@@ -834,7 +1111,19 @@ def handle_command(
                 )
 
             lines.append("\n_Commands: `/tp` (take profit), `/derisk`, `/close <COIN>`, `/closeall`_")
-            _reply(chat_id, "\n".join(lines))
+            kb_buttons = []
+            for pid, p in open_pos.items():
+                t = p.get("ticker", "BTC").upper()
+                kb_buttons.append([
+                    {"text": f"🔒 Lock BE ({t})", "callback_data": f"pos_lock_be_{t}"},
+                    {"text": f"💰 Bank 50% ({t})", "callback_data": f"pos_bank_50_{t}"},
+                ])
+                kb_buttons.append([
+                    {"text": f"🛑 Close ({t})", "callback_data": f"pos_close_full_{t}"},
+                    {"text": f"🧬 Asset DNA ({t})", "callback_data": f"pos_view_dna_{t}"},
+                ])
+            markup = {"inline_keyboard": kb_buttons} if kb_buttons else None
+            _reply(chat_id, "\n".join(lines), reply_markup=markup)
             return
 
         open_pos = state.get_open_positions()
@@ -843,6 +1132,7 @@ def handle_command(
             return
 
         lines = ["📈 *Current Active Positions on Bybit:*", ""]
+        kb_buttons = []
         for p in open_pos.values():
             t = p.get("ticker", "UNKNOWN")
             side = p.get("side", "")
@@ -863,8 +1153,18 @@ def handle_command(
                 f"  Floating PnL: *{pnl_str}*\n"
                 f"  TP1: {tp1} | TP2: {tp2} | SL: {sl}\n"
             )
+            if t != "UNKNOWN":
+                kb_buttons.append([
+                    {"text": f"🔒 Lock BE ({t})", "callback_data": f"pos_lock_be_{t}"},
+                    {"text": f"💰 Bank 50% ({t})", "callback_data": f"pos_bank_50_{t}"},
+                ])
+                kb_buttons.append([
+                    {"text": f"🛑 Close ({t})", "callback_data": f"pos_close_full_{t}"},
+                    {"text": f"🧬 Asset DNA ({t})", "callback_data": f"pos_view_dna_{t}"},
+                ])
 
-        _reply(chat_id, "\n".join(lines))
+        markup = {"inline_keyboard": kb_buttons} if kb_buttons else None
+        _reply(chat_id, "\n".join(lines), reply_markup=markup)
 
     elif cmd in ("/onlyday", "/dayonly"):
         if not is_admin(chat_id):
@@ -2463,17 +2763,179 @@ def handle_command(
         else:
             _reply(chat_id, "ℹ️ You do not currently have an active target goal.", bot_token=_current_bot_token)
 
+    elif cmd in ("/hybrid", "/hybridmode"):
+        user_store.set_user_auto_trade_mode(chat_id, "hybrid")
+        msg = (
+            "🚀 *Hybrid 70/30 Execution Mode ACTIVATED!* 🚀\n\n"
+            "• *Allocation*: **70% Fast Scalps (15m)** & **30% Trend Expansions (4h)**\n"
+            "• *Conviction Filter*: Strictly **A+ Institutional Setups** (Score ≥ 80%)\n"
+            "• *Scalp Targets*: **Tight TP1 (≤ 1.8%)** — rapid execution and profit banking\n"
+            "• *Trend Targets*: **Uncapped Targets (2%–6%+)** — rides high-probability expansions\n"
+            "• *Capacity Guard*: Maximum 1 trend position active at any time, guaranteeing at least 1 slot always remains open for scalps\n"
+            "• *BTC Momentum Shield*: **Armed** (Protects altcoin shorts from BTC pumps)\n"
+            "• *Multi-Tier Profit Lock*: **Active** (Fee-protected breakeven + trailing locks)\n\n"
+            "👉 _Switch to Sniper mode anytime with `/sniper` or Normal with `/normal`._"
+        )
+        _reply(chat_id, msg, bot_token=_current_bot_token)
+
+    elif cmd in ("/sniper", "/snipermode"):
+        user_store.set_user_auto_trade_mode(chat_id, "sniper")
+        msg = (
+            "🎯 *Sniper Execution Mode ACTIVATED!* 🎯\n\n"
+            "• *Conviction Filter*: Strictly **A+ Institutional Setups** (Score ≥ 80%)\n"
+            "• *Target Distance*: **Tight TP1 (≤ 1.8%)** — rapid execution and immediate banking\n"
+            "• *BTC Momentum Shield*: **Armed** (Freezes altcoin shorts whenever BTC pumps)\n"
+            "• *Multi-Tier Profit Lock*: **Active** (Trails SL into green profit every 15s)\n\n"
+            "🛡️ _Low-conviction or wide-target chops are completely filtered out._\n"
+            "👉 _Switch to Hybrid mode with `/hybrid` or Normal with `/normal`._"
+        )
+        _reply(chat_id, msg, bot_token=_current_bot_token)
+
+    elif cmd in ("/normal", "/normalmode", "/standard"):
+        user_store.set_user_auto_trade_mode(chat_id, "normal")
+        msg = (
+            "⚡ *Normal Execution Mode ACTIVATED!* ⚡\n\n"
+            "• *Conviction Filter*: Standard (Executes all valid scalp & day setups across the engine)\n"
+            "• *BTC Momentum Shield*: Active (Protects against violent market expansion)\n"
+            "• *Multi-Tier Profit Lock*: Active (Trails SL into green profit)\n\n"
+            "👉 _Switch to Hybrid mode with `/hybrid` or Sniper with `/sniper`._"
+        )
+        _reply(chat_id, msg, bot_token=_current_bot_token)
+
+    elif cmd in ("/mode", "/autofilter", "/filter"):
+        cur_mode = user_store.get_user_auto_trade_mode(chat_id)
+        if args and args[0].lower() in ("hybrid", "sniper", "normal"):
+            new_mode = user_store.set_user_auto_trade_mode(chat_id, args[0].lower())
+            cur_mode = new_mode
+
+        if cur_mode == "hybrid":
+            mode_badge = "🚀 *Hybrid Mode (70% Scalp / 30% Trend)*"
+        elif cur_mode == "sniper":
+            mode_badge = "🎯 *Sniper Mode (A+ & Tight TP ≤ 1.8%)*"
+        else:
+            mode_badge = "⚡ *Normal Mode (All Valid Signals)*"
+
+        kb = [
+            [
+                {"text": "🚀 Switch to Hybrid (70/30)", "callback_data": "set_mode_hybrid"},
+            ],
+            [
+                {"text": "🎯 Switch to Sniper Mode", "callback_data": "set_mode_sniper"},
+                {"text": "⚡ Switch to Normal Mode", "callback_data": "set_mode_normal"},
+            ]
+        ]
+        text = (
+            f"⚙️ *Auto-Trade Execution Mode Settings*\n\n"
+            f"• *Current Active Mode*: {mode_badge}\n\n"
+            f"🚀 *Hybrid Mode*: Executes 70% quick scalps (tight TP1 ≤ 1.8%) and 30% macro trend moves (wider targets 2%–6%+), with max 1 trend slot to keep capital flowing.\n\n"
+            f"🎯 *Sniper Mode*: Executes ONLY A+ highest-conviction setups where TP1 is close (≤ 1.8%), avoiding long chop and false counter-trend breakouts.\n\n"
+            f"⚡ *Normal Mode*: Executes all valid scalp & day trading opportunities identified by the full engine.\n\n"
+            f"_Tap a button below or type `/hybrid`, `/sniper`, or `/normal` to change anytime._"
+        )
+        _reply(chat_id, text, bot_token=_current_bot_token, reply_markup={"inline_keyboard": kb})
+
+    elif cmd in ("/skipped", "/shielded", "/sniperlog", "/blocked"):
+        import exchange_manager
+        logs = exchange_manager.get_recent_shielded_setups(chat_id)
+        if not logs:
+            _reply(chat_id, "🛡️ *Sniper Shield Status: All Clear*\n\nNo setups have been blocked recently. All risk controls active.", bot_token=_current_bot_token)
+        else:
+            lines = [
+                "🛡️ *Recently Shielded / Filtered Setups*",
+                "━━━━━━━━━━━━━━━━━━━━",
+            ]
+            from datetime import datetime, timezone
+            for item in logs[-8:]:
+                t_str = datetime.fromtimestamp(item.get("time", time.time()), tz=timezone.utc).strftime("%H:%M UTC")
+                lines.append(f"• `{t_str}`: *${item.get('ticker')}* ({item.get('side')})\n  ↳ _Shielded_: {item.get('reason')}")
+            lines.append("━━━━━━━━━━━━━━━━━━━━\n_Sniper Mode actively guards against low conviction, slow targets, and counter-trend surges._")
+            _reply(chat_id, "\n".join(lines), bot_token=_current_bot_token)
+
+    elif cmd in ("/shield", "/profitshield", "/dailyshield"):
+        import exchange_manager
+        if not is_admin(chat_id):
+            u = user_store.get_user(chat_id)
+            eq = float(u.get("paper_equity", 10000.0))
+            ex = user_store.get_user_exchange(chat_id)
+            if ex and ex.get("connected"):
+                client = exchange_manager.get_user_bybit_client(chat_id)
+                if client:
+                    try:
+                        wb = client.get_wallet_balance("USDT")
+                        eq = float(wb.get("equity", eq))
+                    except Exception:
+                        pass
+            shield = exchange_manager._get_user_daily_profit_shield(chat_id, eq)
+            venue_title = "Personal Live Bybit" if (ex and ex.get("connected")) else "Personal Demo Desk"
+        else:
+            bal = engine.client.get_wallet_balance("USDT")
+            eq = bal.get("equity", 0.0) if not engine.client.is_paper else state.get_equity()
+            shield = state.get_daily_profit_shield_status(eq)
+            venue_title = "Master Institutional Desk"
+
+        gain_pct = float(shield.get("daily_gain_pct", 0.0))
+        pnl_usdt = float(shield.get("daily_pnl_usdt", 0.0))
+        stage = int(shield.get("stage", 0))
+
+        def _bar(cur, target):
+            pct = min(1.0, max(0.0, cur / target)) if target > 0 else 0.0
+            filled = int(round(pct * 10))
+            return "🟩" * filled + "⬜" * (10 - filled)
+
+        bar_s1 = _bar(gain_pct, 20.0)
+        bar_s2 = _bar(gain_pct, 50.0)
+
+        if stage == 2:
+            status_desc = "🏆 *STAGE 2: JACKPOT LOCK (+50% Met!)*\n• Mode: Trophy Lock engaged\n• Risk Multiplier: `0.5x` (Half Sizing)\n• Setup Filter: `A+ Only (Score ≥ 90%)`\n• Outcome: Daily jackpot banked and protected from chop."
+        elif stage == 1:
+            status_desc = "🚀 *STAGE 1: MOMENTUM FILTER (+20% Met!)*\n• Mode: Uncapped Compounding Firepower\n• Risk Multiplier: `1.0x` (100% Full Sizing toward +50%)\n• Setup Filter: `High Conviction Only (Score ≥ 85%)`\n• Outcome: House money protected against low-grade chop."
+        else:
+            status_desc = "🟢 *STAGE 0: NORMAL EXPANSION*\n• Mode: Standard Execution across valid setups\n• Risk Multiplier: `1.0x` (100% Full Firepower)\n• Next Target: `+20.0%` (Stage 1 Momentum Filter)"
+
+        pnl_str = f"+${pnl_usdt:.2f} USDT" if pnl_usdt >= 0 else f"-${abs(pnl_usdt):.2f} USDT"
+        msg = (
+            f"🛡️ *2-Stage Daily Profit Shield ({venue_title})* 🛡️\n\n"
+            f"• *Current Equity*: `${eq:,.2f} USDT`\n"
+            f"• *Today's Realized PnL*: `{pnl_str}` (`{gain_pct:+.2f}%`)\n\n"
+            f"🎯 *Stage 1 Progress (+20.0% Momentum Filter)*:\n"
+            f"`{bar_s1}` `{gain_pct:.1f}% / 20.0%`\n"
+            f"_Filters out mediocre setups (<85%) while keeping 100% position size._\n\n"
+            f"🏆 *Stage 2 Progress (+50.0% Jackpot Lock)*:\n"
+            f"`{bar_s2}` `{gain_pct:.1f}% / 50.0%`\n"
+            f"_Cuts risk to 0.5x and restricts to 90%+ A+ setups to lock in a +50% jackpot day._\n\n"
+            f"{status_desc}"
+        )
+        _reply(chat_id, msg, bot_token=_current_bot_token)
+
+    elif cmd in ("/dailydebug", "/intel", "/dailyintel", "/backtest"):
+        _reply(
+            chat_id,
+            "⏳ *Running Complete Daily Debug, Trade Learning & Backtest Simulation...*\n\n"
+            "• Auditing Bybit API connectivity & live position alignment\n"
+            "• Evaluating last 24h trades and loss reasons\n"
+            "• Running 150-candle historical backtest across universe\n\n"
+            "_Please allow ~15 seconds to compile results..._",
+            bot_token=_current_bot_token,
+        )
+        import daily_intel
+        def _run_intel():
+            try:
+                daily_intel.execute_daily_1am_wat_routine(target_chat_id=chat_id)
+            except Exception as e_int:
+                _reply(chat_id, f"❌ *Daily Intel Execution Error*: {e_int}", bot_token=_current_bot_token)
+        threading.Thread(target=_run_intel, daemon=True, name="daily-intel-manual").start()
+
     elif cmd in ("/calls", "/activecalls", "/tracked"):
         summary_text, inline_keyboard = format_active_calls_summary()
         markup = {"inline_keyboard": inline_keyboard} if inline_keyboard else None
         _reply(chat_id, summary_text, bot_token=_current_bot_token, reply_markup=markup)
 
     elif cmd in ("/hourlycalls", "/sendcalls"):
-        _reply(chat_id, "🚀 *Generating and Dispatching 2-Hour Calls Digest (4 Scalps + 3 Day Trades with Interactive Buttons)...*")
+        _reply(chat_id, "🚀 *Generating and Dispatching 2-Hour Calls Digest (4 Scalps + 3 Day Trades with Interactive Buttons)...*", bot_token=bot_token)
         import market_research
         threading.Thread(
             target=market_research.dispatch_hourly_calls,
-            kwargs={"force": True},
+            kwargs={"force": True, "bot_token": bot_token, "chat_id": chat_id},
             daemon=True,
             name="hourly-calls-manual",
         ).start()
@@ -2728,6 +3190,130 @@ def handle_command(
 
         threading.Thread(target=_do_radar_sweep, daemon=True, name="radar-manual").start()
 
+    elif cmd in ("/dna", "/token", "/profile"):
+        target_t = args[0].upper().replace("USDT", "") if args else "DOGE"
+        import asset_dna
+        dna = asset_dna.get_asset_dna(target_t)
+        name = dna.get("name", target_t)
+        arch = dna.get("archetype", "UNKNOWN")
+        buf_pct = dna.get("min_stop_buffer", 0.0075) * 100.0
+        run_st = dna.get("run_style", "N/A")
+        tr_mode = dna.get("trail_mode", "N/A")
+        unl_risk = dna.get("unlock_risk", False)
+        unl_days = dna.get("monthly_unlock_days", [])
+        unl_str = f"⚠️ High Cliff Risk (Monthly Days {unl_days})" if unl_risk else "✅ Clean (No Cliff Risk)"
+        burn = "🔥 Active Supply Burn" if dna.get("burn_catalyst") else "None"
+        sess = dna.get("best_session", "ALL")
+        desc = dna.get("description", "")
+
+        macro_str = ""
+        try:
+            import engine
+            sym = bybit_linear_symbol(target_t)
+            tick = engine.client.get_ticker(sym)
+            if tick:
+                l_price = float(tick.get("mark_price", 0.0))
+                macro_str = f"\n• *Live Mark Price*: `{fmt_dollar(l_price)}`"
+                klines = engine.client.get_klines(sym, interval="D", limit=30, category="linear")
+                if klines and len(klines) >= 15:
+                    h30 = max(float(k.get("high", 0)) for k in klines)
+                    l30 = min(float(k.get("low", 0)) for k in klines)
+                    macro_str += f"\n• *30D Major Ceiling*: `{fmt_dollar(h30)}`\n• *30D Major Floor*: `{fmt_dollar(l30)}`"
+        except Exception:
+            pass
+
+        dna_card = (
+            f"🧬 *Asset DNA Master Profile: {target_t} ({name})*\n\n"
+            f"• *Archetype*: `{arch}`\n"
+            f"• *Stop Noise Cushion*: `≥ {buf_pct:.2f}%` (Guaranteed Noise Floor)\n"
+            f"• *Trailing Mode*: `{tr_mode}`\n"
+            f"• *Movement Style*: `{run_st}`\n"
+            f"• *Tokenomics & Unlocks*: {unl_str}\n"
+            f"• *Burn Mechanics*: `{burn}`\n"
+            f"• *Institutional Session*: `{sess}`{macro_str}\n\n"
+            f"💡 *Specialist Playbook*: _{desc}_"
+        )
+        _reply(chat_id, dna_card, bot_token=_current_bot_token)
+
+    elif cmd in ("/compound", "/compounding"):
+        u = user_store.get_user(chat_id)
+        ex = u.get("exchange", {})
+        curr_pct = user_store.get_user_compounding_pct(chat_id)
+
+        # Check current balance if Bybit connected or paper
+        import exchange_manager
+        client = exchange_manager.get_user_bybit_client(chat_id)
+        bal_eq = 0.0
+        if client:
+            try:
+                wb = client.get_wallet_balance("USDT")
+                bal_eq = float(wb.get("equity", 0.0))
+            except Exception:
+                pass
+        if bal_eq <= 0:
+            bal_eq = float(u.get("paper_equity", 10000.0))
+
+        if args:
+            arg = args[0].strip().lower()
+            if arg in ("off", "disable", "stop", "0", "none"):
+                user_store.set_user_compounding_pct(chat_id, 0.0)
+                fixed_margin = float(ex.get("risk_per_trade_usdt", 50.0))
+                _reply(
+                    chat_id,
+                    f"⏸ *Dynamic Compounding Disabled*\n\n"
+                    f"• Auto-trade sizing has reverted to your fixed margin of *${fixed_margin:.2f} USDT* per trade.\n"
+                    f"• To re-enable dynamic balance scaling, type e.g. `/compound 1.0` (1.0% per trade).",
+                    bot_token=_current_bot_token,
+                )
+                return
+            try:
+                val = float(arg.replace("%", ""))
+                if val <= 0:
+                    user_store.set_user_compounding_pct(chat_id, 0.0)
+                    _reply(chat_id, "⏸ Dynamic compounding turned off.", bot_token=_current_bot_token)
+                    return
+                if val > 10.0:
+                    _reply(chat_id, "⚠️ Maximum allowable compounding risk is 10.0% per trade to prevent ruin.", bot_token=_current_bot_token)
+                    return
+                new_pct = user_store.set_user_compounding_pct(chat_id, val)
+                effective_margin = round(bal_eq * (new_pct / 100.0), 2)
+                _reply(
+                    chat_id,
+                    f"🚀 *Dynamic Compounding Mode Activated!* 🚀\n\n"
+                    f"• *Compounding Risk*: `{new_pct:.2f}%` of live equity per trade\n"
+                    f"• *Current Reference Equity*: `${bal_eq:,.2f} USDT`\n"
+                    f"• *Next Trade Margin*: `~${effective_margin:,.2f} USDT`\n\n"
+                    f"💡 *How it works*: As your Bybit balance grows, Winz automatically compounds your position sizes proportionally — accelerating exponential growth while strictly limiting drawdown to {new_pct:.1f}% per setup.\n"
+                    f"_Type `/compound off` anytime to switch back to fixed margin._",
+                    bot_token=_current_bot_token,
+                )
+                return
+            except ValueError:
+                _reply(chat_id, "⚠️ Invalid format. Use e.g. `/compound 1.0` (for 1.0%) or `/compound off`.", bot_token=_current_bot_token)
+                return
+
+        # No args: status display
+        fixed_margin = float(ex.get("risk_per_trade_usdt", 50.0))
+        if curr_pct > 0:
+            effective_margin = round(bal_eq * (curr_pct / 100.0), 2)
+            status_text = (
+                f"📈 *Dynamic Balance Compounding: ACTIVE*\n\n"
+                f"• *Current Setting*: `{curr_pct:.2f}%` of live wallet equity per trade\n"
+                f"• *Live Equity*: `${bal_eq:,.2f} USDT`\n"
+                f"• *Current Calculated Margin*: `${effective_margin:,.2f} USDT` per trade\n\n"
+                f"👉 To adjust rate: `/compound 1.5` or `/compound 2.0`\n"
+                f"👉 To disable: `/compound off`"
+            )
+        else:
+            status_text = (
+                f"⚙️ *Dynamic Balance Compounding: OFF*\n\n"
+                f"• *Current Mode*: Fixed margin of `${fixed_margin:.2f} USDT` per trade\n"
+                f"• *Live Equity*: `${bal_eq:,.2f} USDT`\n\n"
+                f"💡 Dynamic compounding scales your margin with your growing balance.\n"
+                f"👉 To enable: `/compound 1.0` (scales risk to 1.0% of live equity per trade)"
+            )
+        _reply(chat_id, status_text, bot_token=_current_bot_token)
+
     elif cmd in ("/gencode", "/createcode", "/newcode"):
         if not is_admin(chat_id):
             return
@@ -2938,6 +3524,58 @@ def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_tri
                                 pass
                             continue
 
+                        # Handle interactive Hybrid vs Sniper vs Normal mode toggles
+                        if cb_data in ("set_mode_hybrid", "set_mode_sniper", "set_mode_normal"):
+                            if cb_data == "set_mode_hybrid":
+                                new_m = "hybrid"
+                                m_text = "🚀 Hybrid Mode Activated (70% Scalp / 30% Trend)"
+                                mode_badge = "🚀 *Hybrid Mode (70% Scalp / 30% Trend)*"
+                            elif cb_data == "set_mode_sniper":
+                                new_m = "sniper"
+                                m_text = "🎯 Sniper Mode Activated (A+ & Tight TP ≤ 1.8%)"
+                                mode_badge = "🎯 *Sniper Mode (A+ & Tight TP ≤ 1.8%)*"
+                            else:
+                                new_m = "normal"
+                                m_text = "⚡ Normal Mode Activated (All Valid Signals)"
+                                mode_badge = "⚡ *Normal Mode (All Valid Signals)*"
+
+                            user_store.set_user_auto_trade_mode(cb_chat_id, new_m)
+                            try:
+                                ack_url = f"https://api.telegram.org/bot{token}/answerCallbackQuery"
+                                requests.post(ack_url, json={"callback_query_id": cb_id, "text": m_text}, timeout=4)
+                            except Exception:
+                                pass
+
+                            kb = [
+                                [
+                                    {"text": "🚀 Switch to Hybrid (70/30)", "callback_data": "set_mode_hybrid"},
+                                ],
+                                [
+                                    {"text": "🎯 Switch to Sniper Mode", "callback_data": "set_mode_sniper"},
+                                    {"text": "⚡ Switch to Normal Mode", "callback_data": "set_mode_normal"},
+                                ]
+                            ]
+                            text = (
+                                f"⚙️ *Auto-Trade Execution Mode Settings*\n\n"
+                                f"• *Current Active Mode*: {mode_badge}\n\n"
+                                f"🚀 *Hybrid Mode*: Executes 70% quick scalps (tight TP1 ≤ 1.8%) and 30% macro trend moves (wider targets 2%–6%+), with max 1 trend slot to keep capital flowing.\n\n"
+                                f"🎯 *Sniper Mode*: Executes ONLY A+ highest-conviction setups where TP1 is close (≤ 1.8%), avoiding long chop and false counter-trend breakouts.\n\n"
+                                f"⚡ *Normal Mode*: Executes all valid scalp & day trading opportunities identified by the full engine.\n\n"
+                                f"_Mode updated! You can toggle again anytime._"
+                            )
+                            try:
+                                edit_url = f"https://api.telegram.org/bot{token}/editMessageText"
+                                requests.post(edit_url, json={
+                                    "chat_id": cb_chat_id,
+                                    "message_id": cb_msg_id,
+                                    "text": text,
+                                    "parse_mode": "Markdown",
+                                    "reply_markup": {"inline_keyboard": kb},
+                                }, timeout=6)
+                            except Exception as exc:
+                                log.debug("Failed to edit mode message: %s", exc)
+                            continue
+
                         # Handle interactive notification preference toggles
                         if cb_data.startswith("toggle_notif_"):
                             action = cb_data.replace("toggle_notif_", "")
@@ -2979,6 +3617,20 @@ def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_tri
                         except Exception:
                             pass
 
+                        if cb_data.startswith("tweet_"):
+                            t_sym = cb_data.replace("tweet_", "").upper()
+                            def _async_tweet(t: str, c_id: str, b_tok: str):
+                                import market_research
+                                sig = market_research.build_signal_for_timeframe(t, tf_minutes=15)
+                                market_research.send_twitter_post(sig, bot_token=b_tok, chat_id=c_id)
+                            threading.Thread(
+                                target=_async_tweet,
+                                args=(t_sym, cb_chat_id, token),
+                                daemon=True,
+                                name=f"tweet-{t_sym}",
+                            ).start()
+                            continue
+
                         if cb_data.startswith("call_view_"):
                             parts = cb_data.split("_")
                             if len(parts) >= 4:
@@ -3003,6 +3655,241 @@ def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_tri
                                     daemon=True,
                                     name=f"cb-{ticker}",
                                 ).start()
+                            continue
+
+                        # Interactive One-Tap Trade Action Buttons:
+                        if cb_data.startswith("pos_lock_be_"):
+                            ticker = cb_data.replace("pos_lock_be_", "").upper().strip()
+                            import exchange_manager
+                            u = user_store.get_user(cb_chat_id)
+                            open_pos = u.get("open_positions", {})
+                            target_pid = None
+                            target_pos = None
+                            for pid, p in open_pos.items():
+                                if p.get("ticker", "").upper() == ticker:
+                                    target_pid = pid
+                                    target_pos = p
+                                    break
+
+                            # Also check master desk positions if admin
+                            if not target_pos and is_admin(cb_chat_id):
+                                sym = bybit_linear_symbol(ticker)
+                                import engine
+                                pos_info = engine.client.get_position(sym)
+                                if pos_info and float(pos_info.get("size", 0.0)) > 0:
+                                    ep = float(pos_info.get("entry_price", 0.0))
+                                    q_sl = engine.client.quantize_price(sym, ep, category="linear")
+                                    engine.client.set_trading_stop(category="linear", symbol=sym, stop_loss=q_sl)
+                                    _reply(
+                                        cb_chat_id,
+                                        f"🔒 *Master Desk Breakeven Stop Locked: ${ticker}* 🔒\n\n"
+                                        f"• *Stop Loss*: Moved to Entry (`${ep:,.4f}`)\n"
+                                        f"• *Downside Risk*: **$0.00 (Zero Risk)**\n"
+                                        f"• *Status*: Position protected on Bybit!",
+                                        bot_token=token,
+                                    )
+                                    continue
+
+                            if not target_pos:
+                                _reply(cb_chat_id, f"⚠️ No active open position found for ${ticker}.", bot_token=token)
+                                continue
+
+                            entry = float(target_pos.get("entry_price", 0.0))
+                            client = exchange_manager.get_user_bybit_client(cb_chat_id)
+                            sym = bybit_linear_symbol(ticker)
+                            if client:
+                                try:
+                                    q_sl = client.quantize_price(sym, entry, category="linear")
+                                    client.set_trading_stop(category="linear", symbol=sym, stop_loss=q_sl)
+                                except Exception as e_sl:
+                                    log.debug("Error setting BE stop on Bybit for %s: %s", ticker, e_sl)
+
+                            target_pos["sl"] = entry
+                            target_pos["be_trailed"] = True
+                            user_store.update_user_position(cb_chat_id, target_pid, target_pos)
+                            _reply(
+                                cb_chat_id,
+                                f"🔒 *Breakeven Stop Locked: ${ticker}* 🔒\n\n"
+                                f"• *Stop Loss*: Moved to Entry (`${entry:,.4f}`)\n"
+                                f"• *Downside Risk*: **$0.00 (Zero Risk)**\n"
+                                f"• *Status*: Trade is 100% protected against reversals!",
+                                bot_token=token,
+                            )
+                            continue
+
+                        if cb_data.startswith("pos_bank_50_"):
+                            ticker = cb_data.replace("pos_bank_50_", "").upper().strip()
+                            import exchange_manager
+                            from scanner import fetch_live_price
+                            u = user_store.get_user(cb_chat_id)
+                            open_pos = u.get("open_positions", {})
+                            target_pid = None
+                            target_pos = None
+                            for pid, p in open_pos.items():
+                                if p.get("ticker", "").upper() == ticker:
+                                    target_pid = pid
+                                    target_pos = p
+                                    break
+
+                            # Also check master desk positions if admin
+                            if not target_pos and is_admin(cb_chat_id):
+                                sym = bybit_linear_symbol(ticker)
+                                import engine
+                                pos_info = engine.client.get_position(sym)
+                                if pos_info and float(pos_info.get("size", 0.0)) > 0:
+                                    ep = float(pos_info.get("entry_price", 0.0))
+                                    sz = float(pos_info.get("size", 0.0))
+                                    s_side = pos_info.get("side", "Buy")
+                                    c_side = "Sell" if s_side.lower() == "buy" else "Buy"
+                                    h_sz = engine.client.quantize_qty(sym, sz * 0.5, category="linear")
+                                    engine.client.close_position_market(sym, c_side, h_sz)
+                                    q_sl = engine.client.quantize_price(sym, ep, category="linear")
+                                    engine.client.set_trading_stop(category="linear", symbol=sym, stop_loss=q_sl)
+                                    _reply(
+                                        cb_chat_id,
+                                        f"💰 *Master Desk 50% Profit Banked: ${ticker}* 💰\n\n"
+                                        f"• *Closed Size*: `{h_sz} contracts`\n"
+                                        f"• *Stop Loss*: Snapped to Entry (`${ep:,.4f}`)\n"
+                                        f"• *Status*: Remaining half running risk-free!",
+                                        bot_token=token,
+                                    )
+                                    continue
+
+                            if not target_pos:
+                                _reply(cb_chat_id, f"⚠️ No active open position found for ${ticker}.", bot_token=token)
+                                continue
+
+                            entry = float(target_pos.get("entry_price", 0.0))
+                            side = target_pos.get("side", "BUY").upper()
+                            qty = float(target_pos.get("qty", 0.0))
+                            lp = fetch_live_price(ticker) or entry
+                            client = exchange_manager.get_user_bybit_client(cb_chat_id)
+                            sym = bybit_linear_symbol(ticker)
+
+                            close_qty = round(qty * 0.5, 4)
+                            if client:
+                                try:
+                                    c_side = "Sell" if side == "BUY" else "Buy"
+                                    q_close = client.quantize_qty(sym, close_qty, category="linear")
+                                    client.close_position_market(sym, c_side, q_close)
+                                    q_sl = client.quantize_price(sym, entry, category="linear")
+                                    client.set_trading_stop(category="linear", symbol=sym, stop_loss=q_sl)
+                                except Exception as e_c:
+                                    log.debug("Error banking 50% on Bybit for %s: %s", ticker, e_c)
+
+                            raw_pct = ((lp - entry) / entry) if side == "BUY" else ((entry - lp) / entry)
+                            pnl_50 = raw_pct * entry * close_qty
+                            target_pos["qty"] = max(0.0001, round(qty - close_qty, 4))
+                            target_pos["sl"] = entry
+                            target_pos["derisked"] = True
+                            target_pos["be_trailed"] = True
+                            user_store.update_user_position(cb_chat_id, target_pid, target_pos)
+                            u["paper_equity"] = round(u.get("paper_equity", 10000.0) + pnl_50, 2)
+                            user_store._save_user(cb_chat_id, u)
+
+                            _reply(
+                                cb_chat_id,
+                                f"💰 *50% Profit Banked: ${ticker}* 💰\n\n"
+                                f"• *Realized PnL*: `+${pnl_50:,.2f} USDT`\n"
+                                f"• *Remaining Qty*: `{target_pos['qty']} contracts`\n"
+                                f"• *Stop Loss*: Snapped to Breakeven (`${entry:,.4f}`)\n"
+                                f"• *Status*: Remaining half is running 100% Risk-Free!",
+                                bot_token=token,
+                            )
+                            continue
+
+                        if cb_data.startswith("pos_close_full_"):
+                            ticker = cb_data.replace("pos_close_full_", "").upper().strip()
+                            import exchange_manager
+                            from scanner import fetch_live_price
+                            u = user_store.get_user(cb_chat_id)
+                            open_pos = u.get("open_positions", {})
+                            target_pid = None
+                            target_pos = None
+                            for pid, p in open_pos.items():
+                                if p.get("ticker", "").upper() == ticker:
+                                    target_pid = pid
+                                    target_pos = p
+                                    break
+
+                            # Also check master desk positions if admin
+                            if not target_pos and is_admin(cb_chat_id):
+                                sym = bybit_linear_symbol(ticker)
+                                import engine
+                                pos_info = engine.client.get_position(sym)
+                                if pos_info and float(pos_info.get("size", 0.0)) > 0:
+                                    sz = float(pos_info.get("size", 0.0))
+                                    s_side = pos_info.get("side", "Buy")
+                                    c_side = "Sell" if s_side.lower() == "buy" else "Buy"
+                                    engine.client.close_position_market(sym, c_side, sz)
+                                    _reply(
+                                        cb_chat_id,
+                                        f"🛑 *Master Desk Emergency Market Close: ${ticker}* 🛑\n\n"
+                                        f"• *Closed Size*: `{sz} contracts`\n"
+                                        f"• *Status*: Bybit position fully closed at market.",
+                                        bot_token=token,
+                                    )
+                                    continue
+
+                            if not target_pos:
+                                _reply(cb_chat_id, f"⚠️ No active open position found for ${ticker}.", bot_token=token)
+                                continue
+
+                            entry = float(target_pos.get("entry_price", 0.0))
+                            side = target_pos.get("side", "BUY").upper()
+                            qty = float(target_pos.get("qty", 0.0))
+                            lp = fetch_live_price(ticker) or entry
+                            client = exchange_manager.get_user_bybit_client(cb_chat_id)
+                            sym = bybit_linear_symbol(ticker)
+
+                            if client:
+                                try:
+                                    c_side = "Sell" if side == "BUY" else "Buy"
+                                    client.close_position_market(sym, c_side, qty)
+                                except Exception as e_c:
+                                    log.debug("Error full close on Bybit for %s: %s", ticker, e_c)
+
+                            closed_record = user_store.close_user_position(cb_chat_id, target_pid, lp, reason="USER_ONE_TAP_CLOSE")
+                            pnl_val = closed_record.get("pnl_usdt", 0.0) if closed_record else 0.0
+                            _reply(
+                                cb_chat_id,
+                                f"🛑 *Emergency Market Close: ${ticker}* 🛑\n\n"
+                                f"• *Closed Price*: `${lp:,.4f}`\n"
+                                f"• *Net Realized PnL*: `+${pnl_val:,.2f} USDT`\n"
+                                f"• *Status*: Position fully liquidated and slot released.",
+                                bot_token=token,
+                            )
+                            continue
+
+                        if cb_data.startswith("pos_view_dna_"):
+                            ticker = cb_data.replace("pos_view_dna_", "").upper().strip()
+                            import asset_dna
+                            dna = asset_dna.get_asset_dna(ticker)
+                            name = dna.get("name", ticker)
+                            arch = dna.get("archetype", "UNKNOWN")
+                            buf_pct = dna.get("min_stop_buffer", 0.0075) * 100.0
+                            run_st = dna.get("run_style", "N/A")
+                            tr_mode = dna.get("trail_mode", "N/A")
+                            unl_risk = dna.get("unlock_risk", False)
+                            unl_days = dna.get("monthly_unlock_days", [])
+                            unl_str = f"⚠️ High Cliff Risk (Monthly Days {unl_days})" if unl_risk else "✅ Clean (No Cliff Risk)"
+                            burn = "🔥 Active Supply Burn" if dna.get("burn_catalyst") else "None"
+                            sess = dna.get("best_session", "ALL")
+                            desc = dna.get("description", "")
+                            dna_card = (
+                                f"🧬 *Asset DNA Profile: {ticker} ({name})*\n\n"
+                                f"• *Archetype*: `{arch}`\n"
+                                f"• *Stop Noise Floor*: `≥ {buf_pct:.2f}%`\n"
+                                f"• *Trailing Mode*: `{tr_mode}`\n"
+                                f"• *Movement Style*: `{run_st}`\n"
+                                f"• *Tokenomics & Unlocks*: {unl_str}\n"
+                                f"• *Burn Mechanics*: `{burn}`\n"
+                                f"• *Institutional Session*: `{sess}`\n\n"
+                                f"💡 *Specialist Playbook*: _{desc}_"
+                            )
+                            _reply(cb_chat_id, dna_card, bot_token=token)
+                            continue
+
                         continue
 
                     # 3. Handle messages & channel posts
@@ -3025,9 +3912,27 @@ def _poll_single_bot(token: str, allowed_chat_id: Optional[str] = None, scan_tri
                     lower_text = raw_text.lower()
                     is_dm = not (chat_id.startswith("-") or chat_id.startswith("-100"))
                     is_unauthorized = not access_manager.is_user_authorized(chat_id)
+
+                    # On-demand token inquiry detection (Exclusive to Winz bot)
+                    winz_tok = c_tok or cfg.call_bot_token
+                    is_this_winz = bool(token and (token == winz_tok or (c_tok and token == c_tok)))
+                    token_q = parse_token_research_query(raw_text) if is_this_winz else None
+
+                    # Recognize command prefixes (?, !, /) or bare command names
+                    first_w = raw_text.split()[0].lower().split("@")[0].strip() if raw_text.split() else ""
+                    clean_first_w = first_w.lstrip("/?!")
+                    is_known_cmd_w = (
+                        clean_first_w in RESERVED_BOT_COMMANDS
+                        or clean_first_w in [c["command"] for c in WINZ_PUBLIC_COMMANDS]
+                        or clean_first_w in [c["command"] for c in BOT_COMMANDS]
+                    )
+                    has_cmd_prefix = first_w.startswith(("/", "?", "!"))
+
                     is_cmd = (
-                        raw_text.startswith("/")
+                        has_cmd_prefix
+                        or is_known_cmd_w
                         or (is_dm and is_unauthorized)
+                        or (token_q is not None)
                         or "convert to twitter" in lower_text
                         or "tweet" in lower_text
                         or ("research" in lower_text and "(" in lower_text and ")" in lower_text)
@@ -3114,6 +4019,8 @@ def _poll_updates_loop(scan_trigger_fn=None) -> None:
 BOT_COMMANDS = [
     {"command": "watchlist", "description": "🎯 Best setups to watch now & smart shelves"},
     {"command": "status", "description": "Balance, equity & open positions"},
+    {"command": "shield", "description": "🛡️ 2-Stage Daily Profit Shield (+20% / +50%)"},
+    {"command": "dailydebug", "description": "🧠 1AM WAT debug, learning & backtest"},
     {"command": "positions", "description": "Active Bybit positions & targets"},
     {"command": "tp", "description": "🎯 Close all open trades in profit"},
     {"command": "derisk", "description": "Close winning trades & trim losers 50%"},
@@ -3171,9 +4078,12 @@ BOT_COMMANDS = [
 WINZ_PUBLIC_COMMANDS = [
     {"command": "access", "description": "🔑 Activate or verify your access code"},
     {"command": "calls", "description": "📋 View active triggered trades & pending setups"},
+    {"command": "dna", "description": "🧬 View Master Asset DNA, unlock dates & macro levels (e.g. /dna DOGE)"},
     {"command": "hourlycalls", "description": "🎯 View 15 trade desk calls (6 scalp + 4 day + 5 spot)"},
     {"command": "spot", "description": "💎 View 5 spot accumulation setups with buttons"},
     {"command": "status", "description": "📊 View your personal $10,000 demo portfolio"},
+    {"command": "shield", "description": "🛡️ 2-Stage Daily Profit Shield (+20% / +50%)"},
+    {"command": "dailydebug", "description": "🧠 1AM WAT debug, learning & backtest"},
     {"command": "positions", "description": "📈 View your personal active positions"},
     {"command": "trade", "description": "🚀 Open a personal paper trade (e.g. /trade BTC)"},
     {"command": "tp", "description": "🎯 Bank profits on all winning positions"},
@@ -3203,6 +4113,7 @@ WINZ_PUBLIC_COMMANDS = [
     {"command": "connect", "description": "🔐 Connect Bybit account (/connect bybit <KEY> <SECRET>)"},
     {"command": "myexchange", "description": "💼 View connected exchange balance & status"},
     {"command": "autotrade", "description": "⚙️ Toggle automated trade execution on/off"},
+    {"command": "compound", "description": "📈 Scale margin dynamically with equity (e.g. /compound 1.0)"},
     {"command": "risk", "description": "⚖️ Set margin size per trade (e.g. /risk 50)"},
     {"command": "disconnect", "description": "🔌 Disconnect exchange and wipe API keys"},
     {"command": "help", "description": "Show command guide and help"},

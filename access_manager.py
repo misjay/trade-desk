@@ -122,6 +122,8 @@ def is_user_authorized(chat_id: Union[str, int]) -> bool:
         return True
 
     cid = str(chat_id).strip()
+    if cid.startswith("-"):
+        return True
     with _lock:
         data = _load_data()
         user_info = data.get("authorized_users", {}).get(cid)

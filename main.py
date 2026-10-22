@@ -170,11 +170,12 @@ def run_scan_cycle(trade_type: str = "scalp", manual: bool = False):
     skipped_paused_count = 0
     executed_count = 0
 
-    # 1. Global Daily Loss Circuit Breaker Check
+    # 1. Global Daily Loss Circuit Breaker Check (Master Paper Trading Desk)
     gcb_active, gcb_reason = state.is_global_circuit_breaker_active()
+    master_paper_frozen = False
     if gcb_active and not manual:
-        log.warning("🚨 %s Skipping scheduled %s execution.", gcb_reason, trade_type)
-        return
+        master_paper_frozen = True
+        log.warning("🚨 %s Master paper desk is FROZEN. Live user auto-trading and signal tracking will continue.", gcb_reason)
 
     # 2. High-Impact Macro Economic News Blackout Check (CPI, FOMC, NFP)
     macro_active, macro_reason = check_macro_news_blackout()
@@ -183,9 +184,8 @@ def run_scan_cycle(trade_type: str = "scalp", manual: bool = False):
         return
 
     in_weekend_derisk = is_weekend_derisk_window()
-    if in_weekend_derisk and trade_type == "scalp" and not manual:
-        log.info("🛡️ Weekend Defense Mode active (Friday 14:00 -> Sunday 22:00 UTC): 15m scalp execution muted. High-timeframe A+ setups only.")
-        return
+    if in_weekend_derisk:
+        log.info("🛡️ Weekend Defense Mode active (Friday 21:00 -> Sunday 22:00 UTC): Restricting %s execution to A+ setups (>=88%%) on liquid leaders.", trade_type)
 
     # ── Speed-to-Target & Conviction Priority Ranking ────────────────────────
     # Rank actionable signals by highest conviction and closest distance to TP1
@@ -227,33 +227,18 @@ def run_scan_cycle(trade_type: str = "scalp", manual: bool = False):
             state.save_signal(sig)
             continue
 
-        # Weekend Defense Mode Gatekeeper (Majors only, Max 2 positions, >=92% conviction)
+        # Weekend Defense Mode Gatekeeper (Liquid leaders only, Max 4 positions, >=88% A+ conviction)
         if in_weekend_derisk:
             if ticker not in WEEKEND_MAJORS_ONLY:
-                log.info("🛡️ Weekend Defense: Skipping %s %s (Weekend trading restricted to high-liquidity majors: %s)",
+                log.info("🛡️ Weekend Defense: Skipping %s %s (Weekend trading restricted to high-liquidity leaders: %s)",
                          ticker, side, ", ".join(WEEKEND_MAJORS_ONLY))
                 state.save_signal(sig)
                 continue
-            if sig.get("conviction", 0) < 92.0:
-                log.info("🛡️ Weekend Defense: Skipping %s %s (conviction %.1f%% < 92.0%% A+ weekend threshold)",
+            if sig.get("conviction", 0) < 88.0:
+                log.info("🛡️ Weekend Defense: Skipping %s %s (conviction %.1f%% < 88.0%% A+ weekend threshold)",
                          ticker, side, sig.get("conviction", 0))
                 state.save_signal(sig)
                 continue
-
-        # Check if an active open position already exists for this ticker
-        open_pos = state.get_open_positions()
-        if has_active_pos := any(p.get("ticker") == ticker for p in open_pos.values()):
-            log.info("Active position already open for %s, skipping", ticker)
-            state.save_signal(sig)
-            continue
-
-        # Check max concurrent positions cap (capped to 2 on weekends, cfg.max_concurrent_positions on weekdays)
-        effective_max_pos = 2 if in_weekend_derisk else cfg.max_concurrent_positions
-        if len(open_pos) >= effective_max_pos:
-            log.info("Active positions at cap (%d/%d). Skipping %s execution to minimize risk.",
-                     len(open_pos), effective_max_pos, ticker)
-            state.save_signal(sig)
-            continue
 
         # Broadcast card to Telegram if fresh shelf
         prev = state.get_last_signal(ticker)
@@ -282,32 +267,92 @@ def run_scan_cycle(trade_type: str = "scalp", manual: bool = False):
                         name=f"trend-alert-{ticker}",
                     ).start()
 
-        # If bot is paused, do NOT execute any automated orders
+        # Decoupled Live User Auto-Trade Dispatch:
+        # Evaluate setup for active Bybit auto-traders independently of Master Desk capacity.
+        # User-specific risk limits (Option A caps, correlation, margin buffer, user circuit breaker)
+        # are safely enforced per-user inside exchange_manager.
+        try:
+            import exchange_manager
+            call_cfg = state.get_call_bot_config()
+            c_tok = call_cfg.get("token") or cfg.call_bot_token or cfg.telegram_token
+            lp = float(sig.get("live_price", 0.0) or sig.get("entry_mid", 0.0))
+            sig_payload = {
+                "ticker": ticker,
+                "side": side,
+                "live_price": lp,
+                "trigger_price": lp,
+                "sl": sig.get("sl"),
+                "tp1": sig.get("tp1"),
+                "tp2": sig.get("tp2"),
+                "tf": "15m" if trade_type == "scalp" else "4h",
+                "conviction": sig.get("conviction", 80),
+                "score": sig.get("score") or sig.get("conviction", 80),
+                "confidence": sig.get("confidence") or sig.get("conviction", 80),
+                "grade": sig.get("grade") or ("A+" if sig.get("conviction", 0) >= 88 else "A"),
+            }
+            threading.Thread(
+                target=exchange_manager.dispatch_triggered_trade_to_users,
+                args=(sig_payload,),
+                kwargs={"bot_token": c_tok},
+                daemon=True,
+                name=f"live-user-dispatch-{ticker}",
+            ).start()
+        except Exception as exc:
+            log.warning("Could not dispatch signal %s to live users: %s", ticker, exc)
+
+        # ── Master Trade Desk Execution ───────────────────────────────────
+        # Check if Master Desk execution is paused
         if is_paused:
             skipped_paused_count += 1
-            log.info("Bot is PAUSED: skipping order placement for %s %s. Use /resume to enable execution.", ticker, side)
+            log.info("Bot is PAUSED: skipping Master Desk order for %s %s. Use /resume to enable execution.", ticker, side)
             state.save_signal(sig)
             continue
 
-        # Hummingbot Inventory Skew & Net Directional Exposure Balancing
+        if master_paper_frozen:
+            log.info("Master Paper Desk frozen by circuit breaker: Skipping master demo order for %s %s.", ticker, side)
+            state.save_signal(sig)
+            continue
+
+        # Check if an active open position already exists for this ticker on Master Desk
+        open_pos = state.get_open_positions()
+        if has_active_pos := any(p.get("ticker") == ticker for p in open_pos.values()):
+            log.info("Active position already open on Master Desk for %s, skipping master order", ticker)
+            state.save_signal(sig)
+            continue
+
+        # Check Master Desk max concurrent positions cap
+        effective_max_pos = 4 if in_weekend_derisk else cfg.max_concurrent_positions
+        if len(open_pos) >= effective_max_pos:
+            sig_conv = float(sig.get("conviction", 80.0) or 80.0)
+            if sig_conv >= 88.0:
+                evicted = engine.evict_weakest_working_order(sig_conv, min_gap=6.0)
+                if evicted:
+                    open_pos = state.get_open_positions()
+            if len(open_pos) >= effective_max_pos:
+                log.info("Master Desk active positions at cap (%d/%d). Skipping %s master order.",
+                         len(open_pos), effective_max_pos, ticker)
+                state.save_signal(sig)
+                continue
+
+        # Hummingbot Inventory Skew & Net Directional Exposure Balancing for Master Desk
         skew_ok, skew_reason = engine.check_portfolio_inventory_skew(side)
         if not skew_ok:
-            log.info("Inventory skew cap reached: Skipping automated order for %s %s (%s)", ticker, side, skew_reason)
+            log.info("Master Desk inventory skew cap reached: Skipping master order for %s %s (%s)", ticker, side, skew_reason)
             state.save_signal(sig)
             continue
 
-        # Narrative & Ecosystem Sector Basket Exposure Cap
+        # Narrative & Ecosystem Sector Basket Exposure Cap for Master Desk
         sector_ok, sector_reason = engine.check_sector_basket_exposure(ticker)
         if not sector_ok:
-            log.info("Sector basket cap reached: Skipping automated order for %s (%s)", ticker, sector_reason)
+            log.info("Master Desk sector basket cap reached: Skipping master order for %s (%s)", ticker, sector_reason)
             state.save_signal(sig)
             continue
 
-        # Execute order on Bybit (Demo or Live) since no active position exists and not paused
+        # Execute order for Master Desk
         res = engine.execute_signal(sig)
         if res.get("status") == "SUCCESS":
             executed_count += 1
-        log.info("Execution result for %s: %s", ticker, res)
+        log.info("Master Desk execution result for %s: %s", ticker, res)
 
         # Save to state store after execution
         state.save_signal(sig)
@@ -319,7 +364,7 @@ def run_scan_cycle(trade_type: str = "scalp", manual: bool = False):
             pause_note = f"\n\n⏸ *Execution is PAUSED.* ({skipped_paused_count} setups analyzed, 0 orders placed).\n_Bot will remain paused until you type `/resume`._"
         else:
             pause_note = f"\n\n🟢 *Execution is ACTIVE.* ({executed_count} orders placed)."
-        notifier.send_text(f"🔍 *Manual {trade_type.upper()} Scan Complete!*\nScanned Core 24 and Extras.{pause_note}")
+        notifier.send_text(f"🔍 *Manual {trade_type.upper()} Scan Complete!*\nScanned Institutional Leaders and Extras.{pause_note}")
 
 
 # ── Scheduler Setup ─────────────────────────────────────────────────────────
@@ -373,6 +418,14 @@ def _setup_scheduler():
             name="Daily Ticker Pruning & Quarantine Matrix (24h)",
             replace_existing=True,
         )
+    import daily_intel
+    _scheduler.add_job(
+        lambda: daily_intel.execute_daily_1am_wat_routine(),
+        trigger=CronTrigger(hour=0, minute=0, timezone="UTC"),  # 00:00 UTC == 1:00 AM WAT
+        id="daily_1am_wat_intel",
+        name="Daily Debug, Learn & Backtest (1:00 AM WAT)",
+        replace_existing=True,
+    )
     import dynamic_screener
     _scheduler.add_job(
         lambda: dynamic_screener.run_opportunistic_scan_and_dispatch(),

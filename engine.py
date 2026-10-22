@@ -1425,8 +1425,8 @@ def _sync_with_bybit() -> None:
                 try:
                     btc_ok, _ = scanner.check_btc_momentum_gate(b_side)
                     if not btc_ok:
-                        if curr_r >= 0.08:
-                            log.info("BTC Shock Shield: %s %s in slight green (+%.2fR) during adverse BTC impulse! Snapping SL to BE @%.4f", ticker, b_side, curr_r, b_entry)
+                        if curr_r >= 0.85:
+                            log.info("BTC Shock Shield: %s %s in healthy profit (+%.2fR) during adverse BTC impulse! Snapping SL to BE @%.4f", ticker, b_side, curr_r, b_entry)
                             state.update_open_position(matched_id, {"be_trailed": True, "btc_shock_tightened": True, "sl": b_entry})
                             matched_pos["be_trailed"] = True
                             matched_pos["btc_shock_tightened"] = True

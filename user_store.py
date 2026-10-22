@@ -18,7 +18,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -265,6 +265,7 @@ def close_user_position(
     pos_id: str,
     exit_price: float,
     reason: str = "MANUAL",
+    exact_pnl: Optional[float] = None,
 ) -> Optional[dict]:
     """Close a specific position in the user's portfolio and credit/debit PnL."""
     u = get_user(chat_id)
@@ -277,7 +278,12 @@ def close_user_position(
     side = pos.get("side", "BUY").upper()
     leverage = int(pos.get("leverage", 10))
 
-    if entry > 0:
+    if exact_pnl is not None:
+        pnl_usdt = float(exact_pnl)
+        notional = entry * qty
+        margin = float(pos.get("margin_usdt", 0.0)) or (notional / max(leverage, 1))
+        pnl_pct = (pnl_usdt / margin) if margin > 0 else 0.0
+    elif entry > 0:
         raw_pct = ((exit_price - entry) / entry) if side == "BUY" else ((entry - exit_price) / entry)
         pnl_pct = raw_pct * leverage
         notional = entry * qty
@@ -518,9 +524,30 @@ def set_user_risk_per_trade(chat_id: Union[str, int], risk_usdt: float) -> float
     """Set the fixed USDT margin allocated per automated trade."""
     u = get_user(chat_id)
     ex = u.setdefault("exchange", {})
-    val = max(5.0, min(10000.0, float(risk_usdt)))
+    val = max(1.0, min(10000.0, float(risk_usdt)))
     ex["risk_per_trade_usdt"] = val
     _save_user(chat_id, u)
+    return val
+
+
+def get_user_compounding_pct(chat_id: Union[str, int]) -> float:
+    """Retrieve user's compounding percentage (0.0 if disabled)."""
+    u = get_user(chat_id)
+    ex = u.get("exchange", {})
+    return float(ex.get("compounding_pct", 0.0) or 0.0)
+
+
+def set_user_compounding_pct(chat_id: Union[str, int], pct: float) -> float:
+    """
+    Set dynamic balance compounding percentage (e.g. 1.0 = 1.0% of balance per trade).
+    Setting to 0.0 disables compounding and falls back to fixed margin.
+    """
+    u = get_user(chat_id)
+    ex = u.setdefault("exchange", {})
+    val = round(max(0.0, min(10.0, float(pct))), 2)
+    ex["compounding_pct"] = val
+    _save_user(chat_id, u)
+    log.info("User %s compounding set to %.2f%%", chat_id, val)
     return val
 
 
@@ -655,3 +682,136 @@ def update_goal_morning_equity_if_new_day(chat_id: Union[str, int], current_equi
 
     return goal
 
+
+
+def get_user_auto_trade_mode(chat_id: Union[str, int]) -> str:
+    """Get the auto-trade filtering mode: 'hybrid' (70% scalp / 30% trend), 'sniper', or 'normal'."""
+    u = get_user(chat_id)
+    return str(u.get("auto_trade_mode", "hybrid")).lower()
+
+
+def set_user_auto_trade_mode(chat_id: Union[str, int], mode: str) -> str:
+    """Set the auto-trade filtering mode to 'hybrid', 'sniper', or 'normal'."""
+    u = get_user(chat_id)
+    m = str(mode).strip().lower()
+    if m in ("normal", "std", "standard", "off"):
+        m_clean = "normal"
+    elif m in ("sniper", "tight"):
+        m_clean = "sniper"
+    else:
+        m_clean = "hybrid"
+    u["auto_trade_mode"] = m_clean
+    _save_user(chat_id, u)
+    return m_clean
+
+
+def is_user_circuit_breaker_active(chat_id: Union[str, int]) -> Tuple[bool, str]:
+    """Check if the user is currently under an active circuit breaker cooldown."""
+    cid = str(chat_id).strip()
+    u = get_user(cid)
+    paused_until_str = u.get("circuit_breaker_until")
+    if paused_until_str:
+        try:
+            p_until = datetime.fromisoformat(paused_until_str.replace("Z", "+00:00"))
+            now_dt = datetime.now(timezone.utc)
+            if now_dt < p_until:
+                remaining_m = int((p_until - now_dt).total_seconds() / 60)
+                return True, f"Daily Loss Circuit Breaker Active: Cooldown for another {remaining_m} minutes."
+            else:
+                u["circuit_breaker_until"] = None
+                u["circuit_breaker_reset_at"] = now_dt.isoformat()
+                _save_user(cid, u)
+        except Exception:
+            pass
+    return False, ""
+
+
+def check_and_apply_user_circuit_breaker(chat_id: Union[str, int]) -> Tuple[bool, str]:
+    """
+    User Account Daily Loss Circuit Breaker:
+    Checks user's closed trades in the past 24 hours (or since last circuit breaker reset).
+    If the last 2 consecutive closed trades were losses OR net loss >= $3.00:
+    Triggers a 12-hour cooling pause to protect balance.
+    Returns: (is_paused, reason)
+    """
+    cid = str(chat_id).strip()
+    u = get_user(cid)
+
+    # 1. Check if already active
+    is_active, active_reason = is_user_circuit_breaker_active(cid)
+    if is_active:
+        return True, active_reason
+
+    closed = u.get("closed_positions", [])
+    if len(closed) < 2:
+        return False, ""
+
+    # 2. Check 24-hour window, or since last circuit breaker reset
+    now_dt = datetime.now(timezone.utc)
+    cutoff = now_dt - timedelta(hours=24)
+    last_reset_str = u.get("circuit_breaker_reset_at")
+    if last_reset_str:
+        try:
+            reset_dt = datetime.fromisoformat(last_reset_str.replace("Z", "+00:00"))
+            if reset_dt > cutoff:
+                cutoff = reset_dt
+        except Exception:
+            pass
+
+    recent_closed = []
+    total_loss_24h = 0.0
+
+    for p in closed:
+        c_at = p.get("closed_at")
+        if c_at:
+            try:
+                dt = datetime.fromisoformat(c_at.replace("Z", "+00:00"))
+                if dt >= cutoff:
+                    pnl = float(p.get("pnl_usdt", 0.0) or p.get("pnl", 0.0) or 0.0)
+                    total_loss_24h += pnl
+                    recent_closed.append(p)
+            except Exception:
+                pass
+
+    if len(recent_closed) < 2:
+        return False, ""
+
+    # Check last 2 closed trades in this active cycle
+    last_two = recent_closed[-2:]
+    all_losses = True
+    for p in last_two:
+        pnl = float(p.get("pnl_usdt", 0.0) or p.get("pnl", 0.0) or 0.0)
+        if pnl >= 0.0:
+            all_losses = False
+            break
+
+    should_trip = False
+    trip_reason = ""
+    if all_losses:
+        should_trip = True
+        trip_reason = "2 consecutive losses recorded"
+    elif total_loss_24h <= -3.00:
+        should_trip = True
+        trip_reason = f"Cycle net loss reached ${abs(total_loss_24h):.2f} (>= $3.00 limit)"
+
+    if should_trip:
+        cooldown_until = (now_dt + timedelta(hours=12)).isoformat()
+        u["circuit_breaker_until"] = cooldown_until
+        u["circuit_breaker_reset_at"] = (now_dt + timedelta(hours=12)).isoformat()
+        _save_user(cid, u)
+        log.warning("🚨 Daily Circuit Breaker TRIPPED for user %s: %s. Paused for 12 hours.", cid, trip_reason)
+        return True, f"Daily Loss Circuit Breaker Tripped ({trip_reason}). Auto-trading paused for 12 hours to protect capital."
+
+    return False, ""
+
+
+def reset_user_circuit_breaker(chat_id: Union[str, int]) -> bool:
+    """Manually or programmatically reset user's circuit breaker and advance the evaluation window."""
+    cid = str(chat_id).strip()
+    u = get_user(cid)
+    now_dt = datetime.now(timezone.utc)
+    u["circuit_breaker_until"] = None
+    u["circuit_breaker_reset_at"] = now_dt.isoformat()
+    _save_user(cid, u)
+    log.info("Reset circuit breaker for user %s at %s", cid, now_dt.isoformat())
+    return True

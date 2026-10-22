@@ -820,6 +820,28 @@ def sync_user_positions_with_bybit(chat_id: Union[str, int], bot_token: Optional
     u = user_store.get_user(cid)
     user_open = u.get("open_positions", {})
 
+    # Auto-cancel any stale resting entry orders (>10m) or excess resting orders (> max_positions)
+    try:
+        ex_info = u.get("exchange", {})
+        max_pos_allowed = int(ex_info.get("max_positions", 2))
+        open_orders = client.get_open_orders(category="linear")
+        now_epoch = time.time()
+        for o in open_orders:
+            if o.get("orderStatus") in ("New", "PartiallyFilled") and float(o.get("price", 0.0)) > 0:
+                raw_c = o.get("createdTime") or o.get("created_time")
+                c_ts = float(raw_c) / 1000.0 if raw_c else 0.0
+                is_stale = (c_ts > 0 and (now_epoch - c_ts) > 600.0)
+                is_excess = (len(active_syms) >= max_pos_allowed)
+                if is_stale or is_excess:
+                    oid = o.get("orderId") or o.get("order_id")
+                    osym = o.get("symbol")
+                    if oid and osym:
+                        client.cancel_order(category="linear", symbol=osym, order_id=oid)
+                        log.info("🧹 Auto-cancelled resting entry limit order on %s (ID=%s, stale=%s, excess=%s) for user %s",
+                                 osym, oid, is_stale, is_excess, cid)
+    except Exception as e_clean:
+        log.debug("Resting order cleanup error for user %s: %s", cid, e_clean)
+
     # Ingest any active Bybit positions not yet recorded in user_open
     for bp in bybit_pos:
         s = bp.get("symbol", "")

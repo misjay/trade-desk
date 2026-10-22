@@ -764,15 +764,27 @@ class BybitClient:
         for p in res.get("result", {}).get("list", []):
             size = float(p.get("size", 0) or 0)
             if size > 0:
+                avg_p = float(p.get("avgPrice", 0) or p.get("entryPrice", 0) or 0)
+                mark_p = float(p.get("markPrice", 0) or 0)
+                u_pnl = float(p.get("unrealisedPnl", 0) or 0)
+                sl_p = float(p.get("stopLoss", 0) or 0) if p.get("stopLoss") else None
+                tp_p = float(p.get("takeProfit", 0) or 0) if p.get("takeProfit") else None
                 active.append({
                     "symbol": p.get("symbol"),
                     "side": p.get("side"),  # "Buy" or "Sell"
                     "size": size,
-                    "entry_price": float(p.get("avgPrice", 0) or 0),
-                    "mark_price": float(p.get("markPrice", 0) or 0),
-                    "unrealised_pnl": float(p.get("unrealisedPnl", 0) or 0),
-                    "stop_loss": float(p.get("stopLoss", 0) or 0) if p.get("stopLoss") else None,
-                    "take_profit": float(p.get("takeProfit", 0) or 0) if p.get("takeProfit") else None,
+                    "entry_price": avg_p,
+                    "avg_price": avg_p,
+                    "avgPrice": avg_p,
+                    "entryPrice": avg_p,
+                    "mark_price": mark_p,
+                    "markPrice": mark_p,
+                    "unrealised_pnl": u_pnl,
+                    "unrealisedPnl": u_pnl,
+                    "stop_loss": sl_p,
+                    "stopLoss": sl_p,
+                    "take_profit": tp_p,
+                    "takeProfit": tp_p,
                     "leverage": int(float(p.get("leverage", 1) or 1)),
                     "position_idx": p.get("positionIdx", 0),
                     "updated_time": p.get("updatedTime"),

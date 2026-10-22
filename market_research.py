@@ -512,6 +512,27 @@ def generate_market_research(sig: dict) -> str:
     lines.append("")
     lines.append(f"*Verdict:* {verdict}")
 
+    # ── Key Actionable Setup & Entry Levels ───────────────────────────────────
+    conv = sig.get("conviction", 92.0)
+    tp1_pct = sig.get("tp1_pct", 2.5)
+    tp2_pct = sig.get("tp2_pct", 5.0)
+    sl_pct = sig.get("sl_pct", 1.2)
+    rr = sig.get("rr", 2.0)
+    side_emoji = "🟢" if side == "BUY" else ("🔴" if side == "SELL" else "🟡")
+    direction_label = "LONG / BUY" if side == "BUY" else ("SHORT / SELL" if side == "SELL" else "NEUTRAL / WAIT")
+
+    lines.append("")
+    lines.append(f"🎯 *Actionable Entry & Targets ({tf}):*")
+    lines.append(f"• *Bias*: {side_emoji} `{direction_label}` | *Mark*: `{mark_str}`")
+    lines.append(f"• *Entry Band*: `{band_str}`")
+    lines.append(f"• *Take Profit 1*: `{tp1_str}` (`+{tp1_pct:.1f}%`)")
+    lines.append(f"• *Take Profit 2*: `{tp2_str}` (`+{tp2_pct:.1f}%`)")
+    lines.append(f"• *Invalidation (SL)*: `{sl_str}` (`-{sl_pct:.1f}%`)")
+    lines.append(f"• *Risk / Reward*: `1 : {rr:.1f}` | *Conviction*: `{conv:.0f}%`")
+    lines.append("")
+    lines.append("🛡️ *Independent Research Setup*")
+    lines.append("_ℹ️ This setup is generated on-demand purely for your independent research & personal discretion. It is completely isolated from the automated trading engine and will NOT trigger automated execution._")
+
     return "\n".join(lines)
 
 
@@ -830,6 +851,11 @@ def send_research_with_chart(
                 "parse_mode": "Markdown",
                 "reply_markup": json.dumps({
                     "inline_keyboard": [
+                        [
+                            {"text": "⚡ 15m Scalp", "callback_data": f"call_view_{ticker}_15m"},
+                            {"text": "📈 4h Day", "callback_data": f"call_view_{ticker}_4h"},
+                            {"text": "💎 1D Spot", "callback_data": f"call_view_{ticker}_spot"},
+                        ],
                         [{"text": "❌ Close Chart", "callback_data": "close_msg"}]
                     ]
                 }),
@@ -848,7 +874,15 @@ def send_research_with_chart(
         "disable_web_page_preview": True,
         "reply_markup": {
             "inline_keyboard": [
-                [{"text": "❌ Close Research", "callback_data": "close_msg"}]
+                [
+                    {"text": "⚡ 15m Scalp", "callback_data": f"call_view_{ticker}_15m"},
+                    {"text": "📈 4h Day Trade", "callback_data": f"call_view_{ticker}_4h"},
+                    {"text": "💎 1D Macro Spot", "callback_data": f"call_view_{ticker}_spot"},
+                ],
+                [
+                    {"text": "🐦 Tweet", "callback_data": f"tweet_{ticker}"},
+                    {"text": "❌ Close Research", "callback_data": "close_msg"}
+                ]
             ]
         },
     }
@@ -1060,12 +1094,17 @@ def dispatch_hourly_calls(
 
     index_msg = "\n".join(index_lines)
     send_url = f"https://api.telegram.org/bot{target_token}/sendMessage"
-    chats = call_cfg.get("all_chats")
-    if not chats:
-        chats = [target_chat] if target_chat else []
+    all_chats = list(call_cfg.get("all_chats") or [])
+    if chat_id:
+        chats = [str(chat_id)] + [str(x) for x in all_chats if str(x) != str(chat_id)]
+    else:
+        chats = all_chats if all_chats else ([str(target_chat)] if target_chat else [])
 
     for c in chats:
-        if not state.is_chat_alert_enabled(str(c), "digests"):
+        # Direct user request always delivers; otherwise check notification preference
+        if chat_id and str(c) == str(chat_id):
+            pass
+        elif not state.is_chat_alert_enabled(str(c), "digests"):
             log.debug("Chat %s has paused 2-hour digests. Skipping.", c)
             continue
         payload = {
@@ -1076,7 +1115,10 @@ def dispatch_hourly_calls(
             "reply_markup": {"inline_keyboard": inline_keyboard},
         }
         try:
-            requests.post(send_url, json=payload, timeout=12)
+            resp = requests.post(send_url, json=payload, timeout=12)
+            if resp.status_code != 200:
+                payload["parse_mode"] = None
+                requests.post(send_url, json=payload, timeout=12)
         except Exception as exc:
             log.warning("Failed to send 2-hour digest with buttons to chat %s: %s", c, exc)
 

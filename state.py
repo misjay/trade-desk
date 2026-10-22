@@ -127,6 +127,9 @@ def set_equity(new_equity: float) -> None:
     with _lock:
         s = _load_raw()
         s["paper_equity"] = round(new_equity, 4)
+        hwm = float(s.get("high_water_mark", 0.0) or 0.0)
+        if new_equity > hwm:
+            s["high_water_mark"] = round(new_equity, 4)
         _save(s)
 
 
@@ -315,6 +318,9 @@ def close_position(pos_id: str, exit_price: float, reason: str, exact_pnl: Optio
             s["session"]["wins"] += 1
         elif pnl_usdt < 0:
             s["session"]["losses"] += 1
+            t_clean = str(pos.get("ticker", "")).upper()
+            sd_clean = str(pos.get("side", "")).upper()
+            _process_loss_quarantine(s, t_clean, sd_clean, pnl_usdt, reason)
         else:
             s["session"]["breakevens"] += 1
         s["session"]["total_pnl_usdt"] = round(
@@ -359,6 +365,9 @@ def record_closed_position(closed: dict) -> None:
             s["session"]["wins"] += 1
         elif pnl < 0:
             s["session"]["losses"] += 1
+            t_raw = str(closed.get("ticker", closed.get("symbol", ""))).replace("USDT", "").upper()
+            sd_clean = str(closed.get("side", "")).upper()
+            _process_loss_quarantine(s, t_raw, sd_clean, pnl, closed.get("exit_reason", "BYBIT_TRADE"))
         else:
             s["session"]["breakevens"] += 1
         s["session"]["total_pnl_usdt"] = round(s["session"]["total_pnl_usdt"] + pnl, 4)
@@ -395,8 +404,25 @@ def reset_state(keep_equity: bool = False, keep_configs: bool = True) -> None:
         log.info("State reset. Equity: %.2f", fresh["paper_equity"])
 
 
+def _purge_ticker_orders(ticker: str) -> None:
+    """Best-effort purge of resting orders on Bybit for a quarantined ticker to prevent adverse fills."""
+    try:
+        from engine import client
+        from config import bybit_linear_symbol
+        t_clean = ticker.upper().replace("USDT", "")
+        if t_clean.startswith("1000"):
+            t_clean = t_clean[4:]
+        sym = bybit_linear_symbol(t_clean)
+        if client and not client.is_paper:
+            cancelled = client.cancel_all_orders(category="linear", symbol=sym)
+            if cancelled:
+                log.info("🧹 Order Purge: Cancelled %d resting orders on Bybit for quarantined %s", len(cancelled), sym)
+    except Exception as exc:
+        log.debug("Order purge skipped/failed for %s: %s", ticker, exc)
+
+
 def quarantine_asset(ticker: str, hours: float = 24.0, reason: str = "") -> dict:
-    """Quarantine an asset for N hours. Adds to avoid_list with expiration timestamp."""
+    """Quarantine an asset for N hours. Adds to avoid_list with expiration timestamp and purges resting orders."""
     with _lock:
         s = _load_raw()
         t = ticker.strip().upper()
@@ -419,7 +445,91 @@ def quarantine_asset(ticker: str, hours: float = 24.0, reason: str = "") -> dict
         current_avoid.add(t)
         s["avoid_list"] = sorted(list(current_avoid))
         _save(s)
+
+        # Instant Resting Order Purge on Bybit
+        _purge_ticker_orders(t)
         return s["quarantine"][t]
+
+
+def _process_loss_quarantine(s: dict, ticker: str, side: str, pnl: float, reason: str) -> None:
+    """
+    Escalating Strike Penalty Engine:
+    - Strike 1 (1st loss in 24h): 2h Directional Quarantine (side-specific)
+    - Strike 2 (2nd loss in 24h): 12h Full Asset Freeze (avoid_list)
+    - Strike 3 (3rd+ loss in 24h): 48h Hard Asset Quarantine (avoid_list)
+    Automatically purges resting limit orders on Bybit for the asset.
+    """
+    t_raw = str(ticker).replace("USDT", "").upper()
+    t_clean = t_raw[4:] if t_raw.startswith("1000") else t_raw
+    sd_clean = str(side).upper()
+    if not t_clean or not sd_clean or pnl >= 0:
+        return
+
+    now = datetime.now(timezone.utc)
+    cutoff_24h = (now - timedelta(hours=24)).isoformat()
+    stopout_threshold = -max(5.00, float(getattr(cfg, "max_scalp_loss_cap", 10.0)) * 0.50)
+
+    # Count trailing genuine losses for this ticker in last 24h
+    recent_losses = 0
+    for cp in reversed(s.get("closed_positions", [])):
+        ts = cp.get("closed_at", cp.get("opened_at", ""))
+        if ts and ts < cutoff_24h:
+            continue
+        c_tick = str(cp.get("ticker", cp.get("symbol", ""))).replace("USDT", "").replace("1000", "").upper()
+        if c_tick == t_clean:
+            c_pnl = float(cp.get("pnl_usdt", cp.get("closed_pnl", 0.0)) or 0.0)
+            if c_pnl <= stopout_threshold:
+                recent_losses += 1
+
+    recent_losses = max(1, recent_losses)
+
+    strike1_h = float(getattr(cfg, "quarantine_strike1_hours", 2.0))
+    strike2_h = float(getattr(cfg, "quarantine_strike2_hours", 12.0))
+    strike3_h = float(getattr(cfg, "quarantine_strike3_hours", 48.0))
+
+    # Autonomous Leader Immunity: Never full-freeze proven liquid leaders (BTC, SOL, XRP, DOGE, ADA, AVAX, NEAR, LINK, BNB).
+    # Apply Directional Quarantine only to prevent desk starvation.
+    from config import AUTONOMOUS_TRADING_TICKERS
+    if t_clean in AUTONOMOUS_TRADING_TICKERS:
+        exp_dt = now + timedelta(hours=strike1_h)
+        dq = s.setdefault("directional_quarantine", {})
+        dq[f"{t_clean}_{sd_clean}"] = {
+            "ticker": t_clean,
+            "side": sd_clean,
+            "quarantined_at": _now(),
+            "expires_at": exp_dt.isoformat(),
+            "hours": strike1_h,
+            "strike": 1,
+            "reason": f"Autonomous Leader Directional Cooldown: Adverse {sd_clean} loss (-${abs(pnl):.2f} USDT, {reason})",
+        }
+        log.warning("🚫 AUTONOMOUS LEADER DIRECTIONAL COOLDOWN: %s %s blocked for %.1fh until %s.",
+                    t_clean, sd_clean, strike1_h, exp_dt.strftime("%H:%M UTC"))
+        return
+
+    if recent_losses >= 3:
+        # Strike 3: 48h Hard Quarantine
+        quarantine_asset(t_clean, hours=strike3_h, reason=f"Strike 3: {recent_losses} stopouts in 24h (Latest: -${abs(pnl):.2f})")
+        log.warning("🚨 STRIKE 3 QUARANTINE: %s placed on %.0fh HARD FREEZE (%d stopouts in 24h).", t_clean, strike3_h, recent_losses)
+    elif recent_losses == 2:
+        # Strike 2: 12h Full Asset Quarantine
+        quarantine_asset(t_clean, hours=strike2_h, reason=f"Strike 2: 2 stopouts in 24h (Latest: -${abs(pnl):.2f})")
+        log.warning("⚠️ STRIKE 2 QUARANTINE: %s placed on %.0fh FULL FREEZE (2 stopouts in 24h).", t_clean, strike2_h)
+    else:
+        # Strike 1: 2h Directional Quarantine
+        exp_dt = now + timedelta(hours=strike1_h)
+        dq = s.setdefault("directional_quarantine", {})
+        dq[f"{t_clean}_{sd_clean}"] = {
+            "ticker": t_clean,
+            "side": sd_clean,
+            "quarantined_at": _now(),
+            "expires_at": exp_dt.isoformat(),
+            "hours": strike1_h,
+            "strike": 1,
+            "reason": f"Strike 1: Adverse {sd_clean} loss (-${abs(pnl):.2f} USDT, {reason})",
+        }
+        log.warning("🚫 STRIKE 1 QUARANTINE: %s %s blocked for %.1fh until %s (-$%.2f loss).",
+                    t_clean, sd_clean, strike1_h, exp_dt.strftime("%H:%M UTC"), abs(pnl))
+        _purge_ticker_orders(t_clean)
 
 
 def check_and_update_quarantines() -> None:
@@ -455,6 +565,25 @@ def check_and_update_quarantines() -> None:
             changed = True
             log.info("24h Quarantine expired for %s. Moved to 50%% probation for 3 trades.", t)
 
+        # Prune stale probation items (> 48h old) to eliminate dead state bloat
+        stale_probation = []
+        for t, pdata in list(probation.items()):
+            started_str = pdata.get("started_at")
+            if started_str:
+                try:
+                    s_dt = datetime.fromisoformat(started_str)
+                    if (now - s_dt).total_seconds() > (48 * 3600):
+                        stale_probation.append(t)
+                except Exception:
+                    stale_probation.append(t)
+            else:
+                stale_probation.append(t)
+
+        for t in stale_probation:
+            del probation[t]
+            changed = True
+            log.info("🧹 State Hygiene: Purged stale probation record for %s (>48h inactive).", t)
+
         if changed:
             s["quarantine"] = quarantine
             s["probation"] = probation
@@ -466,6 +595,72 @@ def get_quarantine_list() -> Dict[str, dict]:
     check_and_update_quarantines()
     with _lock:
         return dict(_load_raw().get("quarantine", {}))
+
+
+def record_directional_quarantine(ticker: str, side: str, hours: float = 2.0, reason: str = "") -> dict:
+    """Quarantine an asset in a specific direction (BUY or SELL) for N hours after an adverse stopout."""
+    with _lock:
+        s = _load_raw()
+        t = ticker.strip().upper()
+        sd = side.strip().upper()
+        key = f"{t}_{sd}"
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(hours=hours)
+
+        dq = s.setdefault("directional_quarantine", {})
+        entry = {
+            "ticker": t,
+            "side": sd,
+            "quarantined_at": now.isoformat(),
+            "expires_at": expires.isoformat(),
+            "hours": hours,
+            "reason": reason or f"Adverse {sd} stopout on {t}",
+        }
+        dq[key] = entry
+        _save(s)
+        log.warning("🚫 Directional Quarantine ENGAGED: %s %s blocked until %s (%s)", t, sd, expires.strftime("%H:%M UTC"), entry["reason"])
+        _purge_ticker_orders(t)
+        return entry
+
+
+def is_directionally_quarantined(ticker: str, side: str, current_rsi: Optional[float] = None) -> Tuple[bool, str]:
+    """
+    Check if (ticker, side) is currently in directional quarantine cooldown.
+    Structural Release Gate:
+    If chronological timer has expired, but technical momentum is still extreme
+    (e.g. RSI > 58 on SHORT or RSI < 42 on BUY), auto-extends cooldown by 1 hour.
+    """
+    with _lock:
+        s = _load_raw()
+        t = ticker.strip().upper()
+        sd = side.strip().upper()
+        key = f"{t}_{sd}"
+        dq = s.get("directional_quarantine", {})
+        if key not in dq:
+            return False, ""
+
+        data = dq[key]
+        exp_str = data.get("expires_at")
+        if not exp_str:
+            return False, ""
+
+        try:
+            exp_dt = datetime.fromisoformat(exp_str)
+            now = datetime.now(timezone.utc)
+            if now < exp_dt:
+                rem_mins = int((exp_dt - now).total_seconds() / 60)
+                reason = data.get("reason", "Recent stopout")
+                return True, f"Directional Quarantine Active: {t} {sd} cooling down for {rem_mins}m ({reason})"
+            else:
+                # Timer expired -> clean up cleanly without perpetual extension trap
+                del dq[key]
+                s["directional_quarantine"] = dq
+                _save(s)
+                log.info("✅ Directional Quarantine CLEARED: %s %s is now unlocked for trading.", t, sd)
+                return False, ""
+        except Exception as exc:
+            log.debug("Error in is_directionally_quarantined: %s", exc)
+        return False, ""
 
 
 def get_avoid_list() -> List[str]:
@@ -553,7 +748,7 @@ def record_probation_trade(ticker: str, pnl: float) -> Optional[str]:
 def check_and_trigger_consecutive_loss_quarantine(ticker: str) -> Optional[dict]:
     """
     Real-time circuit breaker:
-    If ticker has 2 consecutive closed losses, immediately quarantine for 24h.
+    If ticker has 2 consecutive closed losses, immediately engage Strike 2 (12h full asset freeze).
     """
     with _lock:
         s = _load_raw()
@@ -561,17 +756,24 @@ def check_and_trigger_consecutive_loss_quarantine(ticker: str) -> Optional[dict]
         if t_clean in s.get("quarantine", {}):
             return None
 
+        # Calibrated directly against active scalp loss cap rather than total equity
+        stopout_threshold = -max(5.00, float(getattr(cfg, "max_scalp_loss_cap", 10.0)) * 0.50)
+
         closed = s.get("closed_positions", [])
         ticker_closed = [
             c for c in reversed(closed)
-            if c.get("ticker", "").upper() == t_clean or c.get("symbol", "").replace("USDT", "").replace("1000", "") == t_clean
+            if (c.get("ticker", "").upper() == t_clean or c.get("symbol", "").replace("USDT", "").replace("1000", "") == t_clean)
+            and "PARTIAL" not in str(c.get("exit_reason", "")).upper()
         ]
         if len(ticker_closed) >= 2:
             pnl1 = float(ticker_closed[0].get("pnl_usdt", 0.0) or ticker_closed[0].get("closed_pnl", 0.0))
             pnl2 = float(ticker_closed[1].get("pnl_usdt", 0.0) or ticker_closed[1].get("closed_pnl", 0.0))
-            if pnl1 < -1.0 and pnl2 < -1.0:
-                log.warning("Real-Time Circuit Breaker: %s had 2 consecutive losses ($%.2f, $%.2f). Auto-quarantining for 24h.", t_clean, pnl2, pnl1)
-                return quarantine_asset(t_clean, hours=24.0, reason=f"2 consecutive stop-outs (${pnl2:,.2f}, ${pnl1:,.2f})")
+            if pnl1 <= stopout_threshold and pnl2 <= stopout_threshold:
+                strike2_h = float(getattr(cfg, "quarantine_strike2_hours", 12.0))
+                log.warning("Real-Time Circuit Breaker: %s had 2 consecutive stop-outs ($%.2f, $%.2f). Auto-quarantining for %.0fh.", t_clean, pnl2, pnl1, strike2_h)
+                res = quarantine_asset(t_clean, hours=strike2_h, reason=f"2 consecutive stop-outs (${pnl2:,.2f}, ${pnl1:,.2f})")
+                _purge_ticker_orders(t_clean)
+                return res
     return None
 
 
@@ -664,8 +866,10 @@ def check_and_trigger_global_daily_circuit_breaker() -> Optional[dict]:
                 except Exception:
                     pass
 
-        # If net PnL is negative and net loss exceeds threshold:
-        if recent_pnl <= -abs(cfg.max_daily_loss_usdt):
+        # Dynamic daily loss cap: max of cfg.max_daily_loss_usdt or 3.0% of current equity
+        eq = float(s.get("paper_equity", cfg.paper_equity) or cfg.paper_equity)
+        effective_max_loss = max(abs(cfg.max_daily_loss_usdt), eq * 0.03)
+        if recent_pnl <= -effective_max_loss:
             freeze_hrs = cfg.global_circuit_breaker_freeze_hours
             expires = now + timedelta(hours=freeze_hrs)
             gcb = {
@@ -674,14 +878,72 @@ def check_and_trigger_global_daily_circuit_breaker() -> Optional[dict]:
                 "expires_at": expires.isoformat(),
                 "hours": freeze_hrs,
                 "loss_24h": round(abs(recent_pnl), 2),
-                "reason": f"Rolling 24h loss (-${abs(recent_pnl):,.2f}) exceeded daily cap (-${cfg.max_daily_loss_usdt:,.2f})",
+                "reason": f"Rolling 24h loss (-${abs(recent_pnl):,.2f}) exceeded daily cap (-${effective_max_loss:,.2f})",
             }
             s["global_circuit_breaker"] = gcb
             _save(s)
             log.warning("🚨 GLOBAL DAILY CIRCUIT BREAKER TRIGGERED! 24h loss -$%.2f >= -$%.2f cap. Freezing new orders for %.1f hours.",
-                        abs(recent_pnl), cfg.max_daily_loss_usdt, freeze_hrs)
+                        abs(recent_pnl), effective_max_loss, freeze_hrs)
             return gcb
     return None
+
+
+def get_daily_profit_shield_status(current_equity: Optional[float] = None) -> Dict[str, Any]:
+    """
+    2-Stage Daily Profit Shield:
+      - Stage 1 (+20.0% Daily Gain — Uncapped Momentum Filter):
+          Keeps 100% risk sizing so the desk can compound toward +50%,
+          but filters out lower-conviction (<85%) chop setups.
+      - Stage 2 (+50.0% Daily Gain — Jackpot Lock Mode):
+          Locks in a +50% daily trophy by scaling risk to 0.5x and only taking A+ (>=90%) setups.
+    """
+    with _lock:
+        s = _load_raw()
+        eq = float(current_equity if current_equity is not None else (s.get("paper_equity", cfg.paper_equity) or cfg.paper_equity))
+        closed = s.get("closed_positions", [])
+        now = datetime.now(timezone.utc)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        daily_pnl = 0.0
+        for c in closed:
+            c_time_str = c.get("closed_at")
+            if c_time_str:
+                try:
+                    c_dt = datetime.fromisoformat(c_time_str.replace("Z", "+00:00"))
+                    if c_dt >= day_start:
+                        daily_pnl += float(c.get("pnl_usdt", 0.0) or c.get("closed_pnl", 0.0))
+                except Exception:
+                    pass
+
+        start_eq = max(1.0, eq - daily_pnl)
+        daily_gain_pct = (daily_pnl / start_eq) * 100.0 if start_eq > 0 else 0.0
+
+        if daily_gain_pct >= 50.0:
+            return {
+                "stage": 2,
+                "mode": "JACKPOT_LOCK_50PCT",
+                "daily_pnl_usdt": round(daily_pnl, 2),
+                "daily_gain_pct": round(daily_gain_pct, 2),
+                "min_conviction": 90.0,
+                "risk_mult": 0.50,
+            }
+        elif daily_gain_pct >= 20.0:
+            return {
+                "stage": 1,
+                "mode": "MOMENTUM_FILTER_20PCT",
+                "daily_pnl_usdt": round(daily_pnl, 2),
+                "daily_gain_pct": round(daily_gain_pct, 2),
+                "min_conviction": 85.0,
+                "risk_mult": 1.00,
+            }
+        return {
+            "stage": 0,
+            "mode": "NORMAL",
+            "daily_pnl_usdt": round(daily_pnl, 2),
+            "daily_gain_pct": round(daily_gain_pct, 2),
+            "min_conviction": 0.0,
+            "risk_mult": 1.00,
+        }
 
 
 def get_custom_leverage(ticker: Optional[str] = None) -> Union[Dict[str, int], Optional[int]]:
@@ -907,6 +1169,11 @@ def remove_call_bot_chat(chat_id: str) -> bool:
             cb["updated_at"] = _now()
             _save(s)
         return changed
+
+
+def get_call_bot_chats() -> List[str]:
+    """Helper alias returning list of all configured call bot chat IDs."""
+    return list(get_call_bot_config().get("all_chats", []))
 
 
 def is_call_bot_subscribed(chat_id: str) -> bool:

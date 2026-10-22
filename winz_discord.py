@@ -397,6 +397,131 @@ async def slash_tweet(interaction: discord.Interaction, ticker: str = "BTC"):
     await interaction.response.send_message(_build_tweet_message(ticker))
 
 
+@bot.tree.command(name="dna", description="View Master Asset DNA, unlock dates & macro levels (e.g. /dna DOGE)")
+async def slash_dna(interaction: discord.Interaction, ticker: str = "DOGE"):
+    await interaction.response.defer()
+    target_t = ticker.upper().replace("USDT", "")
+    import asset_dna
+    from notifier import fmt_dollar
+    from config import bybit_linear_symbol
+    dna = asset_dna.get_asset_dna(target_t)
+    name = dna.get("name", target_t)
+    arch = dna.get("archetype", "UNKNOWN")
+    buf_pct = dna.get("min_stop_buffer", 0.0075) * 100.0
+    run_st = dna.get("run_style", "N/A")
+    tr_mode = dna.get("trail_mode", "N/A")
+    unl_risk = dna.get("unlock_risk", False)
+    unl_days = dna.get("monthly_unlock_days", [])
+    unl_str = f"⚠️ High Cliff Risk (Days {unl_days})" if unl_risk else "✅ Clean (No Cliff Risk)"
+    burn = "🔥 Active Supply Burn" if dna.get("burn_catalyst") else "None"
+    sess = dna.get("best_session", "ALL")
+    desc = dna.get("description", "")
+
+    macro_desc = ""
+    try:
+        import engine
+        sym = bybit_linear_symbol(target_t)
+        tick = engine.client.get_ticker(sym)
+        if tick:
+            l_price = float(tick.get("mark_price", 0.0))
+            macro_desc = f"\n**Live Mark Price:** `{fmt_dollar(l_price)}`"
+            klines = engine.client.get_klines(sym, interval="D", limit=30, category="linear")
+            if klines and len(klines) >= 15:
+                h30 = max(float(k.get("high", 0)) for k in klines)
+                l30 = min(float(k.get("low", 0)) for k in klines)
+                macro_desc += f"\n**30D Major Ceiling:** `{fmt_dollar(h30)}`\n**30D Major Floor:** `{fmt_dollar(l30)}`"
+    except Exception:
+        pass
+
+    embed = discord.Embed(
+        title=f"🧬 Asset DNA Master Profile: {target_t} ({name})",
+        color=0x2ECC71 if not unl_risk else 0xE67E22,
+    )
+    embed.add_field(name="Archetype", value=f"`{arch}`", inline=True)
+    embed.add_field(name="Stop Noise Cushion", value=f"`≥ {buf_pct:.2f}%`", inline=True)
+    embed.add_field(name="Trailing Mode", value=f"`{tr_mode}`", inline=True)
+    embed.add_field(name="Movement Style", value=f"`{run_st}`", inline=True)
+    embed.add_field(name="Tokenomics & Unlocks", value=unl_str, inline=True)
+    embed.add_field(name="Supply Burn", value=f"`{burn}`", inline=True)
+    embed.add_field(name="Key Levels & Price", value=macro_desc if macro_desc else "Active", inline=False)
+    embed.add_field(name="Specialist Playbook", value=f"*{desc}*", inline=False)
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="compound", description="Configure dynamic balance compounding (e.g. 1.0% or 0 to disable)")
+async def slash_compound(interaction: discord.Interaction, pct: Optional[float] = None):
+    await interaction.response.defer()
+    cid = str(interaction.user.id)
+    u = user_store.get_user(cid)
+    ex = u.get("exchange", {})
+    curr_pct = user_store.get_user_compounding_pct(cid)
+
+    bal_eq = float(u.get("paper_equity", 10000.0))
+    import exchange_manager
+    client = exchange_manager.get_user_bybit_client(cid)
+    if client:
+        try:
+            wb = client.get_wallet_balance("USDT")
+            bal_eq = float(wb.get("equity", 0.0))
+        except Exception:
+            pass
+
+    if pct is not None:
+        if pct <= 0:
+            user_store.set_user_compounding_pct(cid, 0.0)
+            fixed_margin = float(ex.get("risk_per_trade_usdt", 50.0))
+            embed = discord.Embed(
+                title="⏸ Dynamic Compounding Disabled",
+                description=f"Auto-trade sizing reverted to your fixed margin of **${fixed_margin:.2f} USDT** per trade.",
+                color=0x95A5A6,
+            )
+            await interaction.followup.send(embed=embed)
+            return
+        if pct > 10.0:
+            await interaction.followup.send("⚠️ Maximum allowable compounding risk is 10.0% per trade to protect capital.", ephemeral=True)
+            return
+
+        new_pct = user_store.set_user_compounding_pct(cid, pct)
+        effective_margin = round(bal_eq * (new_pct / 100.0), 2)
+        embed = discord.Embed(
+            title="🚀 Dynamic Compounding Mode Activated!",
+            description=(
+                f"• **Compounding Risk**: `{new_pct:.2f}%` of live equity per trade\n"
+                f"• **Reference Equity**: `${bal_eq:,.2f} USDT`\n"
+                f"• **Next Trade Margin**: `~${effective_margin:,.2f} USDT`\n\n"
+                f"💡 Winz automatically compounds your position sizes proportionally as balance grows!"
+            ),
+            color=0x2ECC71,
+        )
+        await interaction.followup.send(embed=embed)
+        return
+
+    fixed_margin = float(ex.get("risk_per_trade_usdt", 50.0))
+    if curr_pct > 0:
+        effective_margin = round(bal_eq * (curr_pct / 100.0), 2)
+        embed = discord.Embed(
+            title="📈 Dynamic Balance Compounding: ACTIVE",
+            description=(
+                f"• **Current Setting**: `{curr_pct:.2f}%` of live equity per trade\n"
+                f"• **Live Equity**: `${bal_eq:,.2f} USDT`\n"
+                f"• **Calculated Margin**: `${effective_margin:,.2f} USDT` per trade\n\n"
+                f"👉 Use `/compound pct:1.5` to adjust or `/compound pct:0` to disable."
+            ),
+            color=0x2ECC71,
+        )
+    else:
+        embed = discord.Embed(
+            title="⚙️ Dynamic Balance Compounding: OFF",
+            description=(
+                f"• **Current Mode**: Fixed margin of `${fixed_margin:.2f} USDT` per trade\n"
+                f"• **Live Equity**: `${bal_eq:,.2f} USDT`\n\n"
+                f"👉 Use `/compound pct:1.0` to enable dynamic scaling with account growth."
+            ),
+            color=0x3498DB,
+        )
+    await interaction.followup.send(embed=embed)
+
+
 @bot.tree.command(name="tracked", description="View live milestone status of active calls")
 async def slash_tracked(interaction: discord.Interaction):
     await interaction.response.send_message(embed=_build_tracked_embed())
